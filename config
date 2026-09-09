@@ -1,0 +1,98 @@
+# nginx addon: self-developed WebRTC RTC module.
+# Registers three nginx modules (RTMP bridge + HTTP signaling + stream UDP)
+# and compiles the pure-C RTC core (rtp/sdp/stun/dtls/srtp/registry).
+ngx_addon_name=ngx_rtc_module
+
+RTC_CORE_SRCS="                                                   \
+                $ngx_addon_dir/src/ngx_rtc_rtp.c                  \
+                $ngx_addon_dir/src/ngx_rtc_sdp.c                  \
+                $ngx_addon_dir/src/ngx_rtc_stun.c                 \
+                $ngx_addon_dir/src/ngx_rtc_dtls.c                 \
+                $ngx_addon_dir/src/ngx_rtc_srtp.c                 \
+                $ngx_addon_dir/src/ngx_rtc_core.c                 \
+                $ngx_addon_dir/src/ngx_rtc_ring.c                 \
+                $ngx_addon_dir/src/ngx_rtc_audio.c                \
+                $ngx_addon_dir/src/ngx_rtc_audio_worker.c         \
+                $ngx_addon_dir/src/ngx_rtc_rtcp.c                 \
+                $ngx_addon_dir/src/ngx_rtc_hsm.c                  \
+                $ngx_addon_dir/src/ngx_rtc_session_fsm.c          \
+                "
+
+RTC_CORE_DEPS="                                                   \
+                $ngx_addon_dir/src/ngx_rtc_rtp.h                  \
+                $ngx_addon_dir/src/ngx_rtc_sdp.h                  \
+                $ngx_addon_dir/src/ngx_rtc_stun.h                 \
+                $ngx_addon_dir/src/ngx_rtc_dtls.h                 \
+                $ngx_addon_dir/src/ngx_rtc_srtp.h                 \
+                $ngx_addon_dir/src/ngx_rtc_core.h                 \
+                $ngx_addon_dir/src/ngx_rtc_ring.h                 \
+                $ngx_addon_dir/src/ngx_rtc_audio.h                \
+                $ngx_addon_dir/src/ngx_rtc_audio_worker.h         \
+                $ngx_addon_dir/src/ngx_rtc_rtcp.h                 \
+                $ngx_addon_dir/src/ngx_rtc_hsm.h                  \
+                $ngx_addon_dir/src/ngx_rtc_session_fsm.h          \
+                "
+
+if [ -f auto/module ]; then
+    # rtc_zone directive (NGX_CORE_MODULE): shared-memory zone for multi-worker.
+    ngx_module_type=CORE
+    ngx_module_name="ngx_rtc_core_module"
+    ngx_module_srcs="$ngx_addon_dir/src/ngx_rtc_shm.c"
+    ngx_module_deps="$ngx_addon_dir/src/ngx_rtc_shm.h"
+    . auto/module
+
+    # RTMP bridge module (CORE type, same level as nginx-http-flv-module's RTMP).
+    ngx_module_type=CORE
+    ngx_module_name="ngx_rtmp_rtc_bridge_module"
+    ngx_module_srcs="$ngx_addon_dir/src/ngx_rtmp_rtc_bridge_module.c"
+    ngx_module_deps=""
+    . auto/module
+
+    # HTTP signaling module.
+    ngx_module_type=HTTP
+    ngx_module_name="ngx_rtc_http_module"
+    ngx_module_srcs="$ngx_addon_dir/src/ngx_rtc_http_module.c"
+    ngx_module_deps=""
+    . auto/module
+
+    # Stream UDP module.
+    ngx_module_type=STREAM
+    ngx_module_name="ngx_rtc_stream_module"
+    ngx_module_srcs="$ngx_addon_dir/src/ngx_rtc_stream_module.c"
+    ngx_module_deps=""
+    . auto/module
+
+    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $RTC_CORE_SRCS"
+    NGX_ADDON_DEPS="$NGX_ADDON_DEPS $RTC_CORE_DEPS"
+else
+    CORE_MODULES="$CORE_MODULES ngx_rtc_core_module"
+    CORE_MODULES="$CORE_MODULES ngx_rtmp_rtc_bridge_module"
+    HTTP_MODULES="$HTTP_MODULES ngx_rtc_http_module"
+    STREAM_MODULES="$STREAM_MODULES ngx_rtc_stream_module"
+
+    NGX_ADDON_SRCS="$NGX_ADDON_SRCS $RTC_CORE_SRCS                    \
+                    $ngx_addon_dir/src/ngx_rtmp_rtc_bridge_module.c   \
+                    $ngx_addon_dir/src/ngx_rtc_http_module.c          \
+                    $ngx_addon_dir/src/ngx_rtc_stream_module.c        \
+                    $ngx_addon_dir/src/ngx_rtc_shm.c                  "
+
+    NGX_ADDON_DEPS="$NGX_ADDON_DEPS $RTC_CORE_DEPS"
+fi
+
+# NGX_RTC_EVENT_LOOP enables nginx event-loop state in ngx_rtc_core (the paced
+# GOP replay timer). It is left off for the pure-C host unit tests, which have no
+# event loop.
+# Third-party static deps (libavcodec/libswresample/libavutil/libopus/libsrtp2)
+# are produced by scripts/build-deps.sh into <repo>/build/third (same layout as
+# the legacy /.../third: include/ + lib/). Override with NGX_RTC_THIRD to reuse
+# an existing prebuilt tree without rebuilding.
+RTC_THIRD="${NGX_RTC_THIRD:-$(cd "$ngx_addon_dir/.." && pwd)/build/third}"
+CFLAGS="$CFLAGS -DNGX_RTC_EVENT_LOOP -I$ngx_addon_dir/src -I$RTC_THIRD/include"
+CORE_LIBS="$CORE_LIBS $RTC_THIRD/lib/libavcodec.a"
+CORE_LIBS="$CORE_LIBS $RTC_THIRD/lib/libswresample.a"
+CORE_LIBS="$CORE_LIBS $RTC_THIRD/lib/libavutil.a"
+CORE_LIBS="$CORE_LIBS $RTC_THIRD/lib/libopus.a"
+CORE_LIBS="$CORE_LIBS $RTC_THIRD/lib/libsrtp2.a"
+CORE_LIBS="$CORE_LIBS -lm -lpthread"
+
+USE_OPENSSL=YES

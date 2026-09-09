@@ -1,0 +1,6 @@
+# build artifacts
+test/build/
+test/run_tests
+*.o
+*.d
+*.log
