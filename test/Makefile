@@ -15,7 +15,8 @@ BUILD_DIR := build
 BIN       := run_tests
 
 CORE_NAMES := ngx_rtc_rtp ngx_rtc_stun ngx_rtc_sdp ngx_rtc_rtcp \
-              ngx_rtc_hsm ngx_rtc_session_fsm ngx_rtc_core ngx_rtc_ring
+              ngx_rtc_hsm ngx_rtc_session_fsm ngx_rtc_core ngx_rtc_ring \
+              ngx_rtc_avsync
 
 TEST_NAMES := ngx_rtc_test test_main test_rtp test_stun test_sdp \
               test_rtcp test_hsm test_session_fsm \

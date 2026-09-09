@@ -14,6 +14,7 @@ RTC_CORE_SRCS="                                                   \
                 $ngx_addon_dir/src/ngx_rtc_audio.c                \
                 $ngx_addon_dir/src/ngx_rtc_audio_worker.c         \
                 $ngx_addon_dir/src/ngx_rtc_rtcp.c                 \
+                $ngx_addon_dir/src/ngx_rtc_avsync.c               \
                 $ngx_addon_dir/src/ngx_rtc_hsm.c                  \
                 $ngx_addon_dir/src/ngx_rtc_session_fsm.c          \
                 "
@@ -29,6 +30,7 @@ RTC_CORE_DEPS="                                                   \
                 $ngx_addon_dir/src/ngx_rtc_audio.h                \
                 $ngx_addon_dir/src/ngx_rtc_audio_worker.h         \
                 $ngx_addon_dir/src/ngx_rtc_rtcp.h                 \
+                $ngx_addon_dir/src/ngx_rtc_avsync.h               \
                 $ngx_addon_dir/src/ngx_rtc_hsm.h                  \
                 $ngx_addon_dir/src/ngx_rtc_session_fsm.h          \
                 "
