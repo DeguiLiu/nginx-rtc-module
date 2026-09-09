@@ -388,6 +388,18 @@ ngx_rtc_session_send_rtp(ngx_rtc_session_t *sess, const uint8_t *rtp, uint32_t l
         return 0;
     }
 
+    /* Send pacing: charge the token bucket, drop on overrun so the client
+     * recovers via NACK/PLI rather than queueing (queueing adds latency, the
+     * opposite of a low-latency live stream). Live, replay, and RTX sends all
+     * funnel through here and spend the same link budget. pacer_target_bps == 0
+     * means the pacer was never armed (pacer_init not called), so pass through
+     * unpaced — this keeps host tests that drive the send path working. */
+    if (0 != sess->pacer_target_bps
+            && ngx_rtc_session_pacer_admit(sess, len, (uint64_t) ngx_current_msec)
+                    != NGX_RTC_OK) {
+        return 0;
+    }
+
     c = (ngx_connection_t *)sess->conn;
     ngx_memcpy(sess->cipher, rtp, len);
 
@@ -783,4 +795,184 @@ ngx_rtc_session_rtx_free(ngx_rtc_session_t *sess)
     sess->rtx.slots = NULL;
     sess->rtx.capacity = 0;
     sess->rtx.count = 0;
+}
+
+
+/* ============================================================================
+ * Send pacing (token bucket) + TWCC loss-driven bitrate adaptation (GCC-lite).
+ *
+ * Pure C and host-testable: time is passed explicitly as now_ms, so this does
+ * not depend on nginx's event loop or ngx_current_msec. Tokens are counted in
+ * bytes with integer math; one burst window of bytes at the current target rate
+ * is the bucket capacity.
+ * ============================================================================ */
+
+/* One burst window worth of bytes at the current target rate (bps -> B/ms). */
+static uint64_t
+ngx_rtc_pacer_bucket_bytes(const ngx_rtc_session_t *sess)
+{
+    return sess->pacer_target_bps * NGX_RTC_PACER_BURST_MS / 8000u;
+}
+
+void
+ngx_rtc_session_pacer_init(ngx_rtc_session_t *sess, uint64_t start_bps)
+{
+    if (NULL == sess) {
+        return;
+    }
+
+    if (start_bps < NGX_RTC_PACER_MIN_BPS) {
+        start_bps = NGX_RTC_PACER_MIN_BPS;
+    } else if (start_bps > NGX_RTC_PACER_MAX_BPS) {
+        start_bps = NGX_RTC_PACER_MAX_BPS;
+    }
+
+    sess->pacer_target_bps = start_bps;
+    sess->pacer_tokens = ngx_rtc_pacer_bucket_bytes(sess);
+    sess->pacer_last_ms = 0;   /* first admit anchors the clock */
+    sess->pacer_started = 0;   /* distinguish "never anchored" from now_ms == 0 */
+}
+
+int32_t
+ngx_rtc_session_pacer_admit(ngx_rtc_session_t *sess, uint32_t pkt_bytes,
+                            uint64_t now_ms)
+{
+    uint64_t capacity;
+    uint64_t delta_ms;
+    uint64_t refill;
+
+    if (NULL == sess) {
+        return NGX_RTC_ERR_INVALID;
+    }
+
+    capacity = ngx_rtc_pacer_bucket_bytes(sess);
+
+    if (0 == sess->pacer_started) {
+        /* First packet: anchor the clock; the bucket starts full from init. */
+        sess->pacer_started = 1;
+        sess->pacer_last_ms = now_ms;
+    } else if (now_ms >= sess->pacer_last_ms) {
+        delta_ms = now_ms - sess->pacer_last_ms;
+        if (delta_ms >= NGX_RTC_PACER_BURST_MS) {
+            /* A full burst window or more has elapsed: fill to capacity without
+             * the delta_ms * rate multiply (guards against uint64 overflow). */
+            refill = capacity;
+        } else {
+            refill = delta_ms * sess->pacer_target_bps / 8000u;
+        }
+        sess->pacer_last_ms = now_ms;
+        sess->pacer_tokens += refill;
+        if (sess->pacer_tokens > capacity) {
+            sess->pacer_tokens = capacity;
+        }
+    } else {
+        /* Monotonic clock ran backwards: never refill, just re-anchor. */
+        sess->pacer_last_ms = now_ms;
+    }
+
+    if (sess->pacer_tokens < (uint64_t)pkt_bytes) {
+        return NGX_RTC_AGAIN;
+    }
+
+    sess->pacer_tokens -= (uint64_t)pkt_bytes;
+    return NGX_RTC_OK;
+}
+
+void
+ngx_rtc_session_pacer_set_target(ngx_rtc_session_t *sess, uint64_t bps)
+{
+    if (NULL == sess) {
+        return;
+    }
+
+    if (bps < NGX_RTC_PACER_MIN_BPS) {
+        bps = NGX_RTC_PACER_MIN_BPS;
+    } else if (bps > NGX_RTC_PACER_MAX_BPS) {
+        bps = NGX_RTC_PACER_MAX_BPS;
+    }
+
+    sess->pacer_target_bps = bps;
+}
+
+void
+ngx_rtc_session_on_twcc(ngx_rtc_session_t *sess, uint32_t lost,
+                        uint32_t received, uint64_t now_ms)
+{
+    uint64_t total;
+    uint64_t loss_permille;
+    uint64_t target;
+    uint64_t delta_ms;
+    uint64_t capacity;
+
+    if (NULL == sess) {
+        return;
+    }
+
+    /* Keep the cumulative counters (existing observability) plus the window. */
+    sess->twcc_lost += lost;
+    sess->twcc_received += received;
+    sess->twcc_win_lost += lost;
+    sess->twcc_win_received += received;
+
+    total = (uint64_t)sess->twcc_win_lost + (uint64_t)sess->twcc_win_received;
+    if (0 == total) {
+        return;
+    }
+
+    if (0 == sess->twcc_win_started) {
+        /* First feedback opens the window; wait for a second sample so the
+         * elapsed-time anchor is meaningful. */
+        sess->twcc_win_started = 1;
+        sess->twcc_win_start_ms = now_ms;
+        return;
+    }
+
+    delta_ms = (now_ms >= sess->twcc_win_start_ms)
+             ? (now_ms - sess->twcc_win_start_ms) : 0u;
+
+    /* Re-evaluate once the window has enough packets OR enough elapsed time,
+     * whichever comes first; sparse flows still adapt via the time bound. */
+    if (delta_ms < NGX_RTC_TWCC_WINDOW_MS && total < NGX_RTC_TWCC_MIN_PKTS) {
+        return;
+    }
+
+    target = sess->pacer_target_bps;
+    if (0 == target) {
+        /* Pacer never initialised: nothing sensible to adapt, drop the window. */
+        sess->twcc_win_lost = 0;
+        sess->twcc_win_received = 0;
+        sess->twcc_win_start_ms = now_ms;
+        return;
+    }
+
+    /* Loss in per-mille (integer math, no float on the data path). */
+    loss_permille = (uint64_t)sess->twcc_win_lost * 1000u / total;
+
+    if (loss_permille > NGX_RTC_TWCC_LOSS_HIGH_PM) {
+        /* AIMD multiplicative decrease: x0.85 on >5% loss. */
+        target = target * NGX_RTC_TWCC_DECREASE_NUM / NGX_RTC_TWCC_DECREASE_DEN;
+    } else if (loss_permille < NGX_RTC_TWCC_LOSS_LOW_PM) {
+        /* AIMD additive increase: +8% of the current rate on <2% loss. A fixed
+         * byte step would starve 64 kbps and crawl at 8 Mbps, so scale by 8%. */
+        target = target + target * NGX_RTC_TWCC_INCREASE_NUM
+                        / NGX_RTC_TWCC_INCREASE_DEN;
+    }
+
+    if (target < NGX_RTC_PACER_MIN_BPS) {
+        target = NGX_RTC_PACER_MIN_BPS;
+    } else if (target > NGX_RTC_PACER_MAX_BPS) {
+        target = NGX_RTC_PACER_MAX_BPS;
+    }
+
+    sess->pacer_target_bps = target;
+
+    /* A lower target shrinks the burst bucket; never keep a surplus above it. */
+    capacity = ngx_rtc_pacer_bucket_bytes(sess);
+    if (sess->pacer_tokens > capacity) {
+        sess->pacer_tokens = capacity;
+    }
+
+    sess->twcc_win_lost = 0;
+    sess->twcc_win_received = 0;
+    sess->twcc_win_start_ms = now_ms;
 }

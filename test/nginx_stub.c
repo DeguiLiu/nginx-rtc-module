@@ -14,6 +14,8 @@
 
 #include "ngx_rtc_srtp.h"
 
+volatile ngx_msec_t ngx_current_msec = 0;
+
 void
 ngx_rbtree_insert(ngx_rbtree_t *tree, ngx_rbtree_node_t *node)
 {

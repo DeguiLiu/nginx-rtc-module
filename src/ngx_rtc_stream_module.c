@@ -764,10 +764,11 @@ ngx_rtc_stream_rtcp_cb(const ngx_rtc_rtcp_pkt_t *pkt, void *opaque)
         }
     } else if (NGX_RTC_RTCP_RTPFB == pkt->type
                && NGX_RTC_RTCP_FMT_TWCC == pkt->fmt) {
-        /* Transport-wide CC feedback summarises the peer's downlink loss; keep
-         * a running total so the control plane can surface weak-network state. */
-        sess->twcc_lost += pkt->twcc_lost;
-        sess->twcc_received += pkt->twcc_received;
+        /* Transport-wide CC feedback: feed the loss-based rate controller.
+         * on_twcc accumulates both the cumulative counters (twcc_lost/received,
+         * mirrored below) and the AIMD window, and adjusts pacer_target_bps. */
+        ngx_rtc_session_on_twcc(sess, pkt->twcc_lost, pkt->twcc_received,
+                                (uint64_t) ngx_current_msec);
 
         {
             ngx_rtc_core_conf_t *ccf;
@@ -780,6 +781,11 @@ ngx_rtc_stream_rtcp_cb(const ngx_rtc_rtcp_pkt_t *pkt, void *opaque)
                         sess->twcc_lost, sess->twcc_received);
             }
         }
+    } else if (pkt->has_remb) {
+        /* Receiver Estimated Maximum Bitrate: absolute cap hint from the
+         * viewer. Set the pacer target directly (clamped to [64k, 8M]); the
+         * loss-based controller keeps adjusting around it. */
+        ngx_rtc_session_pacer_set_target(sess, (uint64_t) pkt->remb_bitrate_bps);
     } else if (NGX_RTC_RTCP_BYE == pkt->type) {
         ctx->bye = 1;
     }
@@ -913,6 +919,11 @@ ngx_rtc_stream_dtls_done(void *user)
                                        NGX_RTC_SESSION_EVT_DTLS_HANDSHAKE_DONE);
 
     sess->last_active = ngx_current_msec;
+
+    /* Media-ready: arm the send pacer. Start unpaced (max) so an existing
+     * stream is not throttled before TWCC/REMB feedback establishes the real
+     * link rate; the token bucket drops on overrun and the viewer re-NACKs. */
+    ngx_rtc_session_pacer_init(sess, NGX_RTC_PACER_MAX_BPS);
 
     /* Subscribe the session to its source, then replay the current GOP so a
      * late subscriber decodes its first frame without waiting for an IDR. The

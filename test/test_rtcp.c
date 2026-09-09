@@ -352,3 +352,181 @@ NGX_RTC_TEST(rtcp_twcc_status_vector)
     NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_lost, 1);
     NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_received, 1);
 }
+
+NGX_RTC_TEST(rtcp_remb_single_ssrc)
+{
+    ngx_rtc_rtcp_pkt_t pkt;
+    uint8_t raw[24];
+    uint32_t consumed = 0;
+
+    (void)memset(raw, 0, sizeof(raw));
+
+    /* V=2, P=0, FMT=15 (REMB), PT=206 (PSFB), 24 bytes -> length 5. */
+    raw[0] = 0x8Fu;
+    raw[1] = NGX_RTC_RTCP_PSFB;
+    rtcp_wr_u16(raw + 2, 5u);
+    rtcp_wr_u32(raw + 4, 0x11111111u); /* sender SSRC */
+    rtcp_wr_u32(raw + 8, 0x22222222u); /* media SSRC */
+    raw[12] = 'R'; raw[13] = 'E'; raw[14] = 'M'; raw[15] = 'B';
+    /* numSSRC=1, brExp=3, brMantissa=62500 -> 62500 * 2^3 = 500000 bps. */
+    rtcp_wr_u32(raw + 16, (1u << 24) | (3u << 18) | 62500u);
+    rtcp_wr_u32(raw + 20, 0xAABBCCDDu); /* REMB SSRC */
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt, &consumed),
+                               NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_I64_EQ(consumed, 24u);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.type, NGX_RTC_RTCP_PSFB);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.fmt, NGX_RTC_RTCP_FMT_REMB);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt.media_ssrc, 0x22222222u);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.has_remb, 1);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt.remb_bitrate_bps, 500000u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt.remb_ssrc, 0xAABBCCDDu);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.remb_ssrc_count, 1);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt.remb_ssrcs[0], 0xAABBCCDDu);
+}
+
+NGX_RTC_TEST(rtcp_remb_multi_ssrc)
+{
+    ngx_rtc_rtcp_pkt_t pkt;
+    uint8_t raw[32];
+    uint32_t consumed = 0;
+
+    (void)memset(raw, 0, sizeof(raw));
+
+    raw[0] = 0x8Fu;
+    raw[1] = NGX_RTC_RTCP_PSFB;
+    rtcp_wr_u16(raw + 2, 7u); /* 32 bytes -> length 7 */
+    rtcp_wr_u32(raw + 4, 0x11111111u);
+    rtcp_wr_u32(raw + 8, 0x22222222u);
+    raw[12] = 'R'; raw[13] = 'E'; raw[14] = 'M'; raw[15] = 'B';
+    /* numSSRC=3, brExp=5, brMantissa=4096 -> 4096 * 2^5 = 131072 bps. */
+    rtcp_wr_u32(raw + 16, (3u << 24) | (5u << 18) | 4096u);
+    rtcp_wr_u32(raw + 20, 0x00000001u);
+    rtcp_wr_u32(raw + 24, 0x00000002u);
+    rtcp_wr_u32(raw + 28, 0x00000003u);
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt, &consumed),
+                               NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.has_remb, 1);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt.remb_bitrate_bps, 131072u);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.remb_ssrc_count, 3);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt.remb_ssrc, 0x00000001u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt.remb_ssrcs[0], 0x00000001u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt.remb_ssrcs[1], 0x00000002u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt.remb_ssrcs[2], 0x00000003u);
+}
+
+NGX_RTC_TEST(rtcp_remb_truncated_ssrc_list)
+{
+    ngx_rtc_rtcp_pkt_t pkt;
+    uint8_t raw[24];
+    uint32_t consumed = 0;
+
+    (void)memset(raw, 0, sizeof(raw));
+
+    raw[0] = 0x8Fu;
+    raw[1] = NGX_RTC_RTCP_PSFB;
+    rtcp_wr_u16(raw + 2, 5u); /* 24 bytes */
+    rtcp_wr_u32(raw + 4, 0x11111111u);
+    rtcp_wr_u32(raw + 8, 0x22222222u);
+    raw[12] = 'R'; raw[13] = 'E'; raw[14] = 'M'; raw[15] = 'B';
+    /* numSSRC=2 but only one 4-byte SSRC follows. */
+    rtcp_wr_u32(raw + 16, (2u << 24) | (0u << 18) | 1000u);
+    rtcp_wr_u32(raw + 20, 0xAABBCCDDu);
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt, &consumed),
+                               NGX_RTC_ERR_PARSE);
+}
+
+NGX_RTC_TEST(rtcp_remb_missing_bitrate_word)
+{
+    ngx_rtc_rtcp_pkt_t pkt;
+    uint8_t raw[16];
+    uint32_t consumed = 0;
+
+    (void)memset(raw, 0, sizeof(raw));
+
+    raw[0] = 0x8Fu;
+    raw[1] = NGX_RTC_RTCP_PSFB;
+    rtcp_wr_u16(raw + 2, 3u); /* 16 bytes */
+    rtcp_wr_u32(raw + 4, 0x11111111u);
+    rtcp_wr_u32(raw + 8, 0x22222222u);
+    raw[12] = 'R'; raw[13] = 'E'; raw[14] = 'M'; raw[15] = 'B';
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt, &consumed),
+                               NGX_RTC_ERR_PARSE);
+}
+
+NGX_RTC_TEST(rtcp_remb_not_remb_afb)
+{
+    ngx_rtc_rtcp_pkt_t pkt;
+    uint8_t raw[16];
+    uint32_t consumed = 0;
+
+    (void)memset(raw, 0, sizeof(raw));
+
+    raw[0] = 0x8Fu;
+    raw[1] = NGX_RTC_RTCP_PSFB;
+    rtcp_wr_u16(raw + 2, 3u); /* 16 bytes */
+    rtcp_wr_u32(raw + 4, 0x11111111u);
+    rtcp_wr_u32(raw + 8, 0x22222222u);
+    rtcp_wr_u32(raw + 12, 0xDEADBEEFu); /* application data, not "REMB" */
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt, &consumed),
+                               NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.has_remb, 0);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.remb_ssrc_count, 0);
+}
+
+NGX_RTC_TEST(rtcp_remb_pli_not_misdetected)
+{
+    ngx_rtc_rtcp_pkt_t pkt;
+    uint8_t raw[12];
+    uint32_t consumed = 0;
+
+    (void)memset(raw, 0, sizeof(raw));
+
+    raw[0] = 0x81u; /* V=2, FMT=1 (PLI) */
+    raw[1] = NGX_RTC_RTCP_PSFB;
+    rtcp_wr_u16(raw + 2, 2u); /* 12 bytes */
+    rtcp_wr_u32(raw + 4, 0x11111111u);
+    rtcp_wr_u32(raw + 8, 0x22222222u);
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt, &consumed),
+                               NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.type, NGX_RTC_RTCP_PSFB);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.fmt, NGX_RTC_RTCP_FMT_PLI);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.has_remb, 0);
+}
+
+NGX_RTC_TEST(rtcp_remb_ssrc_list_truncated_to_bound)
+{
+    ngx_rtc_rtcp_pkt_t pkt;
+    uint8_t raw[180];
+    uint32_t consumed = 0;
+    uint32_t i;
+
+    (void)memset(raw, 0, sizeof(raw));
+
+    raw[0] = 0x8Fu;
+    raw[1] = NGX_RTC_RTCP_PSFB;
+    rtcp_wr_u16(raw + 2, (uint16_t)(sizeof(raw) / 4u - 1u)); /* 180 bytes -> 44 */
+    rtcp_wr_u32(raw + 4, 0x11111111u);
+    rtcp_wr_u32(raw + 8, 0x22222222u);
+    raw[12] = 'R'; raw[13] = 'E'; raw[14] = 'M'; raw[15] = 'B';
+    /* numSSRC=40 (over the 32-entry bound), brExp=1, brMantissa=1000 -> 2000 bps. */
+    rtcp_wr_u32(raw + 16, (40u << 24) | (1u << 18) | 1000u);
+    for (i = 0; i < 40u; i++)
+    {
+        rtcp_wr_u32(raw + 20 + i * 4u, 0xA0000000u + i);
+    }
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt, &consumed),
+                               NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.has_remb, 1);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt.remb_bitrate_bps, 2000u);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.remb_ssrc_count, NGX_RTC_RTCP_MAX_REMB_SSRCS);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt.remb_ssrc, 0xA0000000u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt.remb_ssrcs[0], 0xA0000000u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt.remb_ssrcs[31], 0xA0000000u + 31u);
+}

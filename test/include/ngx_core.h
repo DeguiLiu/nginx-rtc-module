@@ -20,6 +20,9 @@ typedef unsigned long ngx_msec_t;
 typedef uintptr_t ngx_uint_t;
 typedef intptr_t  ngx_int_t;
 
+/* Cached monotonic clock (host build: link-only global, see nginx_stub.c). */
+extern volatile ngx_msec_t ngx_current_msec;
+
 /* Nginx-style helpers reduced to their C-library equivalents for the host
  * build. The media modules are nginx-free; these macros keep the few nginx
  * idioms used by ngx_rtc_core.c compilable without the real nginx headers. */

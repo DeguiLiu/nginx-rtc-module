@@ -459,3 +459,114 @@ NGX_RTC_TEST(rtx_push_reserves_lazily_and_caches)
     ngx_rtc_session_rtx_free(&sess);
     NGX_RTC_TEST_ASSERT(NULL == sess.rtx.slots);
 }
+
+/* ------------------------------------------------------------------ */
+/* Pacing token bucket + TWCC AIMD bitrate adaptation.                 */
+/* ------------------------------------------------------------------ */
+
+NGX_RTC_TEST(pacer_init_clamps_rate_and_fills_bucket)
+{
+    ngx_rtc_session_t sess;
+
+    (void)memset(&sess, 0, sizeof(sess));
+
+    /* Below the floor: clamped to 64 kbps, bucket = 64e3*100/8000 = 800 B. */
+    ngx_rtc_session_pacer_init(&sess, 1000u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_target_bps, NGX_RTC_PACER_MIN_BPS);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_tokens, 800u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_started, 0u);
+
+    /* Above the ceiling: clamped to 8 Mbps, bucket = 8e6*100/8000 = 100000 B. */
+    ngx_rtc_session_pacer_init(&sess, 99999999u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_target_bps, NGX_RTC_PACER_MAX_BPS);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_tokens, 100000u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_started, 0u);
+}
+
+NGX_RTC_TEST(pacer_admit_grants_denies_and_refills)
+{
+    ngx_rtc_session_t sess;
+
+    (void)memset(&sess, 0, sizeof(sess));
+
+    /* 800 kbps -> 100 bytes/ms, bucket = 100 * 100 ms = 10000 bytes. */
+    ngx_rtc_session_pacer_init(&sess, 800000u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_tokens, 10000u);
+
+    /* First admit only anchors the clock at now_ms=0 (bucket starts full). */
+    NGX_RTC_TEST_ASSERT_I64_EQ(
+        ngx_rtc_session_pacer_admit(&sess, 1000u, 0u), NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_tokens, 9000u);
+
+    /* Same instant, not enough tokens: rejected, tokens untouched. */
+    NGX_RTC_TEST_ASSERT_I64_EQ(
+        ngx_rtc_session_pacer_admit(&sess, 9001u, 0u), NGX_RTC_AGAIN);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_tokens, 9000u);
+
+    /* 10 ms elapsed -> +1000 bytes, then a 200-byte packet is charged. */
+    NGX_RTC_TEST_ASSERT_I64_EQ(
+        ngx_rtc_session_pacer_admit(&sess, 200u, 10u), NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_tokens, 9800u);
+
+    /* A packet larger than the whole burst bucket is always rejected. */
+    NGX_RTC_TEST_ASSERT_I64_EQ(
+        ngx_rtc_session_pacer_admit(&sess, 20000u, 10u), NGX_RTC_AGAIN);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_tokens, 9800u);
+
+    /* Exact-fit drain leaves the bucket at zero. */
+    NGX_RTC_TEST_ASSERT_I64_EQ(
+        ngx_rtc_session_pacer_admit(&sess, 9800u, 10u), NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_tokens, 0u);
+}
+
+NGX_RTC_TEST(on_twcc_high_loss_decreases_rate)
+{
+    ngx_rtc_session_t sess;
+
+    (void)memset(&sess, 0, sizeof(sess));
+    ngx_rtc_session_pacer_init(&sess, 1000000u);
+
+    /* First feedback only opens the window (no decision yet). */
+    ngx_rtc_session_on_twcc(&sess, 6u, 94u, 0u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_target_bps, 1000000u);
+
+    /* 500 ms later the window holds 12/200 lost = 6% > 5%: x0.85. */
+    ngx_rtc_session_on_twcc(&sess, 6u, 94u, 500u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_target_bps, 850000u);
+}
+
+NGX_RTC_TEST(on_twcc_zero_loss_increases_rate)
+{
+    ngx_rtc_session_t sess;
+
+    (void)memset(&sess, 0, sizeof(sess));
+    ngx_rtc_session_pacer_init(&sess, 1000000u);
+
+    ngx_rtc_session_on_twcc(&sess, 0u, 100u, 0u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_target_bps, 1000000u);
+
+    /* 0% loss < 2%: +8% -> 1,080,000 bps. */
+    ngx_rtc_session_on_twcc(&sess, 0u, 100u, 500u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(sess.pacer_target_bps, 1080000u);
+}
+
+NGX_RTC_TEST(on_twcc_clamps_rate_bounds)
+{
+    ngx_rtc_session_t lower;
+    ngx_rtc_session_t upper;
+
+    (void)memset(&lower, 0, sizeof(lower));
+    (void)memset(&upper, 0, sizeof(upper));
+
+    /* Decrease from 70 kbps would give 59.5 kbps: clamped to the 64 kbps floor. */
+    ngx_rtc_session_pacer_init(&lower, 70000u);
+    ngx_rtc_session_on_twcc(&lower, 6u, 94u, 0u);
+    ngx_rtc_session_on_twcc(&lower, 6u, 94u, 500u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(lower.pacer_target_bps, NGX_RTC_PACER_MIN_BPS);
+
+    /* Increase from 7.9 Mbps would give 8.532 Mbps: clamped to the 8 Mbps cap. */
+    ngx_rtc_session_pacer_init(&upper, 7900000u);
+    ngx_rtc_session_on_twcc(&upper, 0u, 100u, 0u);
+    ngx_rtc_session_on_twcc(&upper, 0u, 100u, 500u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(upper.pacer_target_bps, NGX_RTC_PACER_MAX_BPS);
+}

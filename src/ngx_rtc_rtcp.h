@@ -95,12 +95,16 @@
 #define NGX_RTC_RTCP_FMT_NACK 1u  /* RTPFB generic NACK (section 6.2.1) */
 #define NGX_RTC_RTCP_FMT_PLI  1u  /* PSFB PLI keyframe request (section 6.3.1) */
 #define NGX_RTC_RTCP_FMT_TWCC 15u /* RTPFB transport-wide CC (not decoded here) */
+#define NGX_RTC_RTCP_FMT_REMB 15u /* PSFB application-layer REMB (draft-alvestrand-rmcat-remb) */
 
 /* SRS kRtcpPacketSize; enough for any single RTCP datagram on the wire. */
 #define NGX_RTC_RTCP_MAX_PACKET 1500u
 
 /* Bounds for the decoded NACK state kept in ngx_rtc_rtcp_pkt_t. */
 #define NGX_RTC_RTCP_MAX_NACK_ENTRIES 128u
+
+/* Bounds for the decoded REMB SSRC list kept in ngx_rtc_rtcp_pkt_t. */
+#define NGX_RTC_RTCP_MAX_REMB_SSRCS 32u
 
 /* SDES CNAME text is at most 255 octets (RFC 3550 6.5.1) plus NUL. */
 #define NGX_RTC_RTCP_MAX_CNAME 256u
@@ -158,6 +162,15 @@ typedef struct
     uint16_t twcc_pkt_count;  /* packets covered by this feedback */
     uint32_t twcc_lost;       /* packets reported as not received */
     uint32_t twcc_received;   /* packets reported as received */
+
+    /* PSFB REMB (206/FMT=15) receiver estimated maximum bitrate
+     * (draft-alvestrand-rmcat-remb). remb_ssrc holds the first entry of the
+     * list; the whole list (remb_ssrc_count entries) is in remb_ssrcs[]. */
+    uint8_t  has_remb;         /* 1 when a REMB FCI was decoded */
+    uint32_t remb_bitrate_bps; /* mantissa * 2^exp, bits per second */
+    uint32_t remb_ssrc;        /* first SSRC in the list (0 when empty) */
+    uint16_t remb_ssrc_count;  /* number of entries in remb_ssrcs[] */
+    uint32_t remb_ssrcs[NGX_RTC_RTCP_MAX_REMB_SSRCS];
 } ngx_rtc_rtcp_pkt_t;
 
 /* Input for ngx_rtc_rtcp_encode_sr. */

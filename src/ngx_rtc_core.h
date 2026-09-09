@@ -44,6 +44,45 @@
 #define NGX_RTC_NACK_WINDOW_MS  100u
 #define NGX_RTC_NACK_BUDGET     128u
 
+/* Return code for the token-bucket pacer: the packet must be deferred or
+ * dropped until tokens are replenished (nginx's NGX_AGAIN occupies -2, which
+ * is NGX_RTC_ERR_TOO_SMALL here, so the pacer uses -6). */
+#ifndef NGX_RTC_AGAIN
+#define NGX_RTC_AGAIN (-6)
+#endif
+
+/* ============================================================================
+ * Send pacing (token bucket) + TWCC loss-driven bitrate adaptation (GCC-lite).
+ * ============================================================================ */
+
+/* Target send-rate clamp. 64 kbps is the floor where H264 video is still
+ * barely watchable; 8 Mbps is the ceiling for a typical 1080p WebRTC uplink. */
+#define NGX_RTC_PACER_MIN_BPS   64000u
+#define NGX_RTC_PACER_MAX_BPS   8000000u
+
+/* The bucket holds this many milliseconds of the target rate: one burst window.
+ * A 100 ms burst lets a keyframe flush immediately but still caps an
+ * uncongested sender from flooding the socket for longer than ~100 ms. */
+#define NGX_RTC_PACER_BURST_MS  100u
+
+/* TWCC loss window: AIMD re-evaluates once per 500 ms of feedback, or earlier
+ * when a minimum number of packets has arrived (whichever comes first), so
+ * sparse streams still adapt through the time bound. */
+#define NGX_RTC_TWCC_WINDOW_MS  500u
+#define NGX_RTC_TWCC_MIN_PKTS   20u
+
+/* Loss thresholds in per-mille (integer math, no float on the data path):
+ *   > 50 permille (5%)  -> multiplicative decrease x0.85
+ *   < 20 permille (2%)  -> additive increase +8% of current rate
+ * Mirrors WebRTC GCC's loss-based AIMD bands (SRS 6.0 leaves on_rtcp_feedback_twcc
+ * a no-op, so the thresholds follow the task spec / Google GCC defaults). */
+#define NGX_RTC_TWCC_LOSS_HIGH_PM  50u
+#define NGX_RTC_TWCC_LOSS_LOW_PM   20u
+#define NGX_RTC_TWCC_DECREASE_NUM  85u
+#define NGX_RTC_TWCC_DECREASE_DEN  100u
+#define NGX_RTC_TWCC_INCREASE_NUM   8u
+#define NGX_RTC_TWCC_INCREASE_DEN  100u
+
 /* GOP ring capacity; power of two so slot = head & (capacity - 1). 2048 slots
  * x ~1224 B/slot ~= 2.4 MB per source, enough for a 1-2 s GOP at 1080p. */
 #define NGX_RTC_GOP_RING_CAP  2048u
@@ -156,6 +195,24 @@ struct ngx_rtc_session_s {
      * the producer-side source GOP ring). Lazily allocated on first video. */
     ngx_rtc_rtp_ring_t rtx;
     uint8_t            rtx_gen;   /* bump each NACK window; 0 = never retransmitted */
+
+    /* Send pacing: token bucket filled at pacer_target_bps (bytes are tracked
+     * with integer math; one token = one byte). pacer_started distinguishes
+     * "never anchored" from "anchored at now_ms == 0" so the first admit only
+     * anchors the clock without a refill; the bucket starts full for an initial
+     * burst (fast-start GOP replay). */
+    uint8_t  pacer_started;
+    uint64_t pacer_target_bps;   /* AIMD-adjusted target send rate (bps) */
+    uint64_t pacer_tokens;       /* token bucket level in bytes */
+    uint64_t pacer_last_ms;      /* monotonic ms of the last refill */
+
+    /* TWCC loss window statistics. twcc_lost/twcc_received above are cumulative;
+     * the *_win_* counters accumulate one AIMD evaluation window and reset after
+     * each rate decision. */
+    uint32_t twcc_win_lost;
+    uint32_t twcc_win_received;
+    uint8_t  twcc_win_started;   /* 1 once the first feedback opened a window */
+    uint64_t twcc_win_start_ms;  /* window anchor (monotonic ms) */
 
 #ifdef NGX_PTR_SIZE
     /* nginx data-structure links (see header comment). The queue link is
@@ -319,5 +376,39 @@ int32_t ngx_rtc_session_rtx_retransmit(ngx_rtc_session_t *sess,
 void ngx_rtc_session_rtx_replay_gop(ngx_rtc_session_t *sess);
 void ngx_rtc_session_rtx_faststart(ngx_rtc_session_t *sess);
 void ngx_rtc_session_rtx_free(ngx_rtc_session_t *sess);
+
+/*
+ * Initialise the per-session pacer token bucket. start_bps is clamped to
+ * [NGX_RTC_PACER_MIN_BPS, NGX_RTC_PACER_MAX_BPS]; the bucket starts full (one
+ * NGX_RTC_PACER_BURST_MS burst) and the clock is anchored by the first admit.
+ */
+void ngx_rtc_session_pacer_init(ngx_rtc_session_t *sess, uint64_t start_bps);
+
+/*
+ * Try to admit one packet into the paced stream. Tokens are replenished at
+ * pacer_target_bps for every now_ms - pacer_last_ms elapsed, capped at one burst
+ * window. Returns NGX_RTC_OK when the packet is charged, NGX_RTC_AGAIN when
+ * there are not enough tokens yet (caller defers or drops), NGX_RTC_ERR_INVALID
+ * for a NULL session. now_ms is the monotonic clock in milliseconds.
+ */
+int32_t ngx_rtc_session_pacer_admit(ngx_rtc_session_t *sess, uint32_t pkt_bytes,
+                                    uint64_t now_ms);
+
+/*
+ * Feed one transport-cc feedback window into the loss-based rate controller.
+ * lost/received are this feedback's packet counts; they accumulate into the
+ * TWCC window and, once the window has enough packets or elapsed time, the
+ * target rate is AIMD-adjusted and the window resets.
+ */
+void ngx_rtc_session_on_twcc(ngx_rtc_session_t *sess, uint32_t lost,
+                             uint32_t received, uint64_t now_ms);
+
+/*
+ * Set the pacer target rate from an absolute bitrate hint (e.g. REMB). bps is
+ * clamped to [NGX_RTC_PACER_MIN_BPS, NGX_RTC_PACER_MAX_BPS]; the token bucket
+ * level is left untouched so a sudden cap does not drop an already-admitted
+ * burst.
+ */
+void ngx_rtc_session_pacer_set_target(ngx_rtc_session_t *sess, uint64_t bps);
 
 #endif /* NGX_RTC_CORE_H */

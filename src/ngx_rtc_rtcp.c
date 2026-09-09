@@ -254,6 +254,80 @@ static void ngx_rtc_rtcp_parse_twcc(const uint8_t *buf, uint32_t total,
     }
 }
 
+/*
+ * Decode a REMB PSFB FCI (draft-alvestrand-rmcat-remb). PT=206, FMT=15. The
+ * FCI after the 12-byte RTCP+media header is:
+ *
+ *   "REMB" (4 bytes)                                          unique identifier
+ *   (numSSRC<<24)|(brExp<<18)|(brMantissa)                    bitrate word
+ *   numSSRC * 4 bytes                                         SSRC feedback list
+ *
+ * bitrate = brMantissa * 2^brExp, in bits per second. A FMT=15 PSFB whose FCI
+ * does not start with "REMB" is an application-layer feedback of another kind
+ * and is left untouched (has_remb stays 0).
+ */
+static int32_t ngx_rtc_rtcp_parse_remb(const uint8_t *buf, uint32_t total,
+                                       ngx_rtc_rtcp_pkt_t *pkt)
+{
+    const uint8_t *p;
+    uint32_t fci;
+    uint32_t word;
+    uint32_t num_ssrc;
+    uint32_t br_exp;
+    uint32_t br_mantissa;
+    uint32_t keep;
+    uint32_t i;
+
+    fci = total - 12u;
+    if (fci < 4u)
+    {
+        return NGX_RTC_OK; /* FCI too short to hold the "REMB" magic: not REMB */
+    }
+
+    p = buf + 12;
+    if ((0x52u != p[0]) || (0x45u != p[1]) || (0x4Du != p[2]) || (0x42u != p[3]))
+    {
+        return NGX_RTC_OK; /* application-layer feedback, not REMB */
+    }
+
+    if (fci < 8u)
+    {
+        return NGX_RTC_ERR_PARSE; /* "REMB" magic present but the bitrate word is missing */
+    }
+
+    word = ngx_rtc_rtcp_rd_u32(p + 4);
+    num_ssrc = (word >> 24) & 0xffu;
+    br_exp = (word >> 18) & 0x3fu;
+    br_mantissa = word & 0x3ffffu;
+
+    if (fci < (8u + num_ssrc * 4u))
+    {
+        return NGX_RTC_ERR_PARSE; /* truncated SSRC feedback list */
+    }
+
+    pkt->has_remb = 1u;
+    pkt->remb_bitrate_bps = (uint32_t)((uint64_t)br_mantissa * (1ULL << br_exp));
+
+    keep = num_ssrc;
+    if (keep > NGX_RTC_RTCP_MAX_REMB_SSRCS)
+    {
+        keep = NGX_RTC_RTCP_MAX_REMB_SSRCS;
+    }
+    pkt->remb_ssrc_count = (uint16_t)keep;
+    p += 8;
+    for (i = 0; i < keep; i++)
+    {
+        pkt->remb_ssrcs[i] = ngx_rtc_rtcp_rd_u32(p);
+        p += 4;
+    }
+    if (keep > 0u)
+    {
+        pkt->remb_ssrc = pkt->remb_ssrcs[0];
+    }
+
+    return NGX_RTC_OK;
+}
+
 int32_t ngx_rtc_rtcp_parse(const uint8_t *buf, uint32_t len,
                            ngx_rtc_rtcp_pkt_t *pkt, uint32_t *consumed)
 {
@@ -381,6 +455,14 @@ int32_t ngx_rtc_rtcp_parse(const uint8_t *buf, uint32_t len,
             return NGX_RTC_ERR_PARSE;
         }
         pkt->media_ssrc = ngx_rtc_rtcp_rd_u32(buf + 8);
+        if (NGX_RTC_RTCP_FMT_REMB == fmt)
+        {
+            int32_t r = ngx_rtc_rtcp_parse_remb(buf, total, pkt);
+            if (NGX_RTC_OK != r)
+            {
+                return r;
+            }
+        }
         break;
 
     default:
