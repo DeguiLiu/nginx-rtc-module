@@ -35,8 +35,9 @@ ngx_rtc_stream_module(owner worker 出队 → SRTP → UDP)
   `include/` + `lib/`，不硬编码路径。
 - **多 worker 数据面**：明文 RTP 通过 `rtc_zone` 的 per-worker 媒体环 + eventfd
   跨进程投递，owner worker 做 SRTP 加密后发送。
-- **GOP 快照下沉 shm**：关键帧 AU（STAP-A + IDR）写入共享内存，任意 worker
-  订阅可立即回放，跨 worker 首帧免等自然 IDR。
+- **重传缓存下沉 shm**：每 source 一个固定窗口视频重传环写入共享内存，任意 worker
+  订阅可立即回放最新 GOP、NACK/PLI 按 seq 命中，跨 worker 首帧免等自然 IDR；同 worker
+  直接读进程内 GOP 环，无锁。
 - **音频线程隔离**：AAC→Opus 转码在独立 pthread 中执行，避免阻塞 nginx 事件循环。
 
 详细设计见发行仓 `nginx-rtc-example/docs/`。

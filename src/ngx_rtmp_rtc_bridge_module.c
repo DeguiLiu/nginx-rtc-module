@@ -466,6 +466,7 @@ ngx_rtmp_rtc_sync_shm(ngx_rtc_source_t *src, const char *name)
     if (NULL == shm_src) {
         return;
     }
+    src->shm_src = shm_src; /* lock-free subscriber-version reads in broadcast */
     ngx_rtc_shm_source_set_publishing(ccf->sh, (u_char *) name,
                                       ngx_strlen(name), 1);
 
@@ -548,6 +549,22 @@ ngx_rtmp_rtc_av(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h, ngx_chain_t *in)
         src->have_ts = 0;
         src->video_pkts = 0;
         src->video_octets = 0;
+
+        /* Drop stale video caches: a restart resets the RTP sequence to 0, so
+         * an old packet with a colliding seq would be served as a wrong
+         * fast-start / NACK retransmit. */
+        src->gop.count = 0;
+        src->gop.gop_start = 0;
+        {
+            ngx_rtc_core_conf_t *ccf;
+
+            ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
+            if (NULL != ccf && NULL != ccf->sh) {
+                ngx_rtc_shm_retransmit_reset(ccf->sh,
+                        (u_char *) name, ngx_strlen(name));
+            }
+        }
+
         /* The AVC sequence header may also span chain buffers; concatenate it
          * before parsing SPS/PPS. */
         body_len = ngx_rtmp_rtc_chain_copy(in, src->video_body,
@@ -876,8 +893,7 @@ ngx_rtc_broadcast_rtp(ngx_rtc_source_t *src, const uint8_t *rtp,
 {
     ngx_rtc_core_conf_t   *ccf;
     ngx_rtc_shm_ctx_t     *shm;
-    ngx_uint_t             snap[NGX_RTC_BRIDGE_MAX_SNAPSHOT];
-    ngx_int_t              slot[NGX_RTC_BRIDGE_MAX_SNAPSHOT];
+    ngx_rtc_shm_source_t  *shm_src;
     ngx_uint_t             n;
     ngx_uint_t             i;
     ngx_uint_t             w;
@@ -895,11 +911,20 @@ ngx_rtc_broadcast_rtp(ngx_rtc_source_t *src, const uint8_t *rtp,
     }
     shm = ccf->sh;
 
-    /* Snapshot ready subscribers under the pool mutex (find + copy happen
-     * together, so no slab pointer escapes the lock). */
-    n = ngx_rtc_shm_source_snapshot(shm, (u_char *) src->name,
-                                    ngx_strlen(src->name), snap, slot,
-                                    NGX_RTC_BRIDGE_MAX_SNAPSHOT);
+    /* Refresh the cached ready-subscriber snapshot only when the shm source's
+     * subscriber set changed; the steady-state hot path reads src->snap_* in
+     * process memory and never touches the slab pool mutex. */
+    shm_src = (ngx_rtc_shm_source_t *) src->shm_src;
+    if (NULL == shm_src
+            || (ngx_uint_t) shm_src->subscribers_version != src->snap_version) {
+        src->snap_count = ngx_rtc_shm_source_snapshot(shm, (u_char *) src->name,
+                ngx_strlen(src->name), src->snap_ids, src->snap_slots,
+                NGX_RTC_SOURCE_MAX_SNAPSHOT);
+        if (NULL != shm_src) {
+            src->snap_version = (ngx_uint_t) shm_src->subscribers_version;
+        }
+    }
+    n = src->snap_count;
     if (0 == n) {
         return;
     }
@@ -907,16 +932,14 @@ ngx_rtc_broadcast_rtp(ngx_rtc_source_t *src, const uint8_t *rtp,
     /* Same-worker fast path: send directly instead of bouncing through the shm
      * ring + eventfd. Cross-worker targets still go through the ring below. */
     for (i = 0; i < n; i++) {
-        if (slot[i] != (ngx_int_t) ngx_worker) {
+        if (src->snap_slots[i] != (ngx_int_t) ngx_worker) {
             continue;
         }
-        sess = ngx_rtc_session_find_by_id(snap[i]);
+        sess = ngx_rtc_session_find_by_id(src->snap_ids[i]);
         if (NULL == sess) {
             continue;
         }
-        if (0 != is_video) {
-            ngx_rtc_session_rtx_push(sess, rtp, len, is_gop_start);
-        }
+        /* No per-session copy: same-worker NACK/PLI reads src->gop directly. */
         (void) ngx_rtc_session_send_rtp(sess, rtp, len);
     }
 
@@ -932,9 +955,9 @@ ngx_rtc_broadcast_rtp(ngx_rtc_source_t *src, const uint8_t *rtp,
         entry.len = (uint16_t) len;
 
         for (i = 0; i < n; i++) {
-            if (slot[i] == (ngx_int_t) w
+            if (src->snap_slots[i] == (ngx_int_t) w
                     && nsess < NGX_RTC_RING_MAX_SESSIONS) {
-                entry.sess[nsess++] = snap[i];
+                entry.sess[nsess++] = src->snap_ids[i];
             }
         }
 
@@ -974,28 +997,17 @@ ngx_rtmp_rtc_emit(void *opaque, const uint8_t *rtp, uint32_t len)
     if (0 != ctx->is_video) {
         ngx_rtc_rtp_ring_push(&src->gop, rtp, len, ctx->is_gop_start);
 
-        /* Accumulate the keyframe access unit (STAP-A + IDR FU-A) into the shm
-         * snapshot once per IDR, so a cross-worker subscriber can replay it
-         * without waiting for the next natural keyframe. */
+        /* Mirror every video packet into the per-source shm retransmit ring so
+         * a cross-worker subscriber fast-starts and answers NACK/PLI from the
+         * same cache (no waiting for the next natural keyframe). */
         {
             ngx_rtc_core_conf_t *ccf;
 
             ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
             if (NULL != ccf && NULL != ccf->sh) {
-                if (0 != ctx->is_gop_start) {
-                    ngx_rtc_shm_gop_snapshot_reset(ccf->sh,
-                            (u_char *) src->name, ngx_strlen(src->name));
-                    src->snapshot_active = 1;
-                }
-
-                if (0 != src->snapshot_active) {
-                    ngx_rtc_shm_gop_snapshot_append(ccf->sh,
-                            (u_char *) src->name, ngx_strlen(src->name),
-                            rtp, len);
-                    if (rtp[1] & 0x80u) {
-                        src->snapshot_active = 0; /* keyframe AU complete */
-                    }
-                }
+                ngx_rtc_shm_retransmit_append(ccf->sh,
+                        (u_char *) src->name, ngx_strlen(src->name),
+                        rtp, len, ctx->is_gop_start);
             }
         }
     }

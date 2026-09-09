@@ -13,8 +13,8 @@
 #include <ngx_event.h>
 #include <ngx_stream.h>
 
-#include <arpa/inet.h>
 #include <time.h>
+#include <arpa/inet.h>
 
 #include "ngx_rtc_stun.h"
 #include "ngx_rtc_dtls.h"
@@ -98,6 +98,9 @@ static void       ngx_rtc_stream_drain_ring(void);
 static void       ngx_rtc_stream_notify_handler(ngx_event_t *ev);
 static ngx_int_t  ngx_rtc_stream_shm_gop_send(void *opaque,
                      const uint8_t *rtp, uint32_t len, uint8_t is_gop_start);
+static int32_t    ngx_rtc_stream_retransmit(ngx_rtc_session_t *sess,
+                     uint16_t seq);
+static void       ngx_rtc_stream_replay_gop(ngx_rtc_session_t *sess);
 static char      *ngx_rtc_stream_rtc(ngx_conf_t *cf, ngx_command_t *cmd,
                      void *conf);
 static void      *ngx_rtc_stream_create_srv_conf(ngx_conf_t *cf);
@@ -678,25 +681,18 @@ ngx_rtc_stream_on_srtp(ngx_stream_session_t *s, ngx_rtc_session_t *sess,
         }
     }
 
-    /* Accumulate the keyframe AU into the shm snapshot, mirroring the RTMP
-     * producer so any cross-worker player gets its first frame immediately. */
+    /* Cache the plaintext video packet in the source GOP ring (same-worker
+     * fast-start/NACK) and the shm retransmit ring (cross-worker), mirroring
+     * the RTMP bridge emit path so NACK/PLI answer uniformly. */
     if (0 != is_video) {
+        ngx_rtc_rtp_ring_push(&sess->source->gop, data, (uint32_t) n,
+                              is_gop_start);
         ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
         if (NULL != ccf && NULL != ccf->sh) {
-            if (0 != is_gop_start) {
-                ngx_rtc_shm_gop_snapshot_reset(ccf->sh,
-                        (u_char *) sess->source->name,
-                        ngx_strlen(sess->source->name));
-                sess->snapshot_active = 1;
-            }
-            if (0 != sess->snapshot_active) {
-                ngx_rtc_shm_gop_snapshot_append(ccf->sh,
-                        (u_char *) sess->source->name,
-                        ngx_strlen(sess->source->name), data, (uint32_t) n);
-                if (data[1] & 0x80u) {
-                    sess->snapshot_active = 0; /* keyframe AU complete */
-                }
-            }
+            ngx_rtc_shm_retransmit_append(ccf->sh,
+                    (u_char *) sess->source->name,
+                    ngx_strlen(sess->source->name), data, (uint32_t) n,
+                    is_gop_start);
         }
     }
 }
@@ -729,11 +725,9 @@ ngx_rtc_stream_rtcp_cb(const ngx_rtc_rtcp_pkt_t *pkt, void *opaque)
                 if (now - sess->nack_window_start >= NGX_RTC_NACK_WINDOW_MS) {
                     sess->nack_window_start = now;
                     sess->nack_retransmitted = 0;
-                    /* New dedup generation: a packet already answered in a
-                     * previous window may be sent again (0 stays reserved). */
-                    if (0 == ++sess->rtx_gen) {
-                        ++sess->rtx_gen;
-                    }
+                    /* New window: clear the dedup set so a packet answered in
+                     * a previous window may be sent again. */
+                    ngx_rtc_session_nack_reset(sess);
                 }
 
                 for (i = 0; i < n; i++) {
@@ -743,7 +737,7 @@ ngx_rtc_stream_rtcp_cb(const ngx_rtc_rtcp_pkt_t *pkt, void *opaque)
                         break;
                     }
 
-                    if (ngx_rtc_session_rtx_retransmit(sess, seqs[i])
+                    if (ngx_rtc_stream_retransmit(sess, seqs[i])
                             == NGX_RTC_OK) {
                         sess->nack_retransmitted++;
                     }
@@ -753,14 +747,9 @@ ngx_rtc_stream_rtcp_cb(const ngx_rtc_rtcp_pkt_t *pkt, void *opaque)
     } else if (NGX_RTC_RTCP_PSFB == pkt->type
                && NGX_RTC_RTCP_FMT_PLI == pkt->fmt) {
         if (pkt->media_ssrc == sess->source->video_ssrc) {
-            /* Re-send the most recent keyframe for fast recovery. The producer-
-             * side GOP ring may be empty on this worker (cross-worker), so
-             * prefer this session's own RTX ring and fall back to the GOP. */
-            if (0 == sess->rtx.count) {
-                ngx_rtc_rtp_ring_replay(&sess->source->gop, sess);
-            } else {
-                ngx_rtc_session_rtx_replay_gop(sess);
-            }
+            /* Re-send the most recent keyframe from the shared cache: the
+             * source GOP ring same-worker, the shm retransmit ring cross-worker. */
+            ngx_rtc_stream_replay_gop(sess);
         }
     } else if (NGX_RTC_RTCP_RTPFB == pkt->type
                && NGX_RTC_RTCP_FMT_TWCC == pkt->fmt) {
@@ -932,24 +921,10 @@ ngx_rtc_stream_dtls_done(void *user)
     if (NULL != sess->source && 0 == sess->publishing) {
         ngx_rtc_source_subscribe(sess->source, sess);
 
-        /* Replay the latest GOP from shm so a cross-worker subscriber gets its
-         * first keyframe immediately (the per-process GOP ring is empty here).
-         * Fall back to the local faststart when shm has nothing yet. */
-        {
-            ngx_rtc_core_conf_t *ccf;
-
-            ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
-            if (NULL != ccf && NULL != ccf->sh) {
-                (void) ngx_rtc_shm_gop_snapshot_replay(ccf->sh,
-                        (u_char *) sess->source->name,
-                        ngx_strlen(sess->source->name),
-                        ngx_rtc_stream_shm_gop_send, sess);
-            }
-        }
-
-        if (0 == sess->rtx.count) {
-            ngx_rtc_session_rtx_faststart(sess);
-        }
+        /* Replay the latest GOP from the shared cache so a late subscriber
+         * decodes its first frame immediately: the source GOP ring same-worker,
+         * the shm retransmit ring cross-worker. */
+        ngx_rtc_stream_replay_gop(sess);
     }
 
     /* Phase 1: mark the cross-worker session skeleton ready and link it into
@@ -1056,7 +1031,6 @@ ngx_rtc_stream_session_close(ngx_rtc_session_t *sess,
     ngx_rtc_stream_dtls_cancel(sess);
     ngx_rtc_srtp_destroy(&sess->srtp);
     ngx_rtc_dtls_destroy(&sess->dtls);
-    ngx_rtc_session_rtx_free(sess);
 
     ngx_free(sess);
 }
@@ -1103,12 +1077,8 @@ ngx_rtc_stream_drain_ring(void)
         for (i = 0; i < entry.nsess; i++) {
             sess = ngx_rtc_session_find_by_id(entry.sess[i]);
             if (NULL != sess) {
-                /* Cache video before the send so a NACK of a dropped datagram
-                 * (EAGAIN etc.) can be answered from this session's own ring. */
-                if (0 == entry.media) {
-                    ngx_rtc_session_rtx_push(sess, entry.rtp, entry.len,
-                            (uint8_t)(0 != entry.gop ? 1 : 0));
-                }
+                /* No per-session cache: NACK/PLI for this session is answered
+                 * from the shm retransmit ring (cross-worker). */
                 (void) ngx_rtc_session_send_rtp(sess, entry.rtp, entry.len);
             }
         }
@@ -1142,12 +1112,64 @@ ngx_rtc_stream_shm_gop_send(void *opaque, const uint8_t *rtp, uint32_t len,
 {
     ngx_rtc_session_t *sess = opaque;
 
-    ngx_rtc_session_rtx_push(sess, rtp, len, is_gop_start);
+    (void) is_gop_start;
+
     if (0 == ngx_rtc_session_send_rtp(sess, rtp, len)) {
         return NGX_ERROR; /* socket full: stop the replay burst */
     }
 
     return NGX_OK;
+}
+
+
+/* Retransmit one video packet to a session, resolved from the source GOP ring
+ * (same-worker, lock-free) or the shm retransmit ring (cross-worker, per-ring
+ * lock). Dedup is applied in ngx_rtc_session_retransmit_send. */
+static int32_t
+ngx_rtc_stream_retransmit(ngx_rtc_session_t *sess, uint16_t seq)
+{
+    ngx_rtc_core_conf_t *ccf;
+    u_char               scratch[NGX_RTC_RING_RTP_MAX];
+    uint16_t             out_len;
+
+    if (0 != ngx_rtc_source_gop_ready(sess->source)) {
+        return ngx_rtc_session_retransmit(sess, seq);
+    }
+
+    ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
+    if (NULL == ccf || NULL == ccf->sh) {
+        return NGX_RTC_ERR_PARSE;
+    }
+
+    if (ngx_rtc_shm_retransmit_get(ccf->sh, (u_char *) sess->source->name,
+            ngx_strlen(sess->source->name), seq,
+            scratch, sizeof(scratch), &out_len) != NGX_OK) {
+        return NGX_RTC_ERR_PARSE;
+    }
+
+    return ngx_rtc_session_retransmit_send(sess, seq, scratch, out_len);
+}
+
+
+/* Replay the latest GOP to a session from the shared cache: the source GOP ring
+ * same-worker, the shm retransmit ring cross-worker. */
+static void
+ngx_rtc_stream_replay_gop(ngx_rtc_session_t *sess)
+{
+    ngx_rtc_core_conf_t *ccf;
+
+    if (0 != ngx_rtc_source_gop_ready(sess->source)) {
+        ngx_rtc_rtp_ring_replay(&sess->source->gop, sess);
+        return;
+    }
+
+    ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
+    if (NULL != ccf && NULL != ccf->sh) {
+        (void) ngx_rtc_shm_retransmit_replay_gop(ccf->sh,
+                (u_char *) sess->source->name,
+                ngx_strlen(sess->source->name),
+                ngx_rtc_stream_shm_gop_send, sess);
+    }
 }
 
 

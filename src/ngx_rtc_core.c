@@ -528,9 +528,7 @@ ngx_rtc_rtp_ring_push(ngx_rtc_rtp_ring_t *r, const uint8_t *rtp, uint32_t len,
 
     ngx_memcpy(slot->data, rtp, len);
     slot->len = (uint16_t)len;
-    slot->seq = r->head;
     slot->is_gop_start = (uint8_t)(0 != is_gop_start ? 1 : 0);
-    slot->rtx_gen = 0; /* a fresh packet has never been retransmitted */
 
     if (0 != is_gop_start) {
         r->gop_start = r->head;
@@ -632,169 +630,75 @@ ngx_rtc_rtp_ring_get(ngx_rtc_rtp_ring_t *r, uint16_t rtp_seq,
 }
 
 
-/* Internal: locate a ring slot by its 16-bit RTP sequence number. NULL when the
- * ring is empty or the sequence is outside the retained window. Shared by the
- * ring_get NACK lookup and the per-session RTX retransmitter. */
-static ngx_rtc_rtp_cache_slot_t *
-ngx_rtc_rtp_ring_locate(ngx_rtc_rtp_ring_t *r, uint16_t rtp_seq)
+int
+ngx_rtc_source_gop_ready(const ngx_rtc_source_t *src)
 {
-    ngx_rtc_rtp_cache_slot_t *slot;
-    uint32_t                  start;
-    uint16_t                  start_seq;
-    uint16_t                  dist;
-    uint32_t                  idx;
-
-    if (NULL == r || 0 == r->count || NULL == r->slots) {
-        return NULL;
-    }
-
-    start = r->head - r->count;
-    idx = start & (r->capacity - 1u);
-    start_seq = ngx_rtc_rtp_seq_from_data(r->slots[idx].data);
-
-    dist = (uint16_t)(rtp_seq - start_seq);
-    if ((uint32_t)dist >= r->count) {
-        return NULL; /* outside the retained window */
-    }
-
-    idx = (start + (uint32_t)dist) & (r->capacity - 1u);
-    slot = &r->slots[idx];
-    if (ngx_rtc_rtp_seq_from_data(slot->data) != rtp_seq) {
-        return NULL; /* safety: slot does not match */
-    }
-
-    return slot;
+    return (NULL != src && NULL != src->gop.slots && 0 != src->gop.count) ? 1 : 0;
 }
 
-
 void
-ngx_rtc_session_rtx_push(ngx_rtc_session_t *sess, const uint8_t *rtp,
-                         uint32_t len, uint8_t is_gop_start)
+ngx_rtc_session_nack_reset(ngx_rtc_session_t *sess)
 {
-    if (NULL == sess || NULL == rtp || 0 == len
-            || len > NGX_RTC_MAX_RTP_PKT) {
+    if (NULL == sess) {
         return;
     }
 
-    if (0 == ngx_rtc_rtp_ring_reserve(&sess->rtx, NGX_RTC_RTX_RING_CAP)) {
-        return; /* cache unavailable; live send still proceeds */
-    }
-
-    ngx_rtc_rtp_ring_push(&sess->rtx, rtp, len, is_gop_start);
+    sess->nack_seen_count = 0;
 }
 
-
 int32_t
-ngx_rtc_session_rtx_retransmit(ngx_rtc_session_t *sess, uint16_t seq)
+ngx_rtc_session_retransmit_send(ngx_rtc_session_t *sess, uint16_t seq,
+                                const uint8_t *data, uint32_t len)
 {
-    ngx_rtc_rtp_cache_slot_t *slot;
+    ngx_uint_t i;
 
-    if (NULL == sess) {
+    if (NULL == sess || NULL == data || 0 == len) {
         return NGX_RTC_ERR_INVALID;
     }
 
-    slot = ngx_rtc_rtp_ring_locate(&sess->rtx, seq);
-    if (NULL == slot) {
-        return NGX_RTC_ERR_PARSE; /* outside this session's cache window */
-    }
-    if (slot->rtx_gen == sess->rtx_gen) {
-        return NGX_RTC_ERR_PARSE; /* already retransmitted this NACK window */
+    /* Per-window dedup: a seq already retransmitted this window is skipped. */
+    for (i = 0; i < sess->nack_seen_count; i++) {
+        if (sess->nack_seen[i] == seq) {
+            return NGX_RTC_ERR_PARSE;
+        }
     }
 
-    if (0 == ngx_rtc_session_send_rtp(sess, slot->data, slot->len)) {
+    if (0 == ngx_rtc_session_send_rtp(sess, data, len)) {
         return NGX_RTC_ERR_PARSE; /* socket not draining; leave the budget */
     }
 
-    slot->rtx_gen = sess->rtx_gen;
+    /* Record the seq for dedup. Bounded by NGX_RTC_NACK_BUDGET: the only caller
+     * (the NACK handler) caps retransmits per window at the same budget, so one
+     * entry per successful retransmit keeps count <= budget. Beyond the budget
+     * no further retransmit can occur in the window, so a full set is inert. */
+    if (sess->nack_seen_count < NGX_RTC_NACK_BUDGET) {
+        sess->nack_seen[sess->nack_seen_count++] = seq;
+    }
+
     return NGX_RTC_OK;
 }
 
-
-/* PLI fallback: replay the latest decodable GOP from this session's own RTX
- * ring. Cross-worker safe (the producer-side source GOP ring may be empty on
- * this worker). */
-void
-ngx_rtc_session_rtx_replay_gop(ngx_rtc_session_t *sess)
+int32_t
+ngx_rtc_session_retransmit(ngx_rtc_session_t *sess, uint16_t seq)
 {
-    ngx_rtc_rtp_ring_t *r;
-    uint32_t            i;
-    uint32_t            start;
-    uint32_t            idx;
-
-    if (NULL == sess) {
-        return;
-    }
-
-    r = &sess->rtx;
-    if (0 == r->count || NULL == r->slots) {
-        return;
-    }
-
-    start = r->head - r->count;
-    if (r->gop_start > start) {
-        start = r->gop_start; /* clamp to the latest IDR access unit */
-    }
-
-    for (i = start; i < r->head; i++) {
-        idx = i & (r->capacity - 1u);
-        if (0 == ngx_rtc_session_send_rtp(sess, r->slots[idx].data,
-                                          r->slots[idx].len)) {
-            break; /* socket full: stop, the next PLI/NACK recovers */
-        }
-    }
-}
-
-
-/* Fast-start on subscribe. If the producer lives in this worker, replay the
- * source GOP ring and warm the session RTX ring on the way so an immediate NACK
- * is answerable; otherwise replay this session's own RTX ring if it has data. */
-void
-ngx_rtc_session_rtx_faststart(ngx_rtc_session_t *sess)
-{
-    ngx_rtc_rtp_ring_t *g;
-    uint32_t            i;
-    uint32_t            start;
-    uint32_t            idx;
+    const uint8_t *out;
+    uint16_t       out_len;
+    int32_t        rc;
 
     if (NULL == sess || NULL == sess->source) {
-        return;
+        return NGX_RTC_ERR_INVALID;
     }
 
-    g = &sess->source->gop;
-    if (0 == sess->rtx.count && 0 != g->count && NULL != g->slots) {
-        start = g->head - g->count;
-        if (g->gop_start > start) {
-            start = g->gop_start;
-        }
-
-        for (i = start; i < g->head; i++) {
-            idx = i & (g->capacity - 1u);
-            ngx_rtc_session_rtx_push(sess, g->slots[idx].data,
-                                     g->slots[idx].len,
-                                     g->slots[idx].is_gop_start);
-            if (0 == ngx_rtc_session_send_rtp(sess, g->slots[idx].data,
-                                              g->slots[idx].len)) {
-                break;
-            }
-        }
-        return;
+    if (0 == ngx_rtc_source_gop_ready(sess->source)) {
+        return NGX_RTC_ERR_PARSE; /* no local cache; caller uses the shm ring */
     }
 
-    ngx_rtc_session_rtx_replay_gop(sess);
-}
-
-
-void
-ngx_rtc_session_rtx_free(ngx_rtc_session_t *sess)
-{
-    if (NULL == sess || NULL == sess->rtx.slots) {
-        return;
+    rc = ngx_rtc_rtp_ring_get(&sess->source->gop, seq, &out, &out_len);
+    if (rc != NGX_RTC_OK) {
+        return rc; /* outside the retained window */
     }
 
-    free(sess->rtx.slots);
-    sess->rtx.slots = NULL;
-    sess->rtx.capacity = 0;
-    sess->rtx.count = 0;
+    return ngx_rtc_session_retransmit_send(sess, seq, out, out_len);
 }
 
 

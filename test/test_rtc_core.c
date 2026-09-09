@@ -350,114 +350,69 @@ static void rtx_ready_session(ngx_rtc_session_t *sess, fake_conn_t *conn)
     sess->conn = (void *)conn;
 }
 
-NGX_RTC_TEST(rtx_retransmit_dedup_per_window)
+NGX_RTC_TEST(retransmit_dedup_per_window)
 {
+    ngx_rtc_source_t  src;
     ngx_rtc_session_t sess;
     fake_conn_t       conn;
-    uint8_t           pkt[CORE_PKT_LEN];
 
+    (void)memset(&src, 0, sizeof(src));
     rtx_ready_session(&sess, &conn);
+    sess.source = &src;
     g_replay_count = 0;
 
-    /* Cache four video packets, the first opening a GOP. */
-    make_rtp(pkt, 100u, 0u);
-    ngx_rtc_session_rtx_push(&sess, pkt, sizeof(pkt), 1u);
-    make_rtp(pkt, 101u, 0u);
-    ngx_rtc_session_rtx_push(&sess, pkt, sizeof(pkt), 0u);
-    make_rtp(pkt, 102u, 0u);
-    ngx_rtc_session_rtx_push(&sess, pkt, sizeof(pkt), 0u);
-    make_rtp(pkt, 103u, 0u);
-    ngx_rtc_session_rtx_push(&sess, pkt, sizeof(pkt), 0u);
+    /* Cache four video packets in the source GOP ring, the first opening a GOP. */
+    push_seq(&src.gop, 100u, 1u);
+    push_seq(&src.gop, 101u, 0u);
+    push_seq(&src.gop, 102u, 0u);
+    push_seq(&src.gop, 103u, 0u);
 
-    /* First window: 100 is retransmitted once, a duplicate NACK is skipped. */
-    sess.rtx_gen = 1;
-    NGX_RTC_TEST_ASSERT_I64_EQ(
-        ngx_rtc_session_rtx_retransmit(&sess, 100u), NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT(ngx_rtc_source_gop_ready(&src));
+
+    /* 100 is retransmitted once, a duplicate NACK in the window is skipped. */
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_session_retransmit(&sess, 100u),
+                               NGX_RTC_OK);
     NGX_RTC_TEST_ASSERT_I64_EQ(g_replay_count, 1);
     NGX_RTC_TEST_ASSERT_U64_EQ(g_replay_seq[0], 100u);
 
-    NGX_RTC_TEST_ASSERT_I64_EQ(
-        ngx_rtc_session_rtx_retransmit(&sess, 100u), NGX_RTC_ERR_PARSE);
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_session_retransmit(&sess, 100u),
+                               NGX_RTC_ERR_PARSE);
     NGX_RTC_TEST_ASSERT_I64_EQ(g_replay_count, 1); /* dedup: not re-sent */
 
-    NGX_RTC_TEST_ASSERT_I64_EQ(
-        ngx_rtc_session_rtx_retransmit(&sess, 102u), NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_session_retransmit(&sess, 102u),
+                               NGX_RTC_OK);
     NGX_RTC_TEST_ASSERT_I64_EQ(g_replay_count, 2);
     NGX_RTC_TEST_ASSERT_U64_EQ(g_replay_seq[1], 102u);
 
     /* Outside the retained window is a miss. */
-    NGX_RTC_TEST_ASSERT_I64_EQ(
-        ngx_rtc_session_rtx_retransmit(&sess, 999u), NGX_RTC_ERR_PARSE);
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_session_retransmit(&sess, 999u),
+                               NGX_RTC_ERR_PARSE);
     NGX_RTC_TEST_ASSERT_I64_EQ(g_replay_count, 2);
 
-    /* New NACK window (generation bump): 100 may be sent again. */
-    sess.rtx_gen = 2;
-    NGX_RTC_TEST_ASSERT_I64_EQ(
-        ngx_rtc_session_rtx_retransmit(&sess, 100u), NGX_RTC_OK);
+    /* New NACK window (dedup set cleared): 100 may be sent again. */
+    ngx_rtc_session_nack_reset(&sess);
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_session_retransmit(&sess, 100u),
+                               NGX_RTC_OK);
     NGX_RTC_TEST_ASSERT_I64_EQ(g_replay_count, 3);
 
-    ngx_rtc_session_rtx_free(&sess);
+    free(src.gop.slots);
 }
 
-NGX_RTC_TEST(rtx_replay_gop_clamps_to_latest_gop)
+NGX_RTC_TEST(retransmit_misses_when_source_gop_empty)
 {
+    ngx_rtc_source_t  src;
     ngx_rtc_session_t sess;
     fake_conn_t       conn;
-    uint8_t           pkt[CORE_PKT_LEN];
-    uint32_t          i;
 
+    (void)memset(&src, 0, sizeof(src));
     rtx_ready_session(&sess, &conn);
-    g_replay_count = 0;
+    sess.source = &src;
 
-    /* A first GOP (seq 100..103), then a newer GOP starting at 200. */
-    make_rtp(pkt, 100u, 0u);
-    ngx_rtc_session_rtx_push(&sess, pkt, sizeof(pkt), 1u);
-    for (i = 101u; i < 104u; i++) {
-        make_rtp(pkt, (uint16_t)i, 0u);
-        ngx_rtc_session_rtx_push(&sess, pkt, sizeof(pkt), 0u);
-    }
-    make_rtp(pkt, 200u, 0u);
-    ngx_rtc_session_rtx_push(&sess, pkt, sizeof(pkt), 1u);
-    for (i = 201u; i < 204u; i++) {
-        make_rtp(pkt, (uint16_t)i, 0u);
-        ngx_rtc_session_rtx_push(&sess, pkt, sizeof(pkt), 0u);
-    }
-
-    ngx_rtc_session_rtx_replay_gop(&sess);
-
-    /* PLI replay must start at the latest IDR (200) and skip the old GOP. */
-    NGX_RTC_TEST_ASSERT_I64_EQ(g_replay_count, 4);
-    NGX_RTC_TEST_ASSERT_U64_EQ(g_replay_seq[0], 200u);
-    NGX_RTC_TEST_ASSERT_U64_EQ(g_replay_seq[3], 203u);
-
-    ngx_rtc_session_rtx_free(&sess);
-}
-
-NGX_RTC_TEST(rtx_push_reserves_lazily_and_caches)
-{
-    ngx_rtc_session_t sess;
-    fake_conn_t       conn;
-    uint8_t           pkt[CORE_PKT_LEN];
-    const uint8_t    *out = NULL;
-    uint16_t          out_len = 0;
-
-    rtx_ready_session(&sess, &conn);
-
-    /* Nothing allocated until the first video packet arrives. */
-    NGX_RTC_TEST_ASSERT(NULL == sess.rtx.slots);
-
-    make_rtp(pkt, 100u, 0u);
-    ngx_rtc_session_rtx_push(&sess, pkt, sizeof(pkt), 1u);
-
-    NGX_RTC_TEST_ASSERT(NULL != sess.rtx.slots);
-    NGX_RTC_TEST_ASSERT_U64_EQ(sess.rtx.capacity, NGX_RTC_RTX_RING_CAP);
-    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtp_ring_get(&sess.rtx, 100u,
-                                                    &out, &out_len),
-                               NGX_RTC_OK);
-    NGX_RTC_TEST_ASSERT_I64_EQ(out_len, CORE_PKT_LEN);
-
-    ngx_rtc_session_rtx_free(&sess);
-    NGX_RTC_TEST_ASSERT(NULL == sess.rtx.slots);
+    /* A non-publisher worker's GOP ring is not yet populated: no local cache,
+     * so a retransmit is a miss (the caller routes to the shm retransmit ring). */
+    NGX_RTC_TEST_ASSERT(0 == ngx_rtc_source_gop_ready(&src));
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_session_retransmit(&sess, 100u),
+                               NGX_RTC_ERR_PARSE);
 }
 
 /* ------------------------------------------------------------------ */

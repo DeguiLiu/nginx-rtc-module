@@ -14,7 +14,6 @@
 #include "ngx_rtc_rtp.h"
 
 #include <sys/eventfd.h>
-
 #include <execinfo.h>
 #include <signal.h>
 #include <unistd.h>
@@ -338,13 +337,6 @@ ngx_rtc_shm_source_get(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len)
     src->video_pt = NGX_RTC_PAYLOAD_TYPE_H264;
     src->audio_pt = NGX_RTC_PAYLOAD_TYPE_OPUS;
 
-    src->snapshot = ngx_slab_alloc_locked(ctx->pool,
-            NGX_RTC_SHM_GOP_SNAPSHOT_MAX
-            * sizeof(ngx_rtc_shm_gop_snapshot_pkt_t));
-    if (NULL != src->snapshot) {
-        src->snapshot_cap = NGX_RTC_SHM_GOP_SNAPSHOT_MAX;
-    }
-
     src->sn.str.data = src->name;
     src->sn.str.len = len;
     src->sn.node.key = hash;
@@ -387,6 +379,9 @@ ngx_rtc_shm_source_remove(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len)
 
     ngx_queue_remove(&src->queue);
     ngx_rbtree_delete(&ctx->source_tree, &src->sn.node);
+    if (NULL != src->retransmit) {
+        ngx_slab_free_locked(ctx->pool, src->retransmit);
+    }
     ngx_slab_free_locked(ctx->pool, src);
 
     ngx_shmtx_unlock(&ctx->pool->mutex);
@@ -517,6 +512,7 @@ ngx_rtc_shm_session_free_locked(ngx_rtc_shm_ctx_t *ctx,
     src = sess->source;
     if (NULL != src) {
         ngx_queue_remove(&sess->sub_queue);
+        src->subscribers_version++;
     }
 
     ngx_queue_remove(&sess->queue);
@@ -625,6 +621,7 @@ ngx_rtc_shm_session_activate(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag, size_t len,
     if (0 == sess->publishing && NULL != sess->source
             && sess->sub_queue.next == &sess->sub_queue) {
         ngx_queue_insert_head(&sess->source->subscribers, &sess->sub_queue);
+        sess->source->subscribers_version++;
         sess->source->expires = 0; /* has at least one viewer */
     }
 
@@ -974,10 +971,44 @@ ngx_rtc_shm_source_snapshot(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
 }
 
 
-void
-ngx_rtc_shm_gop_snapshot_reset(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len)
+/* Lazily allocate the per-source retransmit ring. Caller holds pool mutex. */
+static ngx_rtc_shm_retransmit_t *
+ngx_rtc_shm_retransmit_alloc_locked(ngx_rtc_shm_ctx_t *ctx,
+                                    ngx_rtc_shm_source_t *src)
 {
-    ngx_rtc_shm_source_t *src;
+    ngx_rtc_shm_retransmit_t *r;
+    size_t                    size;
+
+    size = sizeof(ngx_rtc_shm_retransmit_t)
+         + (NGX_RTC_SHM_RETX_RING_CAP - 1u)
+           * sizeof(ngx_rtc_shm_retransmit_slot_t);
+    r = ngx_slab_alloc_locked(ctx->pool, size);
+    if (NULL == r) {
+        return NULL;
+    }
+
+    ngx_memzero(r, size);
+    r->cap = NGX_RTC_SHM_RETX_RING_CAP;
+    (void) ngx_shmtx_create(&r->mtx, &r->mtx_sh, (u_char *) "rtc_retx");
+
+    src->retransmit = r;
+    return r;
+}
+
+
+/* 16-bit RTP sequence number carried in a plaintext RTP header. */
+static uint16_t
+ngx_rtc_shm_retx_seq(const u_char *data)
+{
+    return (uint16_t)(((uint16_t)data[2] << 8) | (uint16_t)data[3]);
+}
+
+
+void
+ngx_rtc_shm_retransmit_reset(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len)
+{
+    ngx_rtc_shm_source_t      *src;
+    ngx_rtc_shm_retransmit_t  *r;
 
     if (NULL == ctx || NULL == name || 0 == len
             || len >= NGX_RTC_SHM_SOURCE_NAME_MAX) {
@@ -986,20 +1017,30 @@ ngx_rtc_shm_gop_snapshot_reset(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len)
 
     ngx_shmtx_lock(&ctx->pool->mutex);
     src = ngx_rtc_shm_source_locked_lookup(ctx, name, len);
-    if (NULL != src) {
-        src->snapshot_count = 0;
+    if (NULL == src || NULL == src->retransmit) {
+        ngx_shmtx_unlock(&ctx->pool->mutex);
+        return;
     }
+    r = src->retransmit;
     ngx_shmtx_unlock(&ctx->pool->mutex);
+
+    ngx_shmtx_lock(&r->mtx);
+    r->head = 0;      /* new generation: indices restart, not just count */
+    r->count = 0;
+    r->gop_start = 0;
+    ngx_shmtx_unlock(&r->mtx);
 }
 
 
 void
-ngx_rtc_shm_gop_snapshot_append(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
-                                const uint8_t *rtp, uint32_t rtp_len)
+ngx_rtc_shm_retransmit_append(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
+                              const uint8_t *rtp, uint32_t rtp_len,
+                              uint8_t is_gop_start)
 {
-    ngx_rtc_shm_source_t         *src;
-    ngx_rtc_shm_gop_snapshot_pkt_t *pkt;
-    ngx_uint_t                    n;
+    ngx_rtc_shm_source_t      *src;
+    ngx_rtc_shm_retransmit_t  *r;
+    ngx_rtc_shm_retransmit_slot_t *slot;
+    ngx_uint_t                 idx;
 
     if (NULL == ctx || NULL == name || 0 == len
             || len >= NGX_RTC_SHM_SOURCE_NAME_MAX
@@ -1010,35 +1051,107 @@ ngx_rtc_shm_gop_snapshot_append(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len
 
     ngx_shmtx_lock(&ctx->pool->mutex);
     src = ngx_rtc_shm_source_locked_lookup(ctx, name, len);
-    if (NULL == src || NULL == src->snapshot || 0 == src->snapshot_cap) {
+    if (NULL == src) {
         ngx_shmtx_unlock(&ctx->pool->mutex);
         return;
     }
-
-    n = (ngx_uint_t) src->snapshot_count;
-    if (n < src->snapshot_cap) {
-        pkt = &src->snapshot[n];
-        ngx_memcpy(pkt->data, rtp, rtp_len);
-        pkt->len = rtp_len;
-        src->snapshot_count = n + 1;
-    } else if (n == src->snapshot_cap) {
-        /* IDR larger than the snapshot: mark it invalid and skip. */
-        src->snapshot_count = src->snapshot_cap + 1;
+    r = src->retransmit;
+    if (NULL == r) {
+        r = ngx_rtc_shm_retransmit_alloc_locked(ctx, src);
+        if (NULL == r) {
+            src->retransmit_alloc_failed++;
+            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                          "ngx_rtc: retransmit ring alloc failed for "
+                          "source \"%V\"", &src->sn.str);
+            ngx_shmtx_unlock(&ctx->pool->mutex);
+            return; /* allocation failed: retransmit stays unavailable */
+        }
     }
-
     ngx_shmtx_unlock(&ctx->pool->mutex);
+
+    ngx_shmtx_lock(&r->mtx);
+    idx = r->head & (r->cap - 1u);
+    slot = &r->slots[idx];
+    ngx_memcpy(slot->data, rtp, rtp_len);
+    slot->len = (uint16_t) rtp_len;
+    slot->is_gop_start = (uint8_t)(0 != is_gop_start ? 1 : 0);
+    if (0 != is_gop_start) {
+        r->gop_start = r->head;
+    }
+    r->head++;
+    if (r->count < r->cap) {
+        r->count++;
+    }
+    ngx_shmtx_unlock(&r->mtx);
 }
 
 
 ngx_int_t
-ngx_rtc_shm_gop_snapshot_replay(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
-                                ngx_rtc_shm_gop_cb cb, void *opaque)
+ngx_rtc_shm_retransmit_get(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
+                           uint16_t rtp_seq, u_char *out, size_t out_cap,
+                           uint16_t *out_len)
 {
-    ngx_rtc_shm_source_t         *src;
-    ngx_rtc_shm_gop_snapshot_pkt_t *pkt;
-    ngx_uint_t                    i;
-    ngx_uint_t                    n;
-    ngx_int_t                     rc;
+    ngx_rtc_shm_source_t      *src;
+    ngx_rtc_shm_retransmit_t  *r;
+    ngx_rtc_shm_retransmit_slot_t *slot;
+    ngx_uint_t                 start;
+    ngx_uint_t                 idx;
+    uint16_t                   start_seq;
+    uint16_t                   dist;
+    ngx_int_t                  rc;
+
+    if (NULL == ctx || NULL == name || 0 == len
+            || len >= NGX_RTC_SHM_SOURCE_NAME_MAX
+            || NULL == out || NULL == out_len) {
+        return NGX_DECLINED;
+    }
+
+    ngx_shmtx_lock(&ctx->pool->mutex);
+    src = ngx_rtc_shm_source_locked_lookup(ctx, name, len);
+    if (NULL == src || NULL == src->retransmit) {
+        ngx_shmtx_unlock(&ctx->pool->mutex);
+        return NGX_DECLINED;
+    }
+    r = src->retransmit;
+    ngx_shmtx_unlock(&ctx->pool->mutex);
+
+    rc = NGX_DECLINED;
+    ngx_shmtx_lock(&r->mtx);
+    if (0 != r->count) {
+        start = r->head - r->count;
+        idx = start & (r->cap - 1u);
+        start_seq = ngx_rtc_shm_retx_seq(r->slots[idx].data);
+        dist = (uint16_t)(rtp_seq - start_seq);
+        if ((uint32_t)dist < r->count) {
+            idx = (start + (uint32_t)dist) & (r->cap - 1u);
+            slot = &r->slots[idx];
+            if (ngx_rtc_shm_retx_seq(slot->data) == rtp_seq
+                    && (size_t)slot->len <= out_cap) {
+                ngx_memcpy(out, slot->data, slot->len);
+                *out_len = slot->len;
+                rc = NGX_OK;
+            }
+        }
+    }
+    ngx_shmtx_unlock(&r->mtx);
+
+    return rc;
+}
+
+
+ngx_int_t
+ngx_rtc_shm_retransmit_replay_gop(ngx_rtc_shm_ctx_t *ctx, u_char *name,
+                                  size_t len, ngx_rtc_shm_retransmit_cb cb,
+                                  void *opaque)
+{
+    ngx_rtc_shm_source_t      *src;
+    ngx_rtc_shm_retransmit_t  *r;
+    ngx_rtc_shm_retransmit_slot_t *buf;
+    ngx_uint_t                 start;
+    ngx_uint_t                 i;
+    ngx_uint_t                 idx;
+    ngx_uint_t                 n;
+    ngx_int_t                  rc;
 
     if (NULL == ctx || NULL == name || 0 == len
             || len >= NGX_RTC_SHM_SOURCE_NAME_MAX || NULL == cb) {
@@ -1047,28 +1160,45 @@ ngx_rtc_shm_gop_snapshot_replay(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len
 
     ngx_shmtx_lock(&ctx->pool->mutex);
     src = ngx_rtc_shm_source_locked_lookup(ctx, name, len);
-    if (NULL == src || NULL == src->snapshot || 0 == src->snapshot_cap) {
+    if (NULL == src || NULL == src->retransmit) {
         ngx_shmtx_unlock(&ctx->pool->mutex);
         return NGX_ERROR;
     }
+    r = src->retransmit;
+    ngx_shmtx_unlock(&ctx->pool->mutex);
 
-    n = (ngx_uint_t) src->snapshot_count;
-    if (n > src->snapshot_cap) {
-        ngx_shmtx_unlock(&ctx->pool->mutex);
-        return NGX_OK; /* overflowed snapshot, no valid keyframe to replay */
+    /* Copy the GOP out under the ring lock, then send outside the lock so a
+     * slow viewer's replay burst (blocking sendto) never stalls the publisher's
+     * append on the same ring. The buffer is bounded by the ring capacity and
+     * freed within this call. */
+    buf = ngx_alloc((size_t) r->cap * sizeof(*buf), ngx_cycle->log);
+    if (NULL == buf) {
+        return NGX_ERROR;
     }
+
+    n = 0;
+    ngx_shmtx_lock(&r->mtx);
+    if (0 != r->count) {
+        start = r->head - r->count;
+        if (r->gop_start > start) {
+            start = r->gop_start; /* clamp to the latest IDR access unit */
+        }
+        for (i = start; i < r->head; i++) {
+            idx = i & (r->cap - 1u);
+            buf[n++] = r->slots[idx];
+        }
+    }
+    ngx_shmtx_unlock(&r->mtx);
 
     rc = NGX_OK;
     for (i = 0; i < n; i++) {
-        pkt = &src->snapshot[i];
-        rc = cb(opaque, pkt->data, pkt->len, (0 == i) ? 1 : 0);
+        rc = cb(opaque, buf[i].data, buf[i].len, buf[i].is_gop_start);
         if (NGX_OK != rc) {
             break;
         }
     }
 
-    ngx_shmtx_unlock(&ctx->pool->mutex);
-
+    ngx_free(buf);
     return rc;
 }
 

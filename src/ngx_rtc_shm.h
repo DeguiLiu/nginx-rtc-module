@@ -28,18 +28,31 @@
 typedef struct ngx_rtc_shm_source_s  ngx_rtc_shm_source_t;
 typedef struct ngx_rtc_shm_session_s ngx_rtc_shm_session_t;
 
-/* One keyframe access unit (SPS/PPS STAP-A + IDR FU-A) cached in shm so any
- * worker can replay it on subscribe. Fixed slot count; a larger IDR overflows
- * and is skipped, falling back to the next natural keyframe. */
-#define NGX_RTC_SHM_GOP_SNAPSHOT_MAX 256u
-#define NGX_RTC_RING_MAX_SESSIONS   64u
-#define NGX_RTC_RING_RTP_MAX        1500u
-#define NGX_RTC_RING_DEFAULT_SLOTS  512u
+/* Cross-worker retransmit ring: a per-source fixed-window cache of the recent
+ * plaintext RTP video packets, indexed by RTP sequence number. The publisher
+ * appends every video packet; any worker answers NACK/PLI from it. The ring
+ * owns an ngx_shmtx_t so the retransmit path never contends on the slab pool
+ * mutex (mirrors the media ring). */
+#define NGX_RTC_SHM_RETX_RING_CAP 1024u
+#define NGX_RTC_RING_MAX_SESSIONS 64u
+#define NGX_RTC_RING_RTP_MAX      1500u
+#define NGX_RTC_RING_DEFAULT_SLOTS 512u
 
 typedef struct {
-    u_char     data[NGX_RTC_RING_RTP_MAX]; /* plaintext RTP packet */
-    ngx_uint_t len;                        /* valid bytes in data */
-} ngx_rtc_shm_gop_snapshot_pkt_t;
+    uint16_t    len;          /* valid bytes in data */
+    uint8_t     is_gop_start; /* first packet of an IDR access unit */
+    u_char      data[NGX_RTC_RING_RTP_MAX]; /* plaintext RTP packet */
+} ngx_rtc_shm_retransmit_slot_t;
+
+typedef struct {
+    ngx_uint_t  head;      /* next absolute write index (guarded by mtx) */
+    ngx_uint_t  count;     /* valid entries in [head-count, head) */
+    ngx_uint_t  gop_start; /* absolute index of the latest GOP start */
+    ngx_uint_t  cap;       /* power of two slot count */
+    ngx_shmtx_t mtx;       /* per-ring lock (points at mtx_sh) */
+    ngx_shmtx_sh_t mtx_sh; /* the lock word itself, in shm */
+    ngx_rtc_shm_retransmit_slot_t slots[1]; /* allocated as cap slots */
+} ngx_rtc_shm_retransmit_t;
 
 /* Cross-worker source metadata. Scratch buffers (video/audio tag bodies), the
  * GOP ring and the AAC transcoder are per-worker and deliberately absent here. */
@@ -76,13 +89,13 @@ struct ngx_rtc_shm_source_s {
     ngx_uint_t             sps_profile_level_id_valid;
     u_char                 audio_asc[NGX_RTC_SHM_ASC_MAX];
     ngx_uint_t             audio_asc_len;
+    ngx_atomic_t           subscribers_version; /* bumped on subscriber add/remove */
     ngx_queue_t            subscribers; /* subscriber skeleton list head */
 
-    /* Cross-worker keyframe snapshot: the publisher replaces it once per IDR;
-     * any worker replays it on subscribe. Fixed capacity, overflow skipped. */
-    ngx_atomic_t                snapshot_count;
-    ngx_uint_t                  snapshot_cap;
-    ngx_rtc_shm_gop_snapshot_pkt_t *snapshot;
+    /* Cross-worker retransmit ring (video): lazily allocated on first video
+     * packet; any worker answers NACK/PLI from it (per-ring lock). */
+    ngx_rtc_shm_retransmit_t   *retransmit;
+    ngx_uint_t                  retransmit_alloc_failed; /* lazy ring alloc failures */
 };
 
 /* Cross-worker session skeleton. DTLS/SRTP/connection state is attached by the
@@ -272,22 +285,35 @@ ngx_uint_t ngx_rtc_shm_source_snapshot(ngx_rtc_shm_ctx_t *ctx, u_char *name,
                                        size_t len, ngx_uint_t *ids,
                                        ngx_int_t *slots, ngx_uint_t max);
 
-/* Cross-worker keyframe snapshot. The publisher resets it on a new IDR, appends
- * every packet of that access unit, and any worker replays the whole snapshot
- * (cb returns NGX_OK to continue, anything else to stop). */
-typedef ngx_int_t (*ngx_rtc_shm_gop_cb)(void *opaque, const uint8_t *rtp,
-                                        uint32_t len, uint8_t is_gop_start);
+/* Cross-worker retransmit ring. The publisher appends every video packet (in
+ * RTP sequence order); any worker reads one packet by RTP sequence or replays
+ * the latest GOP. All ring slots are read/written under the per-ring lock. */
+typedef ngx_int_t (*ngx_rtc_shm_retransmit_cb)(void *opaque,
+                                               const uint8_t *rtp,
+                                               uint32_t len,
+                                               uint8_t is_gop_start);
 
-void ngx_rtc_shm_gop_snapshot_reset(ngx_rtc_shm_ctx_t *ctx, u_char *name,
-                                    size_t len);
+/* Drop the whole ring (new publish / stream restart). */
+void ngx_rtc_shm_retransmit_reset(ngx_rtc_shm_ctx_t *ctx, u_char *name,
+                                  size_t len);
 
-void ngx_rtc_shm_gop_snapshot_append(ngx_rtc_shm_ctx_t *ctx, u_char *name,
-                                     size_t len, const uint8_t *rtp,
-                                     uint32_t rtp_len);
+/* Append one video packet; lazily allocates the ring on first use. */
+void ngx_rtc_shm_retransmit_append(ngx_rtc_shm_ctx_t *ctx, u_char *name,
+                                   size_t len, const uint8_t *rtp,
+                                   uint32_t rtp_len, uint8_t is_gop_start);
 
-ngx_int_t ngx_rtc_shm_gop_snapshot_replay(ngx_rtc_shm_ctx_t *ctx, u_char *name,
-                                          size_t len, ngx_rtc_shm_gop_cb cb,
-                                          void *opaque);
+/* Copy one cached packet by its 16-bit RTP sequence into out (<= out_cap).
+ * NGX_OK on hit, NGX_DECLINED on miss. */
+ngx_int_t ngx_rtc_shm_retransmit_get(ngx_rtc_shm_ctx_t *ctx, u_char *name,
+                                     size_t len, uint16_t rtp_seq,
+                                     u_char *out, size_t out_cap,
+                                     uint16_t *out_len);
+
+/* Replay the latest GOP (cb returns NGX_OK to continue, anything else to stop). */
+ngx_int_t ngx_rtc_shm_retransmit_replay_gop(ngx_rtc_shm_ctx_t *ctx,
+                                            u_char *name, size_t len,
+                                            ngx_rtc_shm_retransmit_cb cb,
+                                            void *opaque);
 
 /* Phase 2 media-ring primitives. init allocates one ring from the slab pool;
  * enqueue is MPSC, dequeue is single-consumer (both take ring->mtx). */

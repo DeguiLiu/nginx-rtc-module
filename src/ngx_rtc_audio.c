@@ -82,9 +82,11 @@ ngx_rtc_audio_create(const uint8_t *asc, uint32_t asc_len, int32_t bitrate)
     if (avcodec_open2(a->dec, codec, NULL) < 0) {
         goto fail;
     }
+#if LIBAVCODEC_VERSION_MAJOR < 61
     if (0 == a->dec->channel_layout) {
         a->dec->channel_layout = (uint64_t)av_get_default_channel_layout(a->dec->channels);
     }
+#endif
 
     a->dec_frame = av_frame_alloc();
     a->dec_pkt = av_packet_alloc();
@@ -93,7 +95,8 @@ ngx_rtc_audio_create(const uint8_t *asc, uint32_t asc_len, int32_t bitrate)
     }
 
     a->fifo = av_audio_fifo_alloc(AV_SAMPLE_FMT_S16,
-                                  (int)NGX_RTC_AUDIO_OPUS_CHANNELS, 1);
+                                  (int)NGX_RTC_AUDIO_OPUS_CHANNELS,
+                                  (int)NGX_RTC_AUDIO_FIFO_MAX_SAMPLES);
     if (NULL == a->fifo) {
         goto fail;
     }
@@ -214,6 +217,24 @@ ngx_rtc_audio_transcode(ngx_rtc_audio_t *a, const uint8_t *aac, uint32_t aac_len
 static int32_t
 ngx_rtc_audio_init_swr(ngx_rtc_audio_t *a)
 {
+#if LIBAVCODEC_VERSION_MAJOR >= 61
+    AVChannelLayout in_layout;
+    AVChannelLayout out_layout;
+    int             rc;
+
+    in_layout = a->dec->ch_layout;
+    av_channel_layout_default(&out_layout, (int)NGX_RTC_AUDIO_OPUS_CHANNELS);
+
+    rc = swr_alloc_set_opts2(&a->swr,
+                             &out_layout,
+                             AV_SAMPLE_FMT_S16, (int)NGX_RTC_AUDIO_OPUS_RATE,
+                             &in_layout, a->dec->sample_fmt, a->dec->sample_rate,
+                             0, NULL);
+    av_channel_layout_uninit(&out_layout);
+    if (rc < 0) {
+        return -1;
+    }
+#else
     uint64_t in_layout;
 
     in_layout = a->dec->channel_layout;
@@ -230,6 +251,7 @@ ngx_rtc_audio_init_swr(ngx_rtc_audio_t *a)
     if (NULL == a->swr) {
         return -1;
     }
+#endif
     if (swr_init(a->swr) < 0) {
         return -1;
     }
@@ -280,10 +302,12 @@ ngx_rtc_audio_pump(ngx_rtc_audio_t *a)
 static int32_t
 ngx_rtc_audio_fifo_write(ngx_rtc_audio_t *a, int32_t nb_samples)
 {
-    int32_t total;
-
-    total = av_audio_fifo_size(a->fifo) + nb_samples;
-    if (av_audio_fifo_realloc(a->fifo, total) < 0) {
+    /* The FIFO is pre-sized once (NGX_RTC_AUDIO_FIFO_MAX_SAMPLES) and the
+     * decode loop drains it below one Opus frame before the next write, so it
+     * never overruns. Skip av_audio_fifo_realloc: the hot transcode path must
+     * not re-allocate on every AAC frame. */
+    if (av_audio_fifo_size(a->fifo) + nb_samples
+            > (int)NGX_RTC_AUDIO_FIFO_MAX_SAMPLES) {
         return -1;
     }
     if (av_audio_fifo_write(a->fifo, (void **)a->swr_data, nb_samples) < nb_samples) {

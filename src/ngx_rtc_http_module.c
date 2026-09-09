@@ -220,6 +220,7 @@ ngx_rtc_http_render_stats(u_char *p, u_char *end)
     ngx_uint_t              total_audio_octets;
     ngx_uint_t              total_send_failed;
     ngx_uint_t              total_send_eagain;
+    ngx_uint_t              total_retransmit_alloc_failed;
 
     ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
     if (NULL == ccf || NULL == ccf->sh) {
@@ -236,6 +237,7 @@ ngx_rtc_http_render_stats(u_char *p, u_char *end)
     total_audio_octets = 0;
     total_send_failed = 0;
     total_send_eagain = 0;
+    total_retransmit_alloc_failed = 0;
 
     ngx_shmtx_lock(&sh->pool->mutex);
 
@@ -283,11 +285,13 @@ ngx_rtc_http_render_stats(u_char *p, u_char *end)
 
         p = ngx_slprintf(p, end,
                 "],\"video\":{\"ssrc\":%ui,\"pt\":%ui,\"packets\":%ui,\"octets\":%ui},"
-                "\"audio\":{\"ssrc\":%ui,\"pt\":%ui,\"packets\":%ui,\"octets\":%ui}}",
+                "\"audio\":{\"ssrc\":%ui,\"pt\":%ui,\"packets\":%ui,\"octets\":%ui},"
+                "\"retransmit_alloc_failed\":%ui}",
                 (ngx_uint_t)shm_src->video_ssrc, (ngx_uint_t)shm_src->video_pt,
                 (ngx_uint_t)shm_src->video_pkts, (ngx_uint_t)shm_src->video_octets,
                 (ngx_uint_t)shm_src->audio_ssrc, (ngx_uint_t)shm_src->audio_pt,
-                (ngx_uint_t)shm_src->audio_pkts, (ngx_uint_t)shm_src->audio_octets);
+                (ngx_uint_t)shm_src->audio_pkts, (ngx_uint_t)shm_src->audio_octets,
+                (ngx_uint_t)shm_src->retransmit_alloc_failed);
         first = 0;
 
         total_streams++;
@@ -296,6 +300,7 @@ ngx_rtc_http_render_stats(u_char *p, u_char *end)
         total_audio_octets += shm_src->audio_octets;
         total_send_failed += shm_src->send_failed;
         total_send_eagain += shm_src->send_eagain;
+        total_retransmit_alloc_failed += shm_src->retransmit_alloc_failed;
 
         if (p >= end - 64) {
             break;
@@ -306,10 +311,12 @@ ngx_rtc_http_render_stats(u_char *p, u_char *end)
 
     return ngx_slprintf(p, end, "],\"total_streams\":%ui,\"total_clients\":%ui,"
                         "\"total_video_octets\":%ui,\"total_audio_octets\":%ui,"
-                        "\"total_send_failed\":%ui,\"total_send_eagain\":%ui}",
+                        "\"total_send_failed\":%ui,\"total_send_eagain\":%ui,"
+                        "\"total_retransmit_alloc_failed\":%ui}",
                         total_streams, total_clients,
                         total_video_octets, total_audio_octets,
-                        total_send_failed, total_send_eagain);
+                        total_send_failed, total_send_eagain,
+                        total_retransmit_alloc_failed);
 }
 
 

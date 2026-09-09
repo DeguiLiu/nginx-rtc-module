@@ -65,6 +65,13 @@
  * uncongested sender from flooding the socket for longer than ~100 ms. */
 #define NGX_RTC_PACER_BURST_MS  100u
 
+/* Upper bound on the ready-subscriber snapshot a source caches in-process so
+ * broadcast_rtp can read it lock-free (avoids the slab pool mutex per packet).
+ * Matches NGX_RTC_BRIDGE_MAX_SNAPSHOT; a stream beyond this many viewers is
+ * truncated and the rest are dropped from the fast path (they still count as
+ * cross-worker sends only up to this bound). */
+#define NGX_RTC_SOURCE_MAX_SNAPSHOT 256u
+
 /* TWCC loss window: AIMD re-evaluates once per 500 ms of feedback, or earlier
  * when a minimum number of packets has arrived (whichever comes first), so
  * sparse streams still adapt through the time bound. */
@@ -87,11 +94,6 @@
  * x ~1224 B/slot ~= 2.4 MB per source, enough for a 1-2 s GOP at 1080p. */
 #define NGX_RTC_GOP_RING_CAP  2048u
 
-/* Per-session RTX (retransmission) ring capacity. Lazily allocated in the owner
- * worker, so memory is only committed for sessions that actually receive video.
- * 1024 slots x ~1508 B/slot ~= 1.5 MB/session, ~1-2 s of 1080p video. */
-#define NGX_RTC_RTX_RING_CAP  1024u
-
 /* Source name ("app/stream") capacity, including the NUL terminator. */
 #define NGX_RTC_SOURCE_NAME_MAX  128u
 
@@ -112,9 +114,7 @@ typedef struct
 {
     uint8_t  data[NGX_RTC_MAX_RTP_PKT]; /* plaintext RTP packet */
     uint16_t len;                        /* valid bytes in data */
-    uint32_t seq;                        /* extended 32-bit seq (head index) */
     uint8_t  is_gop_start;               /* first packet of an IDR access unit */
-    uint8_t  rtx_gen;                    /* NACK dedup generation (RTX ring only) */
 } ngx_rtc_rtp_cache_slot_t;
 
 typedef struct
@@ -150,7 +150,6 @@ struct ngx_rtc_session_s {
     uint32_t twcc_lost;      /* cumulative lost via transport-cc feedback */
     uint32_t twcc_received;  /* cumulative received via transport-cc feedback */
     uint8_t  publishing;     /* 1 = WHIP publisher (receives media), 0 = player */
-    uint8_t  snapshot_active; /* WHIP: accumulating a keyframe AU snapshot */
 
     /* ICE credentials from the SDP offer; STUN ufrag matches on these. */
     ngx_uint_t id;       /* shm session id (monotonic, never reused) */
@@ -189,12 +188,12 @@ struct ngx_rtc_session_s {
     ngx_msec_t      nack_window_start;
     ngx_uint_t      nack_retransmitted;
 
-    /* Per-session retransmission ring (owner worker only). Every video packet
-     * actually sent to this session is cached here before the UDP send, so NACK
-     * is answered from what *this* session received (works cross-worker, unlike
-     * the producer-side source GOP ring). Lazily allocated on first video. */
-    ngx_rtc_rtp_ring_t rtx;
-    uint8_t            rtx_gen;   /* bump each NACK window; 0 = never retransmitted */
+    /* NACK dedup for the shared retransmit cache (source GOP ring / shm ring).
+     * A seq already retransmitted in the current NACK window is skipped so a
+     * re-NACK of the same packet does not burst duplicates; cleared on each
+     * window roll. Bounded by NGX_RTC_NACK_BUDGET. */
+    uint16_t    nack_seen[NGX_RTC_NACK_BUDGET];
+    ngx_uint_t  nack_seen_count;
 
     /* Send pacing: token bucket filled at pacer_target_bps (bytes are tracked
      * with integer math; one token = one byte). pacer_started distinguishes
@@ -247,7 +246,6 @@ struct ngx_rtc_source_s {
     uint32_t last_video_rtmp_ms;
     uint32_t last_audio_rtmp_ms;
     uint32_t ring_drops;    /* shm media-ring enqueue failures (silent drops) */
-    uint8_t  snapshot_active; /* bridge: accumulating a keyframe AU snapshot */
 
     /* Sender-report statistics, accumulated by the bridge emit path. */
     uint32_t video_pkts;
@@ -275,17 +273,27 @@ struct ngx_rtc_source_s {
     /* GOP ring: caches recent plaintext RTP for fast-start replay + NACK. */
     ngx_rtc_rtp_ring_t gop;
 
-    /* Contiguous scratch for one RTMP video tag body. nginx-rtmp delivers a
-     * large message as an ngx_chain_t of chunk-sized buffers, so the bridge
-     * concatenates the whole tag here before NALU parsing (see
-     * ngx_rtmp_rtc_chain_copy). */
-    uint8_t  video_body[NGX_RTC_MAX_VIDEO_BODY];
+    /* Cached ready-subscriber snapshot (session id + owner slot). Refreshed
+     * only when the shm source's subscribers_version changes, so broadcast_rtp
+     * reads this fixed array lock-free instead of taking the slab pool mutex on
+     * every packet. shm_src is the ngx_rtc_shm_source_t *, valid while this
+     * source is publishing (the shm source is not reaped while publishing=1). */
+    void       *shm_src;
+    ngx_uint_t  snap_version;
+    ngx_uint_t  snap_count;
+    ngx_uint_t  snap_ids[NGX_RTC_SOURCE_MAX_SNAPSHOT];
+    ngx_int_t   snap_slots[NGX_RTC_SOURCE_MAX_SNAPSHOT];
 
-    /* Contiguous scratch for one RTMP audio tag body (2-byte FLV audio header +
-     * raw AAC frame). Same concatenation need as video_body: nginx-rtmp
-     * delivers a message larger than the inbound chunk size as a chain of
-     * chunk-sized buffers. */
-    uint8_t  audio_body[NGX_RTC_MAX_AUDIO_BODY];
+    /* Contiguous scratch for one RTMP tag body. nginx-rtmp delivers a large
+     * message as an ngx_chain_t of chunk-sized buffers, so the bridge
+     * concatenates the whole tag here before parsing (see
+     * ngx_rtmp_rtc_chain_copy). A video and an audio tag are handled one at a
+     * time by the same RTMP handler, so a union reuses one buffer for both
+     * (pipeline data-structure reuse; the video body is the larger bound). */
+    union {
+        uint8_t  video_body[NGX_RTC_MAX_VIDEO_BODY]; /* 256 KiB, H264 tag */
+        uint8_t  audio_body[NGX_RTC_MAX_AUDIO_BODY]; /* 16 KiB, AAC tag */
+    };
 
 #ifdef NGX_PTR_SIZE
     /* Source-registry rbtree node (str is set to point at name[]) and the
@@ -366,16 +374,24 @@ int32_t ngx_rtc_rtp_ring_get(ngx_rtc_rtp_ring_t *r, uint16_t rtp_seq,
  * so the per-session RTX ring can use its own capacity. */
 int ngx_rtc_rtp_ring_reserve(ngx_rtc_rtp_ring_t *r, uint32_t capacity);
 
-/* Per-session retransmission buffer (see ngx_rtc_session_s.rtx). Cache one
- * video packet before the UDP send; retransmit answers a NACK seq from this
- * session's own cache (dedup per NACK window via slot->rtx_gen). */
-void ngx_rtc_session_rtx_push(ngx_rtc_session_t *sess, const uint8_t *rtp,
-                              uint32_t len, uint8_t is_gop_start);
-int32_t ngx_rtc_session_rtx_retransmit(ngx_rtc_session_t *sess,
-                                       uint16_t seq);
-void ngx_rtc_session_rtx_replay_gop(ngx_rtc_session_t *sess);
-void ngx_rtc_session_rtx_faststart(ngx_rtc_session_t *sess);
-void ngx_rtc_session_rtx_free(ngx_rtc_session_t *sess);
+/* Per-session retransmit: resolve one video packet from the source GOP ring
+ * (same-worker path) and send it with per-window NACK dedup. NGX_RTC_OK on
+ * send; NGX_RTC_ERR_PARSE on miss/dedup/send-fail; NGX_RTC_ERR_INVALID on a
+ * NULL session. */
+int32_t ngx_rtc_session_retransmit(ngx_rtc_session_t *sess, uint16_t seq);
+
+/* Dedup + send for a retransmit candidate whose data/len were already resolved
+ * (shared by the source-ring and shm-ring paths). Same return codes. */
+int32_t ngx_rtc_session_retransmit_send(ngx_rtc_session_t *sess, uint16_t seq,
+                                        const uint8_t *data, uint32_t len);
+
+/* Clear the per-window NACK dedup set (called on NACK window roll). */
+void ngx_rtc_session_nack_reset(ngx_rtc_session_t *sess);
+
+/* 1 when the local source GOP ring holds data (publisher worker). A session
+ * whose source passes this check retransmits from the ring; otherwise it must
+ * use the shm retransmit ring. */
+int ngx_rtc_source_gop_ready(const ngx_rtc_source_t *src);
 
 /*
  * Initialise the per-session pacer token bucket. start_bps is clamped to

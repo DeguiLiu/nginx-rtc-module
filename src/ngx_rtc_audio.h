@@ -26,6 +26,12 @@ typedef struct ngx_rtc_audio_s ngx_rtc_audio_t;
 #define NGX_RTC_AUDIO_OPUS_CHANNELS   2u
 #define NGX_RTC_AUDIO_OPUS_FRAME_SIZE 960u /* 20ms @ 48kHz, libopus default */
 
+/* The interleaved-S16 FIFO is pre-sized once to hold a few Opus frames so the
+ * hot transcode path never calls av_audio_fifo_realloc per AAC frame. The
+ * decode loop drains the FIFO to below one frame before writing the next, so
+ * 4 frames of headroom is a safe fixed bound. */
+#define NGX_RTC_AUDIO_FIFO_MAX_SAMPLES (NGX_RTC_AUDIO_OPUS_FRAME_SIZE * 4u)
+
 /* Upper bound of one raw AAC frame payload (FLV AACPacketType=1). */
 #define NGX_RTC_AUDIO_AAC_MAX         8192u
 
