@@ -36,8 +36,25 @@ export NGX_RTC_THIRD=/path/to/third          # include/ + lib/ (see nginx-rtc-ex
 The host unit tests need none of that:
 
 ```sh
-make -C test run_tests       # 71 cases
+make -C test run_tests       # 87 cases
 ```
+
+## Windows portability
+
+The nginx-free protocol core (`rtp/sdp/stun/rtcp/hsm/session_fsm/core/ring/
+avsync`) compiles under MinGW, and its host tests run on Windows x86-64. The
+four module glues (`shm/http/stream/bridge`) still require a full
+OpenResty/nginx Windows build, which is documented separately in
+`nginx-rtc-example/docs/windows-mingw-build-guide.md`.
+
+To cross-compile the Windows test runner from Linux:
+
+```sh
+MINGW_PREFIX=$HOME/.local/mingw ./scripts/cross-win64-tests.sh
+```
+
+The result lands in `dist/win64/` (`run_tests.exe` plus the two MinGW runtime
+DLLs it needs). `dist/` is git-ignored; regenerate it with the script above.
 
 ## License
 

@@ -34,8 +34,24 @@ export NGX_RTC_THIRD=/path/to/third          # include/ + lib/（见 nginx-rtc-e
 host 单测不需要这些：
 
 ```sh
-make -C test run_tests       # 71 个用例
+make -C test run_tests       # 87 个用例
 ```
+
+## Windows 可移植性
+
+不依赖 nginx 的协议核心（`rtp/sdp/stun/rtcp/hsm/session_fsm/core/ring/avsync`）
+可在 MinGW 下编译，其 host 单测可在 Windows x86-64 上运行。四个模块胶水代码
+（`shm/http/stream/bridge`）仍需完整的 OpenResty/nginx Windows 构建，该路径
+单独记录在 `nginx-rtc-example/docs/windows-mingw-build-guide.md`。
+
+在 Linux 上交叉编译 Windows 测试可执行文件：
+
+```sh
+MINGW_PREFIX=$HOME/.local/mingw ./scripts/cross-win64-tests.sh
+```
+
+产物落在 `dist/win64/`（`run_tests.exe` 及所需的两个 MinGW 运行时 DLL）。
+`dist/` 已被 git 忽略，用上述脚本重新生成。
 
 ## License
 

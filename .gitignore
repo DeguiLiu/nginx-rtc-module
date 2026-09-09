@@ -1,6 +1,12 @@
 # build artifacts
 test/build/
+test/build-win64/
 test/run_tests
 *.o
 *.d
 *.log
+*.exe
+
+# Windows cross-compile release artifacts (regenerate with
+# scripts/cross-win64-tests.sh).
+dist/
