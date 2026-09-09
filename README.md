@@ -3,7 +3,7 @@
 Self-developed nginx C addon that turns **RTMP / WHIP** ingest into **WebRTC**
 (RTP/SRTP over UDP) playout, running on OpenResty/nginx. The assembly + deploy
 repo that consumes this addon lives at
-[github.com/DeguiLiu/rtc-gateway](https://github.com/DeguiLiu/rtc-gateway)
+[github.com/DeguiLiu/nginx-rtc-example](https://github.com/DeguiLiu/nginx-rtc-example)
 (signaling SDP, Lua auth, player pages, HTTP-FLV/HLS output, run scripts).
 
 One `--add-module` registers four nginx modules from this tree:
@@ -29,7 +29,7 @@ The module links static third-party libs
 `include/` + `lib/` by exporting the env var `config` reads:
 
 ```sh
-export NGX_RTC_THIRD=/path/to/third          # include/ + lib/ (see rtc-gateway scripts/build-deps.sh)
+export NGX_RTC_THIRD=/path/to/third          # include/ + lib/ (see nginx-rtc-example scripts/build-deps.sh)
 ./configure ... --add-module=/path/to/nginx-rtc-module
 ```
 
