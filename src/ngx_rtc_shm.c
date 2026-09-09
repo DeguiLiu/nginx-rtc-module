@@ -13,17 +13,24 @@
 #include "ngx_rtc_shm.h"
 #include "ngx_rtc_rtp.h"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <sys/eventfd.h>
 #include <execinfo.h>
 #include <signal.h>
 #include <unistd.h>
+#endif
 
 #define NGX_RTC_BT_MAX_DEPTH  64
 #define NGX_RTC_BT_BUF        512
 
+#ifndef _WIN32
 /* Worker crash backtrace (implemented at the end of this file), wired to the
  * core module's init_process so every worker registers the handlers. */
 static void       ngx_rtc_bt_handler(int signo, siginfo_t *si, void *uc);
+#endif
 static ngx_int_t  ngx_rtc_bt_init_process(ngx_cycle_t *cycle);
 
 static ngx_int_t ngx_rtc_core_init_zone(ngx_shm_zone_t *shm_zone, void *data);
@@ -261,6 +268,7 @@ ngx_rtc_core_init_module(ngx_cycle_t *cycle)
         return NGX_OK;
     }
 
+#ifndef _WIN32
     for (w = 0; w < ccf->sh->nworkers && w < NGX_MAX_PROCESSES; w++) {
         ccf->sh->notify_fd[w] = eventfd(0, EFD_NONBLOCK);
         if (ccf->sh->notify_fd[w] == -1) {
@@ -269,6 +277,7 @@ ngx_rtc_core_init_module(ngx_cycle_t *cycle)
             return NGX_ERROR;
         }
     }
+#endif
 
     return NGX_OK;
 }
@@ -1328,6 +1337,7 @@ ngx_rtc_shm_ring_empty(const ngx_rtc_shm_ring_t *ring)
 }
 
 
+#ifndef _WIN32
 /*
  * Worker crash backtrace to error.log.
  *
@@ -1425,3 +1435,14 @@ ngx_rtc_bt_init_process(ngx_cycle_t *cycle)
 
     return NGX_OK;
 }
+
+#else
+
+static ngx_int_t
+ngx_rtc_bt_init_process(ngx_cycle_t *cycle)
+{
+    (void) cycle;
+    return NGX_OK;
+}
+
+#endif

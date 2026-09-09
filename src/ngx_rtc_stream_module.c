@@ -14,7 +14,13 @@
 #include <ngx_stream.h>
 
 #include <time.h>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <arpa/inet.h>
+#endif
 
 #include "ngx_rtc_stun.h"
 #include "ngx_rtc_dtls.h"

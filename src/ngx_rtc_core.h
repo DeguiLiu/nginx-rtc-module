@@ -18,8 +18,14 @@
 #define NGX_RTC_CORE_H
 
 #include <stdint.h>
-#include <sys/socket.h>
 #include <time.h>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <sys/socket.h>
+#endif
 
 #include "ngx_rtc_rtp.h"
 #include "ngx_rtc_dtls.h"
