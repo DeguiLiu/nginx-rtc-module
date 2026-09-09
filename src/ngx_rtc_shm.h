@@ -30,9 +30,9 @@ typedef struct ngx_rtc_shm_session_s ngx_rtc_shm_session_t;
 
 /* Cross-worker retransmit ring: a per-source fixed-window cache of the recent
  * plaintext RTP video packets, indexed by RTP sequence number. The publisher
- * appends every video packet; any worker answers NACK/PLI from it. The ring
- * owns an ngx_shmtx_t so the retransmit path never contends on the slab pool
- * mutex (mirrors the media ring). */
+ * appends every video packet while a cross-worker viewer is subscribed; any
+ * worker answers NACK/PLI from it. All slots are read/written under the slab
+ * pool mutex, so a ring is never read after its source is freed. */
 #define NGX_RTC_SHM_RETX_RING_CAP 1024u
 #define NGX_RTC_RING_MAX_SESSIONS 64u
 #define NGX_RTC_RING_RTP_MAX      1500u
@@ -45,12 +45,10 @@ typedef struct {
 } ngx_rtc_shm_retransmit_slot_t;
 
 typedef struct {
-    ngx_uint_t  head;      /* next absolute write index (guarded by mtx) */
+    ngx_uint_t  head;      /* next absolute write index (guarded by pool mutex) */
     ngx_uint_t  count;     /* valid entries in [head-count, head) */
     ngx_uint_t  gop_start; /* absolute index of the latest GOP start */
     ngx_uint_t  cap;       /* power of two slot count */
-    ngx_shmtx_t mtx;       /* per-ring lock (points at mtx_sh) */
-    ngx_shmtx_sh_t mtx_sh; /* the lock word itself, in shm */
     ngx_rtc_shm_retransmit_slot_t slots[1]; /* allocated as cap slots */
 } ngx_rtc_shm_retransmit_t;
 
@@ -91,6 +89,7 @@ struct ngx_rtc_shm_source_s {
     ngx_uint_t             audio_asc_len;
     ngx_atomic_t           subscribers_version; /* bumped on subscriber add/remove */
     ngx_queue_t            subscribers; /* subscriber skeleton list head */
+    ngx_uint_t             remote_subscribers; /* viewers on a worker != publisher_slot */
 
     /* Cross-worker retransmit ring (video): lazily allocated on first video
      * packet; any worker answers NACK/PLI from it (per-ring lock). */

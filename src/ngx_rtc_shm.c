@@ -511,8 +511,15 @@ ngx_rtc_shm_session_free_locked(ngx_rtc_shm_ctx_t *ctx,
 
     src = sess->source;
     if (NULL != src) {
-        ngx_queue_remove(&sess->sub_queue);
-        src->subscribers_version++;
+        if (sess->sub_queue.next != &sess->sub_queue) {
+            /* Was subscribed: unlink and drop the cross-worker count. */
+            ngx_queue_remove(&sess->sub_queue);
+            if (sess->owner_slot != src->publisher_slot
+                    && src->remote_subscribers > 0) {
+                src->remote_subscribers--;
+            }
+            src->subscribers_version++;
+        }
     }
 
     ngx_queue_remove(&sess->queue);
@@ -522,6 +529,9 @@ ngx_rtc_shm_session_free_locked(ngx_rtc_shm_ctx_t *ctx,
             && 0 == src->publishing) {
         ngx_queue_remove(&src->queue);
         ngx_rbtree_delete(&ctx->source_tree, &src->sn.node);
+        if (NULL != src->retransmit) {
+            ngx_slab_free_locked(ctx->pool, src->retransmit);
+        }
         ngx_slab_free_locked(ctx->pool, src);
     }
 }
@@ -623,6 +633,9 @@ ngx_rtc_shm_session_activate(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag, size_t len,
         ngx_queue_insert_head(&sess->source->subscribers, &sess->sub_queue);
         sess->source->subscribers_version++;
         sess->source->expires = 0; /* has at least one viewer */
+        if (sess->owner_slot != sess->source->publisher_slot) {
+            sess->source->remote_subscribers++;
+        }
     }
 
     ngx_shmtx_unlock(&ctx->pool->mutex);
@@ -910,6 +923,9 @@ ngx_rtc_shm_expire_locked(ngx_rtc_shm_ctx_t *ctx, ngx_uint_t forced)
                 && (forced || now >= (ngx_msec_t) src->expires)) {
             ngx_queue_remove(&src->queue);
             ngx_rbtree_delete(&ctx->source_tree, &src->sn.node);
+            if (NULL != src->retransmit) {
+                ngx_slab_free_locked(ctx->pool, src->retransmit);
+            }
             ngx_slab_free_locked(ctx->pool, src);
         }
     }
@@ -989,7 +1005,6 @@ ngx_rtc_shm_retransmit_alloc_locked(ngx_rtc_shm_ctx_t *ctx,
 
     ngx_memzero(r, size);
     r->cap = NGX_RTC_SHM_RETX_RING_CAP;
-    (void) ngx_shmtx_create(&r->mtx, &r->mtx_sh, (u_char *) "rtc_retx");
 
     src->retransmit = r;
     return r;
@@ -1022,13 +1037,10 @@ ngx_rtc_shm_retransmit_reset(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len)
         return;
     }
     r = src->retransmit;
-    ngx_shmtx_unlock(&ctx->pool->mutex);
-
-    ngx_shmtx_lock(&r->mtx);
     r->head = 0;      /* new generation: indices restart, not just count */
     r->count = 0;
     r->gop_start = 0;
-    ngx_shmtx_unlock(&r->mtx);
+    ngx_shmtx_unlock(&ctx->pool->mutex);
 }
 
 
@@ -1055,21 +1067,32 @@ ngx_rtc_shm_retransmit_append(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
         ngx_shmtx_unlock(&ctx->pool->mutex);
         return;
     }
+    /* Same-worker viewers read the in-process GOP ring; the shm mirror only
+     * serves cross-worker viewers. Skip the copy (and lazy alloc) until a viewer
+     * on another worker subscribes, so the single-worker hot path stays at one
+     * memcpy per video packet. */
+    if (0 == src->remote_subscribers) {
+        ngx_shmtx_unlock(&ctx->pool->mutex);
+        return;
+    }
     r = src->retransmit;
     if (NULL == r) {
         r = ngx_rtc_shm_retransmit_alloc_locked(ctx, src);
         if (NULL == r) {
             src->retransmit_alloc_failed++;
-            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                          "ngx_rtc: retransmit ring alloc failed for "
-                          "source \"%V\"", &src->sn.str);
+            /* Log the first failure only: without the guard a zone-starved
+             * source re-logs at packet rate. Retries stay (zone space frees up
+             * when other streams end, and the ring self-heals from then on). */
+            if (1 == src->retransmit_alloc_failed) {
+                ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                              "ngx_rtc: retransmit ring alloc failed for "
+                              "source \"%V\"", &src->sn.str);
+            }
             ngx_shmtx_unlock(&ctx->pool->mutex);
-            return; /* allocation failed: retransmit stays unavailable */
+            return; /* retransmit unavailable; live media path unaffected */
         }
     }
-    ngx_shmtx_unlock(&ctx->pool->mutex);
 
-    ngx_shmtx_lock(&r->mtx);
     idx = r->head & (r->cap - 1u);
     slot = &r->slots[idx];
     ngx_memcpy(slot->data, rtp, rtp_len);
@@ -1082,7 +1105,7 @@ ngx_rtc_shm_retransmit_append(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
     if (r->count < r->cap) {
         r->count++;
     }
-    ngx_shmtx_unlock(&r->mtx);
+    ngx_shmtx_unlock(&ctx->pool->mutex);
 }
 
 
@@ -1113,10 +1136,8 @@ ngx_rtc_shm_retransmit_get(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
         return NGX_DECLINED;
     }
     r = src->retransmit;
-    ngx_shmtx_unlock(&ctx->pool->mutex);
 
     rc = NGX_DECLINED;
-    ngx_shmtx_lock(&r->mtx);
     if (0 != r->count) {
         start = r->head - r->count;
         idx = start & (r->cap - 1u);
@@ -1133,7 +1154,7 @@ ngx_rtc_shm_retransmit_get(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
             }
         }
     }
-    ngx_shmtx_unlock(&r->mtx);
+    ngx_shmtx_unlock(&ctx->pool->mutex);
 
     return rc;
 }
@@ -1165,19 +1186,18 @@ ngx_rtc_shm_retransmit_replay_gop(ngx_rtc_shm_ctx_t *ctx, u_char *name,
         return NGX_ERROR;
     }
     r = src->retransmit;
-    ngx_shmtx_unlock(&ctx->pool->mutex);
 
-    /* Copy the GOP out under the ring lock, then send outside the lock so a
+    /* Copy the GOP out under the pool mutex, then send outside the lock so a
      * slow viewer's replay burst (blocking sendto) never stalls the publisher's
-     * append on the same ring. The buffer is bounded by the ring capacity and
-     * freed within this call. */
+     * append. The buffer is bounded by the ring capacity and freed within this
+     * call. */
     buf = ngx_alloc((size_t) r->cap * sizeof(*buf), ngx_cycle->log);
     if (NULL == buf) {
+        ngx_shmtx_unlock(&ctx->pool->mutex);
         return NGX_ERROR;
     }
 
     n = 0;
-    ngx_shmtx_lock(&r->mtx);
     if (0 != r->count) {
         start = r->head - r->count;
         if (r->gop_start > start) {
@@ -1188,7 +1208,7 @@ ngx_rtc_shm_retransmit_replay_gop(ngx_rtc_shm_ctx_t *ctx, u_char *name,
             buf[n++] = r->slots[idx];
         }
     }
-    ngx_shmtx_unlock(&r->mtx);
+    ngx_shmtx_unlock(&ctx->pool->mutex);
 
     rc = NGX_OK;
     for (i = 0; i < n; i++) {
