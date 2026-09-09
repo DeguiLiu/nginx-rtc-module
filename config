@@ -90,11 +90,27 @@ fi
 # an existing prebuilt tree without rebuilding.
 RTC_THIRD="${NGX_RTC_THIRD:-$(cd "$ngx_addon_dir/.." && pwd)/build/third}"
 CFLAGS="$CFLAGS -DNGX_RTC_EVENT_LOOP -I$ngx_addon_dir/src -I$RTC_THIRD/include"
-CORE_LIBS="$CORE_LIBS $RTC_THIRD/lib/libavcodec.a"
-CORE_LIBS="$CORE_LIBS $RTC_THIRD/lib/libswresample.a"
-CORE_LIBS="$CORE_LIBS $RTC_THIRD/lib/libavutil.a"
-CORE_LIBS="$CORE_LIBS $RTC_THIRD/lib/libopus.a"
-CORE_LIBS="$CORE_LIBS $RTC_THIRD/lib/libsrtp2.a"
-CORE_LIBS="$CORE_LIBS -lm -lpthread"
+
+# Windows (MSYS2/MinGW) links the DLL import libraries (.dll.a) rather than the
+# static archives; the static FFmpeg archives drag in hardware-accel / soxr /
+# vaapi deps that a plain mingw-w64 install does not provide. MinGW also has no
+# separate libm and uses winpthreads for pthreads.
+case "$(uname -s 2>/dev/null)" in
+    MINGW*|MSYS*|CYGWIN*)
+        RTC_LIB_EXT=".dll.a"
+        RTC_LIB_SUFFIX="-lwinpthread"
+        ;;
+    *)
+        RTC_LIB_EXT=".a"
+        RTC_LIB_SUFFIX="-lm -lpthread"
+        ;;
+esac
+
+CORE_LIBS="$CORE_LIBS $RTC_THIRD/lib/libavcodec$RTC_LIB_EXT"
+CORE_LIBS="$CORE_LIBS $RTC_THIRD/lib/libswresample$RTC_LIB_EXT"
+CORE_LIBS="$CORE_LIBS $RTC_THIRD/lib/libavutil$RTC_LIB_EXT"
+CORE_LIBS="$CORE_LIBS $RTC_THIRD/lib/libopus$RTC_LIB_EXT"
+CORE_LIBS="$CORE_LIBS $RTC_THIRD/lib/libsrtp2$RTC_LIB_EXT"
+CORE_LIBS="$CORE_LIBS $RTC_LIB_SUFFIX"
 
 USE_OPENSSL=YES
