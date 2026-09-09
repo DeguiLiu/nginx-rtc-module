@@ -260,6 +260,21 @@ ngx_rtc_session_next(ngx_rtc_session_t *sess)
     return ngx_queue_data(q, ngx_rtc_session_t, queue);
 }
 
+ngx_rtc_session_t *
+ngx_rtc_session_find_by_id(ngx_uint_t id)
+{
+    ngx_rtc_session_t *sess;
+
+    for (sess = ngx_rtc_session_first(); NULL != sess;
+         sess = ngx_rtc_session_next(sess)) {
+        if (sess->id == id) {
+            return sess;
+        }
+    }
+
+    return NULL;
+}
+
 void
 ngx_rtc_session_add(ngx_rtc_session_t *sess)
 {

@@ -883,6 +883,7 @@ ngx_rtc_broadcast_rtp(ngx_rtc_source_t *src, const uint8_t *rtp,
     ngx_uint_t             w;
     ngx_uint_t             nsess;
     ngx_rtc_ring_entry_t   entry;
+    ngx_rtc_session_t     *sess;
 
     if (len > NGX_RTC_RING_RTP_MAX) {
         return;
@@ -903,8 +904,27 @@ ngx_rtc_broadcast_rtp(ngx_rtc_source_t *src, const uint8_t *rtp,
         return;
     }
 
+    /* Same-worker fast path: send directly instead of bouncing through the shm
+     * ring + eventfd. Cross-worker targets still go through the ring below. */
+    for (i = 0; i < n; i++) {
+        if (slot[i] != (ngx_int_t) ngx_worker) {
+            continue;
+        }
+        sess = ngx_rtc_session_find_by_id(snap[i]);
+        if (NULL == sess) {
+            continue;
+        }
+        if (0 != is_video) {
+            ngx_rtc_session_rtx_push(sess, rtp, len, is_gop_start);
+        }
+        (void) ngx_rtc_session_send_rtp(sess, rtp, len);
+    }
+
     /* One entry per target worker; carry its ready session ids. */
     for (w = 0; w < shm->nworkers; w++) {
+        if (w == (ngx_uint_t) ngx_worker) {
+            continue; /* already sent directly above */
+        }
         nsess = 0;
         ngx_memzero(&entry, sizeof(entry));
         entry.media = (uint8_t) (is_video ? 0 : 1);

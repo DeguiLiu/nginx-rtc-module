@@ -534,21 +534,6 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
         return;
     }
 
-    /* TEMP DEBUG: raw offer dump (to pair with ans_dump). */
-    {
-        int     ofd;
-        ssize_t wr;
-        ofd = open("/home/dgliu/workspace/webrtc/offer_dump.txt",
-                   O_WRONLY | O_CREAT | O_APPEND, 0644);
-        if (ofd >= 0) {
-            wr = write(ofd, sdp, sdp_len);
-            (void) wr;
-            wr = write(ofd, "\n====\n", 6);
-            (void) wr;
-            close(ofd);
-        }
-    }
-
     su_len = 0;
     ngx_rtc_chain_reader_init(&rd, r->request_body->bufs);
     if (ngx_rtc_http_json_string(&rd, "streamurl",

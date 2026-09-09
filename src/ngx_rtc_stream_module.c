@@ -95,7 +95,6 @@ static void       ngx_rtc_stream_session_close(ngx_rtc_session_t *sess,
 static void       ngx_rtc_stream_close_ev_handler(ngx_event_t *ev);
 static void       ngx_rtc_stream_reap_timer(ngx_event_t *ev);
 static void       ngx_rtc_stream_drain_ring(void);
-static ngx_rtc_session_t *ngx_rtc_stream_find_session_by_id(ngx_uint_t id);
 static void       ngx_rtc_stream_notify_handler(ngx_event_t *ev);
 static ngx_int_t  ngx_rtc_stream_shm_gop_send(void *opaque,
                      const uint8_t *rtp, uint32_t len, uint8_t is_gop_start);
@@ -655,6 +654,30 @@ ngx_rtc_stream_on_srtp(ngx_stream_session_t *s, ngx_rtc_session_t *sess,
     ngx_rtc_broadcast_rtp(sess->source, data, (uint32_t) n,
                           is_video, is_gop_start);
 
+    /* Accumulate and mirror packet/octet counters for the WHIP producer. */
+    {
+        uint32_t octets;
+
+        octets = ((uint32_t) n > NGX_RTC_RTP_HEADER_SIZE)
+                 ? ((uint32_t) n - NGX_RTC_RTP_HEADER_SIZE) : (uint32_t) n;
+        if (0 != is_video) {
+            sess->source->video_pkts++;
+            sess->source->video_octets += octets;
+        } else {
+            sess->source->audio_pkts++;
+            sess->source->audio_octets += octets;
+        }
+
+        ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
+        if (NULL != ccf && NULL != ccf->sh) {
+            ngx_rtc_shm_source_set_media_stats(ccf->sh,
+                    (u_char *) sess->source->name,
+                    ngx_strlen(sess->source->name),
+                    sess->source->video_pkts, sess->source->video_octets,
+                    sess->source->audio_pkts, sess->source->audio_octets);
+        }
+    }
+
     /* Accumulate the keyframe AU into the shm snapshot, mirroring the RTMP
      * producer so any cross-worker player gets its first frame immediately. */
     if (0 != is_video) {
@@ -895,7 +918,7 @@ ngx_rtc_stream_dtls_done(void *user)
      * late subscriber decodes its first frame without waiting for an IDR. The
      * replay also warms the session RTX ring (same-worker publish) so an
      * immediate NACK is answerable. */
-    if (NULL != sess->source) {
+    if (NULL != sess->source && 0 == sess->publishing) {
         ngx_rtc_source_subscribe(sess->source, sess);
 
         /* Replay the latest GOP from shm so a cross-worker subscriber gets its
@@ -1067,7 +1090,7 @@ ngx_rtc_stream_drain_ring(void)
 
     while (ngx_rtc_shm_ring_dequeue(ring, &entry) == NGX_OK) {
         for (i = 0; i < entry.nsess; i++) {
-            sess = ngx_rtc_stream_find_session_by_id(entry.sess[i]);
+            sess = ngx_rtc_session_find_by_id(entry.sess[i]);
             if (NULL != sess) {
                 /* Cache video before the send so a NACK of a dropped datagram
                  * (EAGAIN etc.) can be answered from this session's own ring. */
@@ -1079,22 +1102,6 @@ ngx_rtc_stream_drain_ring(void)
             }
         }
     }
-}
-
-
-static ngx_rtc_session_t *
-ngx_rtc_stream_find_session_by_id(ngx_uint_t id)
-{
-    ngx_rtc_session_t *sess;
-
-    for (sess = ngx_rtc_session_first(); NULL != sess;
-         sess = ngx_rtc_session_next(sess)) {
-        if (sess->id == id) {
-            return sess;
-        }
-    }
-
-    return NULL;
 }
 
 
@@ -1144,6 +1151,11 @@ ngx_rtc_stream_reap_timer(ngx_event_t *ev)
 
     now = ngx_current_msec;
     ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
+
+    /* Reap half-open shm skeletons and empty non-publishing sources. */
+    if (NULL != ccf && NULL != ccf->sh) {
+        ngx_rtc_shm_expire(ccf->sh, 0);
+    }
 
     for (sess = ngx_rtc_session_first(); NULL != sess; sess = next) {
         /* Capture the successor before close() unlinks and frees the session. */

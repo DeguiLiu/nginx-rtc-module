@@ -22,6 +22,8 @@
 #define NGX_RTC_SHM_SPS_MAX          256u
 #define NGX_RTC_SHM_PPS_MAX          256u
 #define NGX_RTC_SHM_ASC_MAX           64u
+#define NGX_RTC_SHM_SESSION_EXPIRE_MS 30000u /* half-open session reap */
+#define NGX_RTC_SHM_SOURCE_EXPIRE_MS  10000u /* empty non-publishing source reap */
 
 typedef struct ngx_rtc_shm_source_s  ngx_rtc_shm_source_t;
 typedef struct ngx_rtc_shm_session_s ngx_rtc_shm_session_t;
@@ -46,6 +48,7 @@ struct ngx_rtc_shm_source_s {
     ngx_queue_t            queue;      /* source_list link (GC / stats) */
     u_char                 name[NGX_RTC_SHM_SOURCE_NAME_MAX];
     ngx_uint_t             publishing;
+    ngx_atomic_t           expires;    /* msec absolute, 0 = no expire (empty source reap) */
     ngx_int_t              publisher_slot;   /* RTMP ingest worker (-1 unknown);
                                               * stats uses it to flag cross-worker
                                               * viewers (owner_slot != this) */
@@ -99,6 +102,7 @@ struct ngx_rtc_shm_session_s {
     ngx_atomic_t           srtp_ready; /* 1 once DTLS -> SRTP completed */
     ngx_int_t              owner_slot; /* owning worker slot, -1 while unbound */
     ngx_atomic_t           close_requested; /* admin kick: 1 = close on next reap */
+    ngx_atomic_t           expires;    /* msec absolute, 0 = no expire (half-open reap) */
     ngx_atomic_t           twcc_lost; /* cumulative transport-cc loss */
     ngx_atomic_t           twcc_received; /* cumulative transport-cc received */
 };
@@ -247,6 +251,19 @@ void ngx_rtc_shm_source_set_pt(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
 void ngx_rtc_shm_source_set_ssrc(ngx_rtc_shm_ctx_t *ctx, u_char *name,
                                  size_t len, uint32_t video_ssrc,
                                  uint32_t audio_ssrc);
+
+/* Mirror a source's packet/octet counters (used by the WHIP producer path,
+ * which does not run the RTMP bridge's sync_shm). */
+void ngx_rtc_shm_source_set_media_stats(ngx_rtc_shm_ctx_t *ctx, u_char *name,
+                                        size_t len, ngx_uint_t video_pkts,
+                                        ngx_uint_t video_octets,
+                                        ngx_uint_t audio_pkts,
+                                        ngx_uint_t audio_octets);
+
+/* Expire sweep: reap half-open sessions and empty non-publishing sources whose
+ * expires has elapsed. forced=1 also sweeps entries not yet due (allocation
+ * pressure fallback). Safe to call on every worker. */
+void ngx_rtc_shm_expire(ngx_rtc_shm_ctx_t *ctx, ngx_uint_t forced);
 
 /* Snapshot a source's ready subscribers under the pool mutex: fills ids/slots
  * with at most max entries and returns the count (0 when the source is absent).

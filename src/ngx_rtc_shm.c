@@ -40,6 +40,8 @@ ngx_rtc_shm_source_locked_lookup(ngx_rtc_shm_ctx_t *ctx, u_char *name,
 static ngx_rtc_shm_session_t *
 ngx_rtc_shm_session_locked_lookup(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag,
                                   size_t len);
+static void
+ngx_rtc_shm_expire_locked(ngx_rtc_shm_ctx_t *ctx, ngx_uint_t forced);
 
 static ngx_command_t  ngx_rtc_core_commands[] = {
 
@@ -318,14 +320,19 @@ ngx_rtc_shm_source_get(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len)
 
     src = ngx_slab_alloc_locked(ctx->pool, sizeof(ngx_rtc_shm_source_t));
     if (NULL == src) {
-        ngx_shmtx_unlock(&ctx->pool->mutex);
-        return NULL;
+        ngx_rtc_shm_expire_locked(ctx, 1); /* allocation pressure: reap, retry */
+        src = ngx_slab_alloc_locked(ctx->pool, sizeof(ngx_rtc_shm_source_t));
+        if (NULL == src) {
+            ngx_shmtx_unlock(&ctx->pool->mutex);
+            return NULL;
+        }
     }
 
     ngx_memzero(src, sizeof(*src));
     ngx_memcpy(src->name, name, len);
     src->name[len] = '\0';
     src->publisher_slot = -1;
+    src->expires = ngx_current_msec + NGX_RTC_SHM_SOURCE_EXPIRE_MS;
     src->video_ssrc = (uint32_t) ngx_random();
     src->audio_ssrc = (uint32_t) ngx_random();
     src->video_pt = NGX_RTC_PAYLOAD_TYPE_H264;
@@ -438,8 +445,12 @@ ngx_rtc_shm_session_add(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag, size_t ufrag_len,
 
     sess = ngx_slab_alloc_locked(ctx->pool, sizeof(ngx_rtc_shm_session_t));
     if (NULL == sess) {
-        ngx_shmtx_unlock(&ctx->pool->mutex);
-        return NULL;
+        ngx_rtc_shm_expire_locked(ctx, 1); /* allocation pressure: reap, retry */
+        sess = ngx_slab_alloc_locked(ctx->pool, sizeof(ngx_rtc_shm_session_t));
+        if (NULL == sess) {
+            ngx_shmtx_unlock(&ctx->pool->mutex);
+            return NULL;
+        }
     }
 
     ngx_memzero(sess, sizeof(*sess));
@@ -457,6 +468,7 @@ ngx_rtc_shm_session_add(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag, size_t ufrag_len,
     sess->publishing = publishing;
     sess->srtp_ready = 0;
     sess->owner_slot = -1;
+    sess->expires = ngx_current_msec + NGX_RTC_SHM_SESSION_EXPIRE_MS;
 
     ngx_queue_init(&sess->queue);
     ngx_queue_init(&sess->sub_queue);
@@ -605,12 +617,15 @@ ngx_rtc_shm_session_activate(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag, size_t len,
     }
 
     sess->srtp_ready = 1;
+    sess->expires = 0; /* bound and ready: no longer a half-open skeleton */
 
     /* Subscribe exactly once: a self-linked sub_queue means "not yet linked".
-     * DTLS-done runs once per skeleton, but keep the guard so an unexpected
-     * second activation cannot corrupt the subscriber queue. */
-    if (NULL != sess->source && sess->sub_queue.next == &sess->sub_queue) {
+     * A WHIP publisher is the media source, not a subscriber, so it must not
+     * receive its own broadcast. */
+    if (0 == sess->publishing && NULL != sess->source
+            && sess->sub_queue.next == &sess->sub_queue) {
         ngx_queue_insert_head(&sess->source->subscribers, &sess->sub_queue);
+        sess->source->expires = 0; /* has at least one viewer */
     }
 
     ngx_shmtx_unlock(&ctx->pool->mutex);
@@ -772,6 +787,11 @@ ngx_rtc_shm_source_set_publishing(ngx_rtc_shm_ctx_t *ctx, u_char *name,
     src = ngx_rtc_shm_source_locked_lookup(ctx, name, len);
     if (NULL != src) {
         src->publishing = publishing;
+        if (0 != publishing || !ngx_queue_empty(&src->subscribers)) {
+            src->expires = 0; /* active: publishing or has viewers */
+        } else if (0 == src->expires) {
+            src->expires = ngx_current_msec + NGX_RTC_SHM_SOURCE_EXPIRE_MS;
+        }
     }
     ngx_shmtx_unlock(&ctx->pool->mutex);
 }
@@ -823,6 +843,91 @@ ngx_rtc_shm_source_set_ssrc(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
             src->audio_ssrc = audio_ssrc;
         }
     }
+    ngx_shmtx_unlock(&ctx->pool->mutex);
+}
+
+
+void
+ngx_rtc_shm_source_set_media_stats(ngx_rtc_shm_ctx_t *ctx, u_char *name,
+                                   size_t len, ngx_uint_t video_pkts,
+                                   ngx_uint_t video_octets,
+                                   ngx_uint_t audio_pkts,
+                                   ngx_uint_t audio_octets)
+{
+    ngx_rtc_shm_source_t *src;
+
+    if (NULL == ctx || NULL == name || 0 == len
+            || len >= NGX_RTC_SHM_SOURCE_NAME_MAX) {
+        return;
+    }
+
+    ngx_shmtx_lock(&ctx->pool->mutex);
+    src = ngx_rtc_shm_source_locked_lookup(ctx, name, len);
+    if (NULL != src) {
+        src->video_pkts = video_pkts;
+        src->video_octets = video_octets;
+        src->audio_pkts = audio_pkts;
+        src->audio_octets = audio_octets;
+    }
+    ngx_shmtx_unlock(&ctx->pool->mutex);
+}
+
+
+static void
+ngx_rtc_shm_expire_locked(ngx_rtc_shm_ctx_t *ctx, ngx_uint_t forced)
+{
+    ngx_queue_t           *q;
+    ngx_queue_t           *next;
+    ngx_rtc_shm_session_t *sess;
+    ngx_rtc_shm_source_t  *src;
+    ngx_msec_t             now;
+
+    now = ngx_current_msec;
+
+    /* Reap half-open sessions (never bound to an owner worker) whose grace has
+     * elapsed. Bound sessions are reclaimed by the owner worker's close path. */
+    for (q = ngx_queue_head(&ctx->session_list);
+         q != ngx_queue_sentinel(&ctx->session_list);
+         q = next) {
+        next = ngx_queue_next(q);
+        sess = ngx_queue_data(q, ngx_rtc_shm_session_t, queue);
+        if (sess->owner_slot != -1) {
+            continue;
+        }
+        if (sess->expires != 0
+                && (forced || now >= (ngx_msec_t) sess->expires)) {
+            ngx_rtc_shm_session_free_locked(ctx, sess);
+        }
+    }
+
+    /* Reap empty non-publishing sources whose grace has elapsed. */
+    for (q = ngx_queue_head(&ctx->source_list);
+         q != ngx_queue_sentinel(&ctx->source_list);
+         q = next) {
+        next = ngx_queue_next(q);
+        src = ngx_queue_data(q, ngx_rtc_shm_source_t, queue);
+        if (src->publishing || !ngx_queue_empty(&src->subscribers)) {
+            continue;
+        }
+        if (src->expires != 0
+                && (forced || now >= (ngx_msec_t) src->expires)) {
+            ngx_queue_remove(&src->queue);
+            ngx_rbtree_delete(&ctx->source_tree, &src->sn.node);
+            ngx_slab_free_locked(ctx->pool, src);
+        }
+    }
+}
+
+
+void
+ngx_rtc_shm_expire(ngx_rtc_shm_ctx_t *ctx, ngx_uint_t forced)
+{
+    if (NULL == ctx) {
+        return;
+    }
+
+    ngx_shmtx_lock(&ctx->pool->mutex);
+    ngx_rtc_shm_expire_locked(ctx, forced);
     ngx_shmtx_unlock(&ctx->pool->mutex);
 }
 

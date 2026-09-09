@@ -260,6 +260,7 @@ ngx_rtc_session_t *ngx_rtc_session_find(const char *ufrag);
  * next(NULL) returns the first session. */
 ngx_rtc_session_t *ngx_rtc_session_first(void);
 ngx_rtc_session_t *ngx_rtc_session_next(ngx_rtc_session_t *sess);
+ngx_rtc_session_t *ngx_rtc_session_find_by_id(ngx_uint_t id);
 
 /* Insert / remove a session from the global list. */
 void ngx_rtc_session_add(ngx_rtc_session_t *sess);
