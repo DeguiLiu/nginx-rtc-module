@@ -181,3 +181,31 @@ NGX_RTC_TEST(vring_overflow_and_guards)
 
     ngx_rtc_vring_destroy(&r);
 }
+
+NGX_RTC_TEST(vring_count_tracks_entries)
+{
+    ngx_rtc_vring_t r;
+    uint8_t         out[8];
+    uint32_t        out_len;
+    uint8_t         payload[4];
+
+    (void)memset(&r, 0, sizeof(r));
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_vring_init(&r, 64u), 0);
+    NGX_RTC_TEST_ASSERT_U64_EQ(ngx_rtc_vring_count(&r), 0u);
+
+    (void)memset(payload, 0x5Au, sizeof(payload));
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_vring_push(&r, payload, 4u), 0);
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_vring_push(&r, payload, 4u), 0);
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_vring_push(&r, payload, 4u), 0);
+    NGX_RTC_TEST_ASSERT_U64_EQ(ngx_rtc_vring_count(&r), 3u);
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_vring_pop(&r, out, sizeof(out), &out_len), 0);
+    NGX_RTC_TEST_ASSERT_U64_EQ(ngx_rtc_vring_count(&r), 2u);
+
+    /* Draining to empty returns to a zero count. */
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_vring_pop(&r, out, sizeof(out), &out_len), 0);
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_vring_pop(&r, out, sizeof(out), &out_len), 0);
+    NGX_RTC_TEST_ASSERT_U64_EQ(ngx_rtc_vring_count(&r), 0u);
+
+    ngx_rtc_vring_destroy(&r);
+}

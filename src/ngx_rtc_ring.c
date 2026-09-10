@@ -168,6 +168,7 @@ ngx_rtc_vring_init(ngx_rtc_vring_t *r, uint32_t capacity)
     r->head = 0;
     r->tail = 0;
     r->bytes = 0;
+    r->count = 0;
 
     return 0;
 }
@@ -185,6 +186,7 @@ ngx_rtc_vring_destroy(ngx_rtc_vring_t *r)
     r->head = 0;
     r->tail = 0;
     r->bytes = 0;
+    r->count = 0;
 }
 
 int
@@ -195,6 +197,16 @@ ngx_rtc_vring_empty(const ngx_rtc_vring_t *r)
     }
 
     return r->bytes == 0;
+}
+
+uint32_t
+ngx_rtc_vring_count(const ngx_rtc_vring_t *r)
+{
+    if (NULL == r || NULL == r->buf) {
+        return 0;
+    }
+
+    return r->count;
 }
 
 int
@@ -217,6 +229,7 @@ ngx_rtc_vring_push(ngx_rtc_vring_t *r, const void *data, uint32_t len)
 
     r->head = (r->head + total) % r->capacity;
     r->bytes += total;
+    r->count++;
 
     return 0;
 }
@@ -245,6 +258,7 @@ ngx_rtc_vring_pop(ngx_rtc_vring_t *r, void *out, uint32_t out_cap,
     total = 4u + len;
     r->tail = (r->tail + total) % r->capacity;
     r->bytes -= total;
+    r->count--;
 
     return 0;
 }

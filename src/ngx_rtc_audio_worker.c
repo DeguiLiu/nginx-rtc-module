@@ -31,6 +31,12 @@
 #define NGX_RTC_AUDIO_OUT_ARENA_BYTES \
     (NGX_RTC_AUDIO_WORKER_RING_CAP * (4u + NGX_RTC_AUDIO_OPUS_MAX_PACKET))
 
+/* Latency bound: when more frames are queued than this, the consumer has fallen
+ * behind and skips stale frames to stay close to live. 8 frames ~= 170 ms; the
+ * byte arena can hold far more small frames than the fixed-size ring's 16, so
+ * an explicit bound keeps latency bounded. */
+#define NGX_RTC_AUDIO_MAX_PENDING 8u
+
 struct ngx_rtc_audio_worker_s {
     pthread_t       thread;
     pthread_mutex_t lock;
@@ -170,6 +176,16 @@ ngx_rtc_audio_worker_drain(ngx_rtc_audio_worker_t *w,
     }
 
     drained = 0;
+
+    /* Fast-forward: skip stale Opus frames when the main loop has fallen
+     * behind, keeping broadcast audio close to live. */
+    pthread_mutex_lock(&w->lock);
+    while (ngx_rtc_vring_count(&w->out) > NGX_RTC_AUDIO_MAX_PENDING) {
+        (void)ngx_rtc_vring_pop(&w->out, opus, sizeof(opus), &opus_len);
+        w->out_dropped++;
+    }
+    pthread_mutex_unlock(&w->lock);
+
     for (;;) {
         pthread_mutex_lock(&w->lock);
         {
@@ -223,6 +239,13 @@ ngx_rtc_audio_worker_main(void *arg)
         if (w->stop) {
             pthread_mutex_unlock(&w->lock);
             break;
+        }
+
+        /* Fast-forward: skip stale AAC frames when the transcoder has fallen
+         * behind, so latency stays bounded instead of growing in the arena. */
+        while (ngx_rtc_vring_count(&w->in) > NGX_RTC_AUDIO_MAX_PENDING) {
+            (void)ngx_rtc_vring_pop(&w->in, aac, sizeof(aac), &aac_len);
+            w->in_dropped++;
         }
 
         (void)ngx_rtc_vring_pop(&w->in, aac, sizeof(aac), &aac_len);

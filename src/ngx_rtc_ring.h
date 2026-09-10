@@ -49,6 +49,7 @@ typedef struct {
     uint32_t head;       /* next write byte offset */
     uint32_t tail;       /* next read byte offset */
     uint32_t bytes;      /* live bytes, including the 4-byte length prefixes */
+    uint32_t count;      /* number of live entries */
 } ngx_rtc_vring_t;
 
 /* Initialise a byte arena of `capacity` bytes. Returns 0 / -1. */
@@ -66,5 +67,6 @@ int ngx_rtc_vring_pop(ngx_rtc_vring_t *r, void *out, uint32_t out_cap,
                       uint32_t *out_len);
 
 int ngx_rtc_vring_empty(const ngx_rtc_vring_t *r);
+uint32_t ngx_rtc_vring_count(const ngx_rtc_vring_t *r);
 
 #endif /* NGX_RTC_RING_H */
