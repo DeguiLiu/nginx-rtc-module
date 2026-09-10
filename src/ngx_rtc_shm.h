@@ -92,7 +92,7 @@ struct ngx_rtc_shm_source_s {
     ngx_uint_t             remote_subscribers; /* viewers on a worker != publisher_slot */
 
     /* Cross-worker retransmit ring (video): lazily allocated on first video
-     * packet; any worker answers NACK/PLI from it (per-ring lock). */
+     * packet; any worker answers NACK/PLI from it under the pool mutex. */
     ngx_rtc_shm_retransmit_t   *retransmit;
     ngx_uint_t                  retransmit_alloc_failed; /* lazy ring alloc failures */
 };
@@ -318,8 +318,13 @@ ngx_int_t ngx_rtc_shm_retransmit_replay_gop(ngx_rtc_shm_ctx_t *ctx,
  * enqueue is MPSC, dequeue is single-consumer (both take ring->mtx). */
 ngx_rtc_shm_ring_t *ngx_rtc_shm_ring_init(ngx_slab_pool_t *pool,
                                           ngx_uint_t slots);
+/* Enqueue one plaintext RTP datagram plus its target session ids, writing the
+ * ring slot in a single pass (no stack staging copy of the caller's buffer).
+ * media = 0 video / 1 audio, gop = first packet of an IDR access unit. */
 ngx_int_t ngx_rtc_shm_ring_enqueue(ngx_rtc_shm_ring_t *ring,
-                                   const ngx_rtc_ring_entry_t *entry);
+                                   uint8_t media, uint8_t gop,
+                                   const uint8_t *rtp, uint16_t rtp_len,
+                                   const ngx_uint_t *sess_ids, ngx_uint_t nsess);
 ngx_int_t ngx_rtc_shm_ring_dequeue(ngx_rtc_shm_ring_t *ring,
                                    ngx_rtc_ring_entry_t *entry);
 ngx_int_t ngx_rtc_shm_ring_full(const ngx_rtc_shm_ring_t *ring);

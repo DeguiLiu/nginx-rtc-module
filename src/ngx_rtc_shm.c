@@ -1273,11 +1273,16 @@ ngx_rtc_shm_ring_init(ngx_slab_pool_t *pool, ngx_uint_t slots)
 
 ngx_int_t
 ngx_rtc_shm_ring_enqueue(ngx_rtc_shm_ring_t *ring,
-                         const ngx_rtc_ring_entry_t *entry)
+                         uint8_t media, uint8_t gop,
+                         const uint8_t *rtp, uint16_t rtp_len,
+                         const ngx_uint_t *sess_ids, ngx_uint_t nsess)
 {
-    ngx_uint_t idx;
+    ngx_rtc_ring_entry_t *slot;
+    ngx_uint_t            idx;
 
-    if (NULL == ring || NULL == entry) {
+    if (NULL == ring || NULL == rtp || NULL == sess_ids
+            || 0 == rtp_len || rtp_len > NGX_RTC_RING_RTP_MAX
+            || 0 == nsess || nsess > NGX_RTC_RING_MAX_SESSIONS) {
         return NGX_ERROR;
     }
 
@@ -1289,8 +1294,14 @@ ngx_rtc_shm_ring_enqueue(ngx_rtc_shm_ring_t *ring,
     }
 
     idx = (ngx_uint_t) (ring->head & ring->mask);
-    ring->entries[idx] = *entry;
-    ring->entries[idx].seq = ring->head;
+    slot = &ring->entries[idx];
+    slot->seq = ring->head;
+    slot->media = media;
+    slot->gop = gop;
+    slot->len = rtp_len;
+    slot->nsess = nsess;
+    ngx_memcpy(slot->sess, sess_ids, nsess * sizeof(ngx_uint_t));
+    ngx_memcpy(slot->rtp, rtp, rtp_len);
     ring->head++;
 
     ngx_shmtx_unlock(&ring->mtx);

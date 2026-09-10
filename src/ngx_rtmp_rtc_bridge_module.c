@@ -898,7 +898,7 @@ ngx_rtc_broadcast_rtp(ngx_rtc_source_t *src, const uint8_t *rtp,
     ngx_uint_t             i;
     ngx_uint_t             w;
     ngx_uint_t             nsess;
-    ngx_rtc_ring_entry_t   entry;
+    ngx_uint_t             sess_ids[NGX_RTC_RING_MAX_SESSIONS];
     ngx_rtc_session_t     *sess;
 
     if (len > NGX_RTC_RING_RTP_MAX) {
@@ -949,15 +949,10 @@ ngx_rtc_broadcast_rtp(ngx_rtc_source_t *src, const uint8_t *rtp,
             continue; /* already sent directly above */
         }
         nsess = 0;
-        ngx_memzero(&entry, sizeof(entry));
-        entry.media = (uint8_t) (is_video ? 0 : 1);
-        entry.gop = (uint8_t) (0 != is_gop_start ? 1 : 0);
-        entry.len = (uint16_t) len;
-
         for (i = 0; i < n; i++) {
             if (src->snap_slots[i] == (ngx_int_t) w
                     && nsess < NGX_RTC_RING_MAX_SESSIONS) {
-                entry.sess[nsess++] = src->snap_ids[i];
+                sess_ids[nsess++] = src->snap_ids[i];
             }
         }
 
@@ -965,11 +960,12 @@ ngx_rtc_broadcast_rtp(ngx_rtc_source_t *src, const uint8_t *rtp,
             continue;
         }
 
-        entry.nsess = (uint16_t) nsess;
-        ngx_memcpy(entry.rtp, rtp, len);
-
-        if (ngx_rtc_shm_ring_enqueue(shm->rings[w], &entry)
-                == NGX_OK) {
+        /* The plaintext RTP is written into the shm slot once by enqueue; no
+         * stack staging entry is built here. */
+        if (ngx_rtc_shm_ring_enqueue(shm->rings[w],
+                (uint8_t) (is_video ? 0 : 1),
+                (uint8_t) (0 != is_gop_start ? 1 : 0),
+                rtp, (uint16_t) len, sess_ids, nsess) == NGX_OK) {
             uint64_t one;
             ssize_t  rc;
             one = 1;
