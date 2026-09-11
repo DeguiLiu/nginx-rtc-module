@@ -10,7 +10,7 @@ ngx_rtmp_rtc_bridge_module / ngx_rtc_stream_module(WHIP 上行)
       │  解析 H264/AAC → 封 RTP / SRTP 解密
       ▼
 ngx_rtc_core_module(source/session 注册表, rtc_zone 共享内存)
-      │  明文 RTP 广播 + GOP 关键帧快照
+      │  明文 RTP 广播 + GOP 环缓存
       ▼
 ngx_rtc_stream_module(owner worker 出队 → SRTP → UDP)
       │
@@ -22,7 +22,7 @@ ngx_rtc_stream_module(owner worker 出队 → SRTP → UDP)
 
 | 模块 | 职责 |
 |---|---|
-| `ngx_rtc_core_module` | `rtc_zone` 共享内存注册表（source/session）、跨 worker 媒体环、GOP 快照；模块身份、`rtc_zone` 指令与 worker 崩溃回溯在 `ngx_rtc_core_module.c`，纯数据结构注册表在 `ngx_rtc_shm.c` |
+| `ngx_rtc_core_module` | `rtc_zone` 共享内存注册表（source/session）、跨 worker 媒体环、每 source 重传环；模块身份、`rtc_zone` 指令与 worker 崩溃回溯在 `ngx_rtc_core_module.c`，纯数据结构注册表在 `ngx_rtc_shm.c` |
 | `ngx_rtmp_rtc_bridge_module` | RTMP 音视频 → RTP 封包 → 广播 |
 | `ngx_rtc_http_module` | WHIP / RTC 信令（SDP offer/answer）、统计透出 |
 | `ngx_rtc_stream_module` | UDP 媒体面：STUN/DTLS/SRTP、上行 SRTP 接收、下行 SRTP 发送 |
