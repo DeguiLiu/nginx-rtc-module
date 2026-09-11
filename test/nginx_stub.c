@@ -1,13 +1,24 @@
 /*
- * nginx_stub.c - link-only stubs for the nginx surface used by ngx_rtc_core.c.
+ * nginx_stub.c - the nginx surface the host build has to supply itself.
  *
- * The host tests exercise only the GOP-ring helpers in ngx_rtc_core.c
- * (ngx_rtc_rtp_ring_push / _get / _replay). The source/session registry half of
- * that file references nginx rbtree / crc32 / queue helpers and the SRTP
- * protector; these symbols must exist for the final link but are never called,
- * so each is a trivial no-op. Do NOT write host tests against the registry
- * functions (ngx_rtc_source_get / *_first / *_next / session add/remove):
- * they depend on the real nginx rbtree semantics that these stubs do not model.
+ * What this file provides depends on which headers the build is using, and the
+ * two branches below are that difference:
+ *
+ *   - Against a configured nginx tree (the Linux host build; see NGX_SRC in
+ *     test/Makefile) nginx supplies its own types and macros, and this file
+ *     only supplies the symbols nginx's .c files would: the slab, the shm
+ *     mutex, the logger, the timer rbtree. nginx_stub.c is not linked into
+ *     that build as a stub of nginx -- it stands in for the handful of units
+ *     the tests deliberately do not link.
+ *   - Without one (the Windows cross build, which cannot use a Linux-configured
+ *     tree) it also supplies the objects themselves, from test/include/.
+ *
+ * The registry IS covered, by test_shm.c: source and session lifecycle,
+ * ownership hand-off and the reaper's reclaim. The earlier note here said the
+ * opposite -- that host tests must not touch ngx_rtc_source_get / *_first /
+ * *_next / session add-remove -- because the rbtree helpers were link-only
+ * no-ops at the time. They are real now, which is what made the registry
+ * testable and what let the sanitizer catch the shm source leak.
  */
 
 #include <ngx_core.h>
