@@ -1,9 +1,13 @@
 /*
- * ngx_rtc_shm.c - `rtc_zone` directive + slab-backed source/session registry.
+ * ngx_rtc_shm.c - slab-backed source/session registry.
  *
- * Phase 0/1 of docs/multi-worker-shm-design.md. The zone-init handshake follows
- * ngx_http_limit_req_init_zone (reload reuses the old cycle's pointers, an
- * existing shm reuses shpool->data, otherwise the root table is allocated).
+ * Phase 0/1 of multi-worker-shm-design.md, which lives in the deploy repo at
+ * nginx-rtc-example/docs/ -- this repo has no docs/ of its own, so the bare
+ * filename that used to be here named nothing. Pure data-structure code: it
+ * owns no nginx configuration and defines no nginx module. The `rtc_zone`
+ * directive and the module identity live in ngx_rtc_core_module.c, which is
+ * what lets this file be compiled by the host test suite with plain slab/shmtx
+ * stubs (see test/test_shm.c).
  *
  * Lists reuse nginx's intrusive ngx_queue_t (doubly-linked, O(1) remove) rather
  * than hand-rolled singly-linked lists; the source name index reuses
@@ -12,25 +16,10 @@
 
 #include "ngx_rtc_shm.h"
 #include "ngx_rtc_rtp.h"
+#include "ngx_rtc_core.h"
 
-#include <sys/eventfd.h>
-#include <execinfo.h>
-#include <signal.h>
-#include <unistd.h>
+#include <string.h>
 
-#define NGX_RTC_BT_MAX_DEPTH  64
-#define NGX_RTC_BT_BUF        512
-
-/* Worker crash backtrace (implemented at the end of this file), wired to the
- * core module's init_process so every worker registers the handlers. */
-static void       ngx_rtc_bt_handler(int signo, siginfo_t *si, void *uc);
-static ngx_int_t  ngx_rtc_bt_init_process(ngx_cycle_t *cycle);
-
-static ngx_int_t ngx_rtc_core_init_zone(ngx_shm_zone_t *shm_zone, void *data);
-static void     *ngx_rtc_core_create_conf(ngx_cycle_t *cycle);
-static char     *ngx_rtc_core_init_conf(ngx_cycle_t *cycle, void *conf);
-static char     *ngx_rtc_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
-static ngx_int_t ngx_rtc_core_init_module(ngx_cycle_t *cycle);
 static ngx_uint_t ngx_rtc_shm_ring_next_pow2(ngx_uint_t v);
 
 static ngx_rtc_shm_source_t *
@@ -44,238 +33,6 @@ ngx_rtc_shm_expire_locked(ngx_rtc_shm_ctx_t *ctx, ngx_uint_t forced);
 static ngx_uint_t
 ngx_rtc_shm_source_referenced_locked(ngx_rtc_shm_ctx_t *ctx,
                                      const ngx_rtc_shm_source_t *src);
-
-static ngx_command_t  ngx_rtc_core_commands[] = {
-
-    { ngx_string("rtc_zone"),
-      NGX_MAIN_CONF | NGX_DIRECT_CONF | NGX_CONF_TAKE2,
-      ngx_rtc_zone,
-      0,
-      0,
-      NULL },
-
-    { ngx_string("rtc_ring_slots"),
-      NGX_MAIN_CONF | NGX_DIRECT_CONF | NGX_CONF_TAKE1,
-      ngx_conf_set_num_slot,
-      0,
-      offsetof(ngx_rtc_core_conf_t, ring_slots),
-      NULL },
-
-      ngx_null_command
-};
-
-static ngx_core_module_t  ngx_rtc_core_module_ctx = {
-    ngx_string("rtc"),
-    ngx_rtc_core_create_conf,
-    ngx_rtc_core_init_conf
-};
-
-ngx_module_t  ngx_rtc_core_module = {
-    NGX_MODULE_V1,
-    &ngx_rtc_core_module_ctx,           /* module context */
-    ngx_rtc_core_commands,              /* module directives */
-    NGX_CORE_MODULE,                    /* module type */
-    NULL,                               /* init master */
-    ngx_rtc_core_init_module,           /* init module */
-    ngx_rtc_bt_init_process,            /* init process */
-    NULL,                               /* init thread */
-    NULL,                               /* exit thread */
-    NULL,                               /* exit process */
-    NULL,                               /* exit master */
-    NGX_MODULE_V1_PADDING
-};
-
-
-static void *
-ngx_rtc_core_create_conf(ngx_cycle_t *cycle)
-{
-    ngx_rtc_core_conf_t *ccf;
-
-    ccf = ngx_pcalloc(cycle->pool, sizeof(ngx_rtc_core_conf_t));
-    if (NULL == ccf) {
-        return NULL;
-    }
-
-    ccf->shm_zone = NULL;
-    ccf->ring_slots = NGX_CONF_UNSET_UINT;
-
-    return ccf;
-}
-
-
-static char *
-ngx_rtc_core_init_conf(ngx_cycle_t *cycle, void *conf)
-{
-    ngx_rtc_core_conf_t *ccf = conf;
-    ngx_core_conf_t     *cccf;
-
-    /* The zone-init callback (ngx_rtc_core_init_zone) runs later, during
-     * ngx_init_zone_pool, and populates ccf->sh / ccf->shpool. */
-    ngx_conf_init_uint_value(ccf->ring_slots, NGX_RTC_RING_DEFAULT_SLOTS);
-
-    cccf = (ngx_core_conf_t *) ngx_get_conf(cycle->conf_ctx, ngx_core_module);
-    ccf->nworkers = (NULL != cccf && cccf->worker_processes > 0)
-                    ? (ngx_uint_t) cccf->worker_processes : 1;
-
-    return NGX_CONF_OK;
-}
-
-
-static char *
-ngx_rtc_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
-{
-    ngx_rtc_core_conf_t *ccf = conf;
-    ngx_shm_zone_t      *shm_zone;
-    ngx_str_t           *value;
-    ssize_t              size;
-
-    value = cf->args->elts;
-
-    size = ngx_parse_size(&value[2]);
-    if (NGX_ERROR == size) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "invalid zone size \"%V\"", &value[2]);
-        return NGX_CONF_ERROR;
-    }
-
-    if (size < (ssize_t)(8 * ngx_pagesize)) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "zone \"%V\" is too small", &value[1]);
-        return NGX_CONF_ERROR;
-    }
-
-    shm_zone = ngx_shared_memory_add(cf, &value[1], (size_t)size,
-                                     &ngx_rtc_core_module);
-    if (NULL == shm_zone) {
-        return NGX_CONF_ERROR;
-    }
-
-    if (NULL != shm_zone->data) {
-        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                           "%V \"%V\" is already bound",
-                           &cmd->name, &value[1]);
-        return NGX_CONF_ERROR;
-    }
-
-    shm_zone->init = ngx_rtc_core_init_zone;
-    shm_zone->data = ccf;
-
-    ccf->shm_zone = shm_zone;
-
-    return NGX_CONF_OK;
-}
-
-
-static ngx_int_t
-ngx_rtc_core_init_zone(ngx_shm_zone_t *shm_zone, void *data)
-{
-    ngx_rtc_core_conf_t *octx = data;
-    ngx_rtc_core_conf_t *ctx = shm_zone->data;
-    size_t               len;
-    ngx_uint_t           w;
-
-    if (NULL != octx) {
-        /* Reload: keep the old cycle's root table and slab pool. */
-        ctx->sh = octx->sh;
-        ctx->shpool = octx->shpool;
-        return NGX_OK;
-    }
-
-    ctx->shpool = (ngx_slab_pool_t *) shm_zone->shm.addr;
-
-    if (shm_zone->shm.exists) {
-        /* Master crashed/restarted but the zone survived. */
-        ctx->sh = ctx->shpool->data;
-        return NGX_OK;
-    }
-
-    ctx->sh = ngx_slab_alloc(ctx->shpool, sizeof(ngx_rtc_shm_ctx_t));
-    if (NULL == ctx->sh) {
-        return NGX_ERROR;
-    }
-
-    ngx_memzero(ctx->sh, sizeof(*ctx->sh));
-    ctx->shpool->data = ctx->sh;
-
-    ctx->sh->pool = ctx->shpool;
-    ngx_rbtree_init(&ctx->sh->source_tree, &ctx->sh->source_sentinel,
-                    ngx_str_rbtree_insert_value);
-    ngx_queue_init(&ctx->sh->source_list);
-    ngx_queue_init(&ctx->sh->session_list);
-    ctx->sh->nworkers = ctx->nworkers;
-    ctx->sh->ring_slots = ctx->ring_slots;
-    ctx->sh->next_session_id = 1;
-
-    for (w = 0; w < NGX_MAX_PROCESSES; w++) {
-        ctx->sh->notify_fd[w] = -1;
-    }
-
-    for (w = 0; w < ctx->nworkers && w < NGX_MAX_PROCESSES; w++) {
-        ctx->sh->rings[w] = ngx_rtc_shm_ring_init(ctx->shpool, ctx->ring_slots);
-        if (NULL == ctx->sh->rings[w]) {
-            ngx_log_error(NGX_LOG_EMERG, shm_zone->shm.log, 0,
-                          "ngx_rtc: cannot allocate media ring %ui", w);
-            return NGX_ERROR;
-        }
-    }
-
-    len = sizeof(" in rtc zone \"\"") + shm_zone->shm.name.len;
-
-    ctx->shpool->log_ctx = ngx_slab_alloc(ctx->shpool, len);
-    if (NULL == ctx->shpool->log_ctx) {
-        return NGX_ERROR;
-    }
-
-    ngx_sprintf(ctx->shpool->log_ctx, " in rtc zone \"%V\"%Z",
-                &shm_zone->shm.name);
-
-    ctx->shpool->log_nomem = 0;
-
-    return NGX_OK;
-}
-
-
-ngx_rtc_core_conf_t *
-ngx_rtc_core_get_conf(ngx_cycle_t *cycle)
-{
-    /* conf_ctx[index] already IS the per-cycle conf pointer (nginx stores the
-     * core-module conf directly, cf. ngx_cycle.c init_conf / ngx_get_conf).
-     * A single cast suffices; the old double dereference read ccf->shm_zone
-     * instead and returned the shm_zone pointer, corrupting every ccf->sh /
-     * ccf->nworkers access across workers. */
-    return (ngx_rtc_core_conf_t *)
-               ngx_get_conf(cycle->conf_ctx, ngx_rtc_core_module);
-}
-
-
-static ngx_int_t
-ngx_rtc_core_init_module(ngx_cycle_t *cycle)
-{
-    ngx_rtc_core_conf_t *ccf;
-    ngx_uint_t           w;
-
-    /* Create one eventfd per worker BEFORE ngx_spawn_process() so every worker
-     * inherits the write side and can be woken by the RTMP producer. Must run
-     * at init_module (pre-fork) and not init_process (post-fork, worker-only):
-     * init_process never runs in the master, so the old code left notify_fd[]
-     * at -1 and the cross-worker wakeup was a no-op. */
-    ccf = ngx_rtc_core_get_conf(cycle);
-    if (NULL == ccf || NULL == ccf->sh) {
-        return NGX_OK;
-    }
-
-    for (w = 0; w < ccf->sh->nworkers && w < NGX_MAX_PROCESSES; w++) {
-        ccf->sh->notify_fd[w] = eventfd(0, EFD_NONBLOCK);
-        if (ccf->sh->notify_fd[w] == -1) {
-            ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
-                          "ngx_rtc: eventfd() failed for worker %ui", w);
-            return NGX_ERROR;
-        }
-    }
-
-    return NGX_OK;
-}
-
 
 static ngx_rtc_shm_source_t *
 ngx_rtc_shm_source_locked_lookup(ngx_rtc_shm_ctx_t *ctx, u_char *name,
@@ -375,7 +132,16 @@ ngx_rtc_shm_source_remove(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len)
     }
 
     /* A source with viewers cannot be freed yet; the last unsubscribe retries. */
-    if (!ngx_queue_empty(&src->subscribers)) {
+    if (0 == ngx_queue_empty(&src->subscribers)) {
+        ngx_shmtx_unlock(&ctx->pool->mutex);
+        return;
+    }
+
+    /* Never free a source that is still publishing: a live publisher holds a
+     * cached shm_src pointer that would dangle. release_publish clears the flag
+     * before the normal remove path; this guard is defense-in-depth against any
+     * caller that removes a publishing source. */
+    if (0 != src->publishing) {
         ngx_shmtx_unlock(&ctx->pool->mutex);
         return;
     }
@@ -478,6 +244,10 @@ ngx_rtc_shm_session_add(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag, size_t ufrag_len,
     sess->publishing = publishing;
     sess->srtp_ready = 0;
     sess->owner_slot = -1;
+    /* The creator is the signaling worker, and no worker owns the UDP session
+     * yet, so NEW is the one state it can honestly publish. Every later write
+     * comes from whichever worker ends up owning the media path. */
+    sess->state = NGX_RTC_SESSION_STATE_NEW;
     sess->expires = ngx_current_msec + NGX_RTC_SHM_SESSION_EXPIRE_MS;
 
     ngx_queue_init(&sess->queue);
@@ -515,9 +285,10 @@ ngx_rtc_shm_session_locked_lookup(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag,
 }
 
 
-/* Unlink and free one skeleton under the pool mutex, then reap its source when
- * the source became empty and is no longer publishing (reclaim the half-open
- * play case where no RTMP publisher ever marked it publishing). */
+/* Unlink and free one skeleton under the pool mutex. When the source is left
+ * empty and no longer publishing it is NOT freed here: see the grace arm below.
+ * (Reclaiming the half-open play case, where no RTMP publisher ever marked the
+ * source publishing, now happens through ngx_rtc_shm_expire_locked.) */
 static void
 ngx_rtc_shm_session_free_locked(ngx_rtc_shm_ctx_t *ctx,
                                 ngx_rtc_shm_session_t *sess)
@@ -526,18 +297,35 @@ ngx_rtc_shm_session_free_locked(ngx_rtc_shm_ctx_t *ctx,
 
     src = sess->source;
     if (NULL != src) {
-        ngx_queue_remove(&sess->sub_queue);
-        src->subscribers_version++;
+        if (sess->sub_queue.next != &sess->sub_queue) {
+            /* Was subscribed: unlink and drop the cross-worker count. */
+            ngx_queue_remove(&sess->sub_queue);
+            if (sess->owner_slot != src->publisher_slot
+                    && src->remote_subscribers > 0) {
+                (void) ngx_atomic_fetch_add(&src->remote_subscribers,
+                                            (ngx_atomic_uint_t) -1);
+            }
+            src->subscribers_version++;
+        }
     }
 
     ngx_queue_remove(&sess->queue);
     ngx_slab_free_locked(ctx->pool, sess);
 
+    /* The source just lost a session. Even when it is now empty and no longer
+     * publishing it must survive the grace period: another worker may hold the
+     * shm_src pointer it resolved up to NGX_RTC_SHM_SYNC_MS ago and keeps
+     * writing through it (stats counters, retransmit ring) until its next
+     * re-claim. Freeing here bypassed the src->expires grace that
+     * ngx_rtc_shm_source_release_publish armed, so a release on one worker
+     * could free the source under a publisher still running on another.
+     * Leaving the free to ngx_rtc_shm_expire_locked keeps one path and one
+     * grace; it requires
+     *     NGX_RTC_SHM_SOURCE_EXPIRE_MS > NGX_RTC_SHM_SYNC_MS
+     * so the grace always outlives the pointer cache. */
     if (NULL != src && ngx_queue_empty(&src->subscribers)
-            && 0 == src->publishing) {
-        ngx_queue_remove(&src->queue);
-        ngx_rbtree_delete(&ctx->source_tree, &src->sn.node);
-        ngx_slab_free_locked(ctx->pool, src);
+            && 0 == src->publishing && 0 == src->expires) {
+        src->expires = ngx_current_msec + NGX_RTC_SHM_SOURCE_EXPIRE_MS;
     }
 }
 
@@ -583,6 +371,7 @@ ngx_rtc_shm_session_bind(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag, size_t len,
     out->twcc_video_ext = sess->twcc_video_ext;
     out->twcc_audio_ext = sess->twcc_audio_ext;
     out->publishing = sess->publishing;
+    out->srtp_ready = (0 != sess->srtp_ready) ? 1 : 0;
 
     src = sess->source;
     if (NULL != src) {
@@ -628,6 +417,7 @@ ngx_rtc_shm_session_activate(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag, size_t len,
     }
 
     sess->srtp_ready = 1;
+    sess->state = NGX_RTC_SESSION_STATE_SRTP_READY;
     sess->expires = 0; /* bound and ready: no longer a half-open skeleton */
 
     /* Subscribe exactly once: a self-linked sub_queue means "not yet linked".
@@ -638,6 +428,9 @@ ngx_rtc_shm_session_activate(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag, size_t len,
         ngx_queue_insert_head(&sess->source->subscribers, &sess->sub_queue);
         sess->source->subscribers_version++;
         sess->source->expires = 0; /* has at least one viewer */
+        if (sess->owner_slot != sess->source->publisher_slot) {
+            (void) ngx_atomic_fetch_add(&sess->source->remote_subscribers, 1);
+        }
     }
 
     ngx_shmtx_unlock(&ctx->pool->mutex);
@@ -730,8 +523,10 @@ ngx_rtc_shm_session_is_close_requested(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag,
 
 
 void
-ngx_rtc_shm_session_set_twcc(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag, size_t len,
-                             ngx_uint_t lost, ngx_uint_t received)
+ngx_rtc_shm_session_set_stats(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag, size_t len,
+                              ngx_uint_t lost, ngx_uint_t received,
+                              ngx_uint_t pacer_bps, ngx_uint_t drop_pacer,
+                              ngx_uint_t drop_gop)
 {
     ngx_rtc_shm_session_t *sess;
 
@@ -745,8 +540,51 @@ ngx_rtc_shm_session_set_twcc(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag, size_t len,
     if (NULL != sess) {
         sess->twcc_lost = lost;
         sess->twcc_received = received;
+        sess->pacer_bps = pacer_bps;
+        sess->drop_pacer = drop_pacer;
+        sess->drop_gop = drop_gop;
     }
     ngx_shmtx_unlock(&ctx->pool->mutex);
+}
+
+
+void
+ngx_rtc_shm_session_set_state(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag, size_t len,
+                              ngx_uint_t slot, uint8_t state)
+{
+    ngx_rtc_shm_session_t *sess;
+
+    if (NULL == ctx || NULL == ufrag || 0 == len
+            || len >= NGX_RTC_SHM_UFRAG_MAX) {
+        return;
+    }
+
+    ngx_shmtx_lock(&ctx->pool->mutex);
+    sess = ngx_rtc_shm_session_locked_lookup(ctx, ufrag, len);
+    if (NULL != sess
+            && (-1 == sess->owner_slot
+                || sess->owner_slot == (ngx_int_t) slot)) {
+        sess->state = state;
+    }
+    ngx_shmtx_unlock(&ctx->pool->mutex);
+}
+
+
+ngx_int_t
+ngx_rtc_shm_layout_check(const ngx_rtc_shm_ctx_t *sh, ngx_log_t *log)
+{
+    if (NULL != sh && NGX_RTC_SHM_LAYOUT == sh->layout) {
+        return NGX_OK;
+    }
+
+    ngx_log_error(NGX_LOG_EMERG, log, 0,
+                  "ngx_rtc: the rtc_zone was built by a different build "
+                  "(layout %uD, this binary expects %uD); a reload cannot reuse "
+                  "it, stop and start the server instead",
+                  (NULL != sh) ? sh->layout : (uint32_t) 0,
+                  (uint32_t) NGX_RTC_SHM_LAYOUT);
+
+    return NGX_ERROR;
 }
 
 
@@ -784,9 +622,48 @@ ngx_rtc_shm_source_request_close(ngx_rtc_shm_ctx_t *ctx, u_char *name,
 }
 
 
+ngx_int_t
+ngx_rtc_shm_source_try_publish(ngx_rtc_shm_ctx_t *ctx, u_char *name,
+                               size_t len, ngx_uint_t kind)
+{
+    ngx_rtc_shm_source_t *src;
+
+    if (NULL == ctx || NULL == name || 0 == len
+            || len >= NGX_RTC_SHM_SOURCE_NAME_MAX) {
+        return NGX_ERROR;
+    }
+
+    ngx_shmtx_lock(&ctx->pool->mutex);
+    src = ngx_rtc_shm_source_locked_lookup(ctx, name, len);
+    if (NULL == src) {
+        ngx_shmtx_unlock(&ctx->pool->mutex);
+        return NGX_ERROR;
+    }
+
+    /* A source has exactly one publisher. Reject a different kind; allow the
+     * same kind (idempotent re-claim on every media packet). */
+    if (0 != src->publisher_kind && src->publisher_kind != kind) {
+        ngx_shmtx_unlock(&ctx->pool->mutex);
+        return NGX_BUSY;
+    }
+
+    src->publisher_kind = kind;
+    src->publishing = 1;
+    src->expires = 0; /* active: publishing */
+    /* Arm the liveness heartbeat. The publish path refreshes it per packet
+     * (ngx_rtmp_rtc_shm_stats); if this worker dies without releasing, it stops
+     * advancing and the reaper reclaims the source. */
+    src->publisher_seen_ms = (ngx_atomic_t) ngx_current_msec;
+
+    ngx_shmtx_unlock(&ctx->pool->mutex);
+
+    return NGX_OK;
+}
+
+
 void
-ngx_rtc_shm_source_set_publishing(ngx_rtc_shm_ctx_t *ctx, u_char *name,
-                                  size_t len, ngx_uint_t publishing)
+ngx_rtc_shm_source_release_publish(ngx_rtc_shm_ctx_t *ctx, u_char *name,
+                                   size_t len, ngx_uint_t kind)
 {
     ngx_rtc_shm_source_t *src;
 
@@ -797,15 +674,145 @@ ngx_rtc_shm_source_set_publishing(ngx_rtc_shm_ctx_t *ctx, u_char *name,
 
     ngx_shmtx_lock(&ctx->pool->mutex);
     src = ngx_rtc_shm_source_locked_lookup(ctx, name, len);
-    if (NULL != src) {
-        src->publishing = publishing;
-        if (0 != publishing || !ngx_queue_empty(&src->subscribers)) {
-            src->expires = 0; /* active: publishing or has viewers */
-        } else if (0 == src->expires) {
-            src->expires = ngx_current_msec + NGX_RTC_SHM_SOURCE_EXPIRE_MS;
-        }
+    if (NULL == src || src->publisher_kind != kind) {
+        /* Not ours: a stale close must not clear a live publisher's flag. */
+        ngx_shmtx_unlock(&ctx->pool->mutex);
+        return;
     }
+
+    src->publisher_kind = NGX_RTC_PUBLISHER_NONE;
+    src->publishing = 0;
+    if (0 == ngx_queue_empty(&src->subscribers)) {
+        src->expires = 0; /* still has viewers: keep alive */
+    } else if (0 == src->expires) {
+        src->expires = ngx_current_msec + NGX_RTC_SHM_SOURCE_EXPIRE_MS;
+    }
+
     ngx_shmtx_unlock(&ctx->pool->mutex);
+}
+
+
+/*
+ * Publish ownership: the only writers of a local source's ownership pair. See
+ * the contract in ngx_rtc_shm.h -- briefly, the shm source is the authority and
+ * ngx_rtc_source_t carries a lock-free mirror for the per-packet media path.
+ * Keeping every write in these three functions is what stops the two copies
+ * from drifting, which is where both known ownership defects came from.
+ */
+
+ngx_int_t
+ngx_rtc_publish_claim(ngx_rtc_source_t *src, ngx_uint_t kind)
+{
+    ngx_rtc_core_conf_t  *ccf;
+    ngx_rtc_shm_source_t *shm_src;
+    ngx_int_t             rc;
+
+    if (NULL == src) {
+        return NGX_ERROR;
+    }
+
+    ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
+
+    if (NULL == ccf || NULL == ccf->sh) {
+        /* No rtc_zone: one worker, so there is nothing to arbitrate against. */
+        src->publisher_kind = kind;
+        src->publishing = 1;
+        src->shm_src = NULL;
+        return NGX_OK;
+    }
+
+    rc = ngx_rtc_shm_source_try_publish(ccf->sh, (u_char *) src->name,
+                                        ngx_strlen(src->name), kind);
+
+    if (NGX_BUSY == rc) {
+        /* Another protocol holds the name. Clear the mirror rather than keep
+         * claiming a right this process does not have: a stale tag here is what
+         * made an RTMP takeover of a dead WHIP name impossible until the whole
+         * process was restarted. */
+        src->publisher_kind = NGX_RTC_PUBLISHER_NONE;
+        src->publishing = 0;
+        src->shm_src = NULL;
+        return NGX_BUSY;
+    }
+
+    src->publisher_kind = kind;
+    src->publishing = 1;
+
+    if (NGX_OK == rc) {
+        /* Safe to cache: try_publish held the mutex and found this source to
+         * claim, and publishing == 1 now keeps ngx_rtc_shm_source_remove() from
+         * freeing it under us. NGX_ERROR instead means the source vanished
+         * between the caller's lookup and the claim -- degrade to no mirror
+         * rather than caching a dangling pointer. */
+        shm_src = ngx_rtc_shm_source_get(ccf->sh, (u_char *) src->name,
+                                         ngx_strlen(src->name));
+    } else {
+        shm_src = NULL;
+    }
+
+    src->shm_src = shm_src;
+    if (NULL != shm_src) {
+        src->shm_sync_ms = ngx_current_msec;
+    }
+
+    return NGX_OK;
+}
+
+
+void
+ngx_rtc_publish_release(ngx_rtc_source_t *src)
+{
+    ngx_rtc_core_conf_t *ccf;
+    ngx_uint_t           kind;
+
+    if (NULL == src) {
+        return;
+    }
+
+    kind = src->publisher_kind;
+    if (NGX_RTC_PUBLISHER_NONE == kind) {
+        /* Not ours (or already released): a stale close must not clear a live
+         * publisher's flag. */
+        return;
+    }
+
+    /* Clear the mirror first. The shm half below is about to make the source
+     * reapable, and nothing in this process may keep reading a cached pointer
+     * into it afterwards. Clearing it also forces the next publish in this
+     * process through the claim path instead of the cached-pointer fast path. */
+    src->publisher_kind = NGX_RTC_PUBLISHER_NONE;
+    src->publishing = 0;
+    src->shm_src = NULL;
+
+    ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
+    if (NULL == ccf || NULL == ccf->sh) {
+        return;
+    }
+
+    ngx_rtc_shm_source_release_publish(ccf->sh, (u_char *) src->name,
+                                       ngx_strlen(src->name), kind);
+
+    /* Hand the shm source back too. remove() is the one that decides: it
+     * refuses while subscribers remain or the source is still published, so a
+     * name with viewers survives and the last unsubscribe retries. Doing it
+     * here keeps both protocols from having to know that ordering. */
+    ngx_rtc_shm_source_remove(ccf->sh, (u_char *) src->name,
+                              ngx_strlen(src->name));
+}
+
+
+void
+ngx_rtc_publish_mirror(ngx_rtc_source_t *src, ngx_uint_t kind)
+{
+    if (NULL == src) {
+        return;
+    }
+
+    /* The shm claim is already held by another worker; adopting it here must
+     * not touch the shm, or this process would become a second claimant of a
+     * right it does not own. */
+    src->publisher_kind = kind;
+    src->publishing = 1;
 }
 
 
@@ -885,6 +892,37 @@ ngx_rtc_shm_source_set_media_stats(ngx_rtc_shm_ctx_t *ctx, u_char *name,
 }
 
 
+/*
+ * True when some session skeleton still points at `src`.
+ *
+ * A source may only be freed once nothing references it. `subscribers` is not
+ * that test: a session that has not finished its handshake is not a subscriber
+ * yet, and a WHIP publisher never becomes one, so the reaper used to free a
+ * source out from under a live `sess->source`. session_activate() then inserts
+ * into `src->subscribers` -- a write into freed slab, through a pointer the
+ * NULL check there cannot catch. Only the intrusive list links are read here;
+ * comparing two slab pointers never dereferences one.
+ */
+static ngx_uint_t
+ngx_rtc_shm_source_referenced_locked(ngx_rtc_shm_ctx_t *ctx,
+                                     const ngx_rtc_shm_source_t *src)
+{
+    ngx_queue_t           *q;
+    ngx_rtc_shm_session_t *sess;
+
+    for (q = ngx_queue_head(&ctx->session_list);
+         q != ngx_queue_sentinel(&ctx->session_list);
+         q = ngx_queue_next(q)) {
+        sess = ngx_queue_data(q, ngx_rtc_shm_session_t, queue);
+        if (sess->source == src) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
 static void
 ngx_rtc_shm_expire_locked(ngx_rtc_shm_ctx_t *ctx, ngx_uint_t forced)
 {
@@ -918,13 +956,43 @@ ngx_rtc_shm_expire_locked(ngx_rtc_shm_ctx_t *ctx, ngx_uint_t forced)
          q = next) {
         next = ngx_queue_next(q);
         src = ngx_queue_data(q, ngx_rtc_shm_source_t, queue);
-        if (src->publishing || !ngx_queue_empty(&src->subscribers)) {
+
+        if (0 != src->publishing) {
+            /* A clean teardown clears this flag; a worker that died takes it to
+             * the grave, and the source -- with its ~1.5 MB retransmit ring --
+             * would then stay pinned for the life of the zone, permanently
+             * refusing any later publish of the same name as a cross-protocol
+             * conflict. The heartbeat written per packet by
+             * ngx_rtmp_rtc_shm_stats() is the liveness proof: while it keeps
+             * advancing the publisher is alive and the source is left alone;
+             * once it has been silent past the grace, fall through and let the
+             * normal rules below decide (subscribers still hold it back). */
+            if (0 != src->publisher_seen_ms
+                    && (ngx_msec_int_t) (now
+                           - (ngx_msec_t) src->publisher_seen_ms)
+                           < (ngx_msec_int_t) NGX_RTC_SHM_PUBLISH_GRACE_MS) {
+                continue;
+            }
+
+            src->publishing = 0;
+            src->publisher_kind = NGX_RTC_PUBLISHER_NONE;
+        }
+
+        if (0 == ngx_queue_empty(&src->subscribers)) {
             continue;
         }
+        /* An empty subscriber list is not enough -- see
+         * ngx_rtc_shm_source_referenced_locked(). A source held back this way
+         * keeps its elapsed `expires`, so it is collected on the first pass
+         * after the last session pointing at it goes away. */
         if (src->expires != 0
-                && (forced || now >= (ngx_msec_t) src->expires)) {
+                && (forced || now >= (ngx_msec_t) src->expires)
+                && 0 == ngx_rtc_shm_source_referenced_locked(ctx, src)) {
             ngx_queue_remove(&src->queue);
             ngx_rbtree_delete(&ctx->source_tree, &src->sn.node);
+            if (NULL != src->retransmit) {
+                ngx_slab_free_locked(ctx->pool, src->retransmit);
+            }
             ngx_slab_free_locked(ctx->pool, src);
         }
     }
@@ -1004,7 +1072,6 @@ ngx_rtc_shm_retransmit_alloc_locked(ngx_rtc_shm_ctx_t *ctx,
 
     ngx_memzero(r, size);
     r->cap = NGX_RTC_SHM_RETX_RING_CAP;
-    (void) ngx_shmtx_create(&r->mtx, &r->mtx_sh, (u_char *) "rtc_retx");
 
     src->retransmit = r;
     return r;
@@ -1037,36 +1104,63 @@ ngx_rtc_shm_retransmit_reset(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len)
         return;
     }
     r = src->retransmit;
-    ngx_shmtx_unlock(&ctx->pool->mutex);
-
-    ngx_shmtx_lock(&r->mtx);
     r->head = 0;      /* new generation: indices restart, not just count */
     r->count = 0;
     r->gop_start = 0;
-    ngx_shmtx_unlock(&r->mtx);
+    ngx_shmtx_unlock(&ctx->pool->mutex);
+}
+
+
+/*
+ * Microsecond clock for the retransmit-ring instrumentation below. nginx's
+ * ngx_current_msec is a cached millisecond and far too coarse for sections that
+ * run in tens of microseconds; ngx_gettimeofday is the portable one (nginx
+ * core provides it for unix and win32 alike) and carries the microsecond field
+ * those sections need. Deliberately not clock_gettime: this module also builds
+ * for Windows and the cross build has no such symbol.
+ */
+static ngx_uint_t
+ngx_rtc_shm_now_us(void)
+{
+    struct timeval  tv;
+
+    ngx_gettimeofday(&tv);
+    return (ngx_uint_t) tv.tv_sec * 1000000u + (ngx_uint_t) tv.tv_usec;
 }
 
 
 void
-ngx_rtc_shm_retransmit_append(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
+ngx_rtc_shm_retransmit_append(ngx_rtc_shm_ctx_t *ctx,
+                              ngx_rtc_shm_source_t *src,
                               const uint8_t *rtp, uint32_t rtp_len,
                               uint8_t is_gop_start)
 {
-    ngx_rtc_shm_source_t      *src;
-    ngx_rtc_shm_retransmit_t  *r;
+    ngx_rtc_shm_retransmit_t      *r;
     ngx_rtc_shm_retransmit_slot_t *slot;
-    ngx_uint_t                 idx;
+    ngx_uint_t                     idx;
+    ngx_uint_t                     t0;
 
-    if (NULL == ctx || NULL == name || 0 == len
-            || len >= NGX_RTC_SHM_SOURCE_NAME_MAX
-            || NULL == rtp || 0 == rtp_len
+    if (NULL == ctx || NULL == src || NULL == rtp || 0 == rtp_len
             || rtp_len > NGX_RTC_RING_RTP_MAX) {
         return;
     }
 
+    /* Same-worker viewers read the in-process GOP ring; the shm mirror only
+     * serves cross-worker viewers. Skip the pool mutex, rbtree lookup, copy and
+     * lazy alloc until a viewer on another worker subscribes. The publisher's
+     * cached src stays valid while publishing == 1 (the same invariant the
+     * broadcast path relies on for its lock-free subscribers_version read). */
+    if (0 == src->remote_subscribers) {
+        return;
+    }
+
+    t0 = ngx_rtc_shm_now_us();
     ngx_shmtx_lock(&ctx->pool->mutex);
-    src = ngx_rtc_shm_source_locked_lookup(ctx, name, len);
-    if (NULL == src) {
+    src->retx_append_locked++;
+    if (0 == src->remote_subscribers) {
+        /* Re-check under the lock: a cross-worker viewer may have unsubscribed
+         * since the lock-free fast-path read above. */
+        src->retx_append_us += ngx_rtc_shm_now_us() - t0;
         ngx_shmtx_unlock(&ctx->pool->mutex);
         return;
     }
@@ -1075,16 +1169,20 @@ ngx_rtc_shm_retransmit_append(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
         r = ngx_rtc_shm_retransmit_alloc_locked(ctx, src);
         if (NULL == r) {
             src->retransmit_alloc_failed++;
-            ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
-                          "ngx_rtc: retransmit ring alloc failed for "
-                          "source \"%V\"", &src->sn.str);
+            /* Log the first failure only: without the guard a zone-starved
+             * source re-logs at packet rate. Retries stay (zone space frees up
+             * when other streams end, and the ring self-heals from then on). */
+            if (1 == src->retransmit_alloc_failed) {
+                ngx_log_error(NGX_LOG_ERR, ngx_cycle->log, 0,
+                              "ngx_rtc: retransmit ring alloc failed for "
+                              "source \"%V\"", &src->sn.str);
+            }
+            src->retx_append_us += ngx_rtc_shm_now_us() - t0;
             ngx_shmtx_unlock(&ctx->pool->mutex);
-            return; /* allocation failed: retransmit stays unavailable */
+            return; /* retransmit unavailable; live media path unaffected */
         }
     }
-    ngx_shmtx_unlock(&ctx->pool->mutex);
 
-    ngx_shmtx_lock(&r->mtx);
     idx = r->head & (r->cap - 1u);
     slot = &r->slots[idx];
     ngx_memcpy(slot->data, rtp, rtp_len);
@@ -1097,7 +1195,8 @@ ngx_rtc_shm_retransmit_append(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
     if (r->count < r->cap) {
         r->count++;
     }
-    ngx_shmtx_unlock(&r->mtx);
+    src->retx_append_us += ngx_rtc_shm_now_us() - t0;
+    ngx_shmtx_unlock(&ctx->pool->mutex);
 }
 
 
@@ -1128,10 +1227,8 @@ ngx_rtc_shm_retransmit_get(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
         return NGX_DECLINED;
     }
     r = src->retransmit;
-    ngx_shmtx_unlock(&ctx->pool->mutex);
 
     rc = NGX_DECLINED;
-    ngx_shmtx_lock(&r->mtx);
     if (0 != r->count) {
         start = r->head - r->count;
         idx = start & (r->cap - 1u);
@@ -1148,7 +1245,7 @@ ngx_rtc_shm_retransmit_get(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
             }
         }
     }
-    ngx_shmtx_unlock(&r->mtx);
+    ngx_shmtx_unlock(&ctx->pool->mutex);
 
     return rc;
 }
@@ -1166,6 +1263,13 @@ ngx_rtc_shm_retransmit_replay_gop(ngx_rtc_shm_ctx_t *ctx, u_char *name,
     ngx_uint_t                 i;
     ngx_uint_t                 idx;
     ngx_uint_t                 n;
+    ngx_uint_t                 t0;
+    ngx_uint_t                 r_head;
+    ngx_uint_t                 r_count;
+    ngx_uint_t                 r_gop_start;
+    ngx_uint_t                 first_seq;
+    ngx_uint_t                 first_gop;
+    ngx_uint_t                 last_seq;
     ngx_int_t                  rc;
 
     if (NULL == ctx || NULL == name || 0 == len
@@ -1173,26 +1277,33 @@ ngx_rtc_shm_retransmit_replay_gop(ngx_rtc_shm_ctx_t *ctx, u_char *name,
         return NGX_ERROR;
     }
 
-    ngx_shmtx_lock(&ctx->pool->mutex);
-    src = ngx_rtc_shm_source_locked_lookup(ctx, name, len);
-    if (NULL == src || NULL == src->retransmit) {
-        ngx_shmtx_unlock(&ctx->pool->mutex);
-        return NGX_ERROR;
-    }
-    r = src->retransmit;
-    ngx_shmtx_unlock(&ctx->pool->mutex);
-
-    /* Copy the GOP out under the ring lock, then send outside the lock so a
-     * slow viewer's replay burst (blocking sendto) never stalls the publisher's
-     * append on the same ring. The buffer is bounded by the ring capacity and
-     * freed within this call. */
-    buf = ngx_alloc((size_t) r->cap * sizeof(*buf), ngx_cycle->log);
+    /* Allocate the replay buffer outside the lock: the ring capacity is a
+     * compile-time constant, so the ~1.5 MB heap allocation never holds the slab
+     * pool mutex. */
+    buf = ngx_alloc((size_t) NGX_RTC_SHM_RETX_RING_CAP * sizeof(*buf),
+                    ngx_cycle->log);
     if (NULL == buf) {
         return NGX_ERROR;
     }
 
+    t0 = ngx_rtc_shm_now_us();
+    ngx_shmtx_lock(&ctx->pool->mutex);
+    src = ngx_rtc_shm_source_locked_lookup(ctx, name, len);
+    if (NULL == src || NULL == src->retransmit) {
+        ngx_shmtx_unlock(&ctx->pool->mutex);
+        ngx_free(buf);
+        return NGX_ERROR;
+    }
+    r = src->retransmit;
+
+    /* Copy the GOP out under the pool mutex, then send outside the lock so a
+     * slow viewer's replay burst (blocking sendto) never stalls the publisher's
+     * append. */
     n = 0;
-    ngx_shmtx_lock(&r->mtx);
+    start = 0;
+    first_seq = 0;
+    first_gop = 0;
+    last_seq = 0;
     if (0 != r->count) {
         start = r->head - r->count;
         if (r->gop_start > start) {
@@ -1203,12 +1314,50 @@ ngx_rtc_shm_retransmit_replay_gop(ngx_rtc_shm_ctx_t *ctx, u_char *name,
             buf[n++] = r->slots[idx];
         }
     }
-    ngx_shmtx_unlock(&r->mtx);
+    if (0 != n) {
+        first_seq = (ngx_uint_t) (((ngx_uint_t) buf[0].data[2] << 8)
+                                  | (ngx_uint_t) buf[0].data[3]);
+        first_gop = (ngx_uint_t) buf[0].is_gop_start;
+        last_seq = (ngx_uint_t) (((ngx_uint_t) buf[n - 1u].data[2] << 8)
+                                 | (ngx_uint_t) buf[n - 1u].data[3]);
+    }
+    r_head = r->head;
+    r_count = r->count;
+    r_gop_start = r->gop_start;
+
+    /* Updated before the unlock so the writes land under the mutex, exactly
+     * like the append-side ones: the stats handler reads all of them holding
+     * it, which is why they need no atomics. */
+    src->retx_replay_count++;
+    src->retx_replay_slots += n;
+    src->retx_replay_us += ngx_rtc_shm_now_us() - t0;
+    ngx_shmtx_unlock(&ctx->pool->mutex);
+
+    /* Replay-shape trace. retx_replay_slots only says a replay happened, not
+     * what it was made of, and the two failures look identical from the
+     * counters: a replay that does not begin at a keyframe, and one that begins
+     * at a keyframe the viewer has already moved past. first_gop separates them,
+     * and first_seq against the live head says how stale the replay is.
+     * Enable with `error_log ... debug;`. */
+    ngx_log_error(NGX_LOG_DEBUG, ngx_cycle->log, 0,
+                  "ngx_rtc: shm replay head=%ui retained=%ui gop_start=%ui "
+                  "start=%ui sent=%ui first_seq=%ui first_gop=%ui "
+                  "last_seq=%ui",
+                  r_head, r_count, r_gop_start, start, n, first_seq, first_gop,
+                  last_seq);
 
     rc = NGX_OK;
     for (i = 0; i < n; i++) {
         rc = cb(opaque, buf[i].data, buf[i].len, buf[i].is_gop_start);
         if (NGX_OK != rc) {
+            break;
+        }
+        /* Stop once the keyframe access unit is out: the rest of the GOP is a
+         * burst a warming-up receiver is likely to lose, and the live frames
+         * that follow carry on from the keyframe anyway. Same rule as the
+         * same-worker replay in ngx_rtc_core.c. */
+        if (NGX_RTC_RTP_HEADER_SIZE < buf[i].len
+                && 0 != (buf[i].data[1] & NGX_RTC_RTP_MARKER)) {
             break;
         }
     }
@@ -1353,101 +1502,3 @@ ngx_rtc_shm_ring_empty(const ngx_rtc_shm_ring_t *ring)
     return ring->head == ring->tail;
 }
 
-
-/*
- * Worker crash backtrace to error.log.
- *
- * Registers async-signal-safe handlers for the fatal signals in each worker.
- * On a crash the handler resets the default disposition, writes the signal +
- * faulting address plus a backtrace_symbols_fd() stack walk straight to
- * error.log's fd (inherited from master, opened O_APPEND, no userspace
- * buffering), then re-raises the signal so the master still logs "exited on
- * signal N" and respawns the worker.
- *
- * Async-safety: no malloc/stdio/locks in the handler; the fd is pre-opened and
- * backtrace()+backtrace_symbols_fd() are warmed up here to force the lazy libgcc
- * load before any crash. Symbol names resolve because openresty links nginx
- * with -Wl,-E (dynamic symbol export).
- */
-
-static ngx_fd_t  ngx_rtc_bt_fd = NGX_INVALID_FILE;
-
-
-static void
-ngx_rtc_bt_handler(int signo, siginfo_t *si, void *uc)
-{
-    u_char            buf[NGX_RTC_BT_BUF];
-    u_char           *p;
-    void             *frames[NGX_RTC_BT_MAX_DEPTH];
-    int               n;
-    struct sigaction  sa;
-    ngx_int_t         nw;
-
-    (void) uc;
-
-    /* Reset to default before anything else: never re-enter this handler. */
-    ngx_memzero(&sa, sizeof(sa));
-    sa.sa_handler = SIG_DFL;
-    sigemptyset(&sa.sa_mask);
-    (void) sigaction(signo, &sa, NULL);
-
-    p = ngx_slprintf(buf, buf + sizeof(buf),
-                     "\nngx_rtc_backtrace: worker %P got signal %d",
-                     ngx_pid, signo);
-    if (NULL != si) {
-        p = ngx_slprintf(p, buf + sizeof(buf), " addr=%p", si->si_addr);
-    }
-    p = ngx_slprintf(p, buf + sizeof(buf), "\n");
-
-    if (NGX_INVALID_FILE != ngx_rtc_bt_fd) {
-        /* write() is marked warn_unused_result: assign then discard. */
-        nw = write(ngx_rtc_bt_fd, buf, (size_t) (p - buf));
-        (void) nw;
-
-        n = backtrace(frames, NGX_RTC_BT_MAX_DEPTH);
-        backtrace_symbols_fd(frames, n, ngx_rtc_bt_fd);
-    }
-
-    /* Re-raise so master logs "exited on signal N" and respawns us. */
-    (void) kill(getpid(), signo);
-    _exit(128 + signo);
-}
-
-
-static ngx_int_t
-ngx_rtc_bt_init_process(ngx_cycle_t *cycle)
-{
-    ngx_log_t        *log;
-    struct sigaction  sa;
-    int               sigs[] = { SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL };
-    ngx_uint_t        i;
-    void             *warm[1];
-
-    /* error.log fd: worker inherits it from master and it stays open. */
-    log = ngx_log_get_file_log(cycle->log);
-    if (NULL == log || NULL == log->file) {
-        ngx_rtc_bt_fd = NGX_INVALID_FILE;
-    } else {
-        ngx_rtc_bt_fd = log->file->fd;
-    }
-
-    /* Warm up execinfo so the first in-crash call never lazy-loads libgcc. */
-    (void) backtrace(warm, 1);
-    if (NGX_INVALID_FILE != ngx_rtc_bt_fd) {
-        backtrace_symbols_fd(warm, 1, ngx_rtc_bt_fd);
-    }
-
-    ngx_memzero(&sa, sizeof(sa));
-    sa.sa_sigaction = ngx_rtc_bt_handler;
-    sa.sa_flags = SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
-
-    for (i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
-        if (sigaction(sigs[i], &sa, NULL) == -1) {
-            ngx_log_error(NGX_LOG_WARN, cycle->log, ngx_errno,
-                          "ngx_rtc_backtrace: sigaction(%d) failed", sigs[i]);
-        }
-    }
-
-    return NGX_OK;
-}

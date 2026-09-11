@@ -50,6 +50,11 @@ extern "C" {
 /*
  * Configurable assertion macro. Override before including this header to use a
  * project-specific assert (or an empty no-op). Defaults to <assert.h>.
+ *
+ * The engine itself no longer asserts: an entry path that does not fit
+ * `entry_path_buffer` makes ngx_rtc_hsm_dispatch() return false instead, so a
+ * mis-sized buffer is reported through the unhandled-event hook rather than
+ * aborting the process. This knob remains for consumers that want it.
  */
 #ifndef NGX_RTC_HSM_ASSERT
 #include <assert.h>
@@ -176,6 +181,19 @@ bool ngx_rtc_hsm_is_in_state(const ngx_rtc_hsm_t *sm,
  * Return the name of the current state, or "Unknown" if unavailable.
  */
 const char *ngx_rtc_hsm_get_current_state_name(const ngx_rtc_hsm_t *sm);
+
+/*
+ * Force the current state to `state` without running any entry/exit action.
+ *
+ * For a mirror instance that learns its real state from outside (the shm
+ * session skeleton) and never traversed the transitions leading to it: those
+ * actions belong to steps that did not happen on this worker, and dispatching
+ * the equivalent events would need transitions the table deliberately lacks.
+ *
+ * Returns false for NULL arguments, leaving the machine untouched.
+ */
+bool ngx_rtc_hsm_restore_state(ngx_rtc_hsm_t *sm,
+                               const ngx_rtc_hsm_state_t *state);
 
 #ifdef __cplusplus
 }
