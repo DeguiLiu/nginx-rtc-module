@@ -1,0 +1,15 @@
+# Paths that are allowed to differ between main and win32-compat.
+#
+# Everything else must be byte-identical: win32-compat = main + these paths.
+# Adding a Windows file means adding a line here, which is the point -- the
+# diff shows up in review.
+
+.gitignore
+README.md
+README.zh.md
+config
+scripts/cross-win64-tests.sh
+src/ngx_rtc_core.h
+src/ngx_rtc_core_module.c
+src/ngx_rtc_stream_module.c
+test/include/ngx_core.h

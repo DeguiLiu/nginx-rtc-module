@@ -148,6 +148,10 @@ $(BUILD_DIR)/test_%.o: %.c
 # by nginx's standard. The alternative -- relaxing warnings one at a time until
 # the unit compiles -- is exactly the per-file patching this Makefile no longer
 # does. The test body is held to -Wall, like the unit it shares a file with.
+#
+# The cost of that choice, stated so it is not rediscovered: this object never
+# gets -Werror, so a warning in ngx_rtc_stream_module.c or in the test body is
+# only ever visible in the build output, never as a failing suite.
 $(BUILD_DIR)/test_test_stream_module.o: test_stream_module.c $(SRC_DIR)/ngx_rtc_stream_module.c
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(NGX_CFLAGS) $(NGX_CPPFLAGS) -MMD -MP -c $< -o $@
