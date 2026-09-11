@@ -387,8 +387,23 @@ struct ngx_rtc_source_s {
     uint32_t audio_asc_len;
     void    *audio_ctx;   /* ngx_rtc_audio_t *, owned by the bridge module */
 
+    /* Set once the bridge has reported that audio_ctx is NULL while raw AAC
+     * frames keep arriving, and cleared every time a transcoder is created.
+     * Per source, not per worker: a worker-wide one-shot spends its only
+     * warning on the first stream to fail and leaves every later one -- and a
+     * second failure on this same source after a republish -- silent. */
+    uint8_t  audio_noctx_warned;
+
     /* GOP ring: caches recent plaintext RTP for fast-start replay + NACK. */
     ngx_rtc_rtp_ring_t gop;
+
+    /* When the last upstream keyframe request went out on this source, and how
+     * many have gone out. A viewer that cannot be served from the cache asks
+     * the publisher for a fresh IDR; several viewers asking at once, or one
+     * asking repeatedly, must not turn into an IDR flood on the uplink, so the
+     * requests are collapsed per source onto a minimum interval. */
+    ngx_msec_t pli_sent_ms;
+    uint32_t   pli_requests;
 
     /* WHIP uplink reorder buffer: caches video RTP by sequence number so a
      * lossy WAN does not deliver H264 out of order to the broadcast path. */

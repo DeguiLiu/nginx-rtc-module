@@ -38,6 +38,15 @@ extern void ngx_rtc_broadcast_rtp(ngx_rtc_source_t *src, const uint8_t *rtp,
                                   uint32_t len, uint8_t is_video,
                                   uint8_t is_gop_start);
 
+/* Upstream keyframe requests (PLI). A viewer that cannot be served from the
+ * cache asks the publisher for an IDR; see ngx_rtc_stream_request_keyframe.
+ * The interval collapses simultaneous and repeated requests so the uplink does
+ * not answer a slow-consumer stall with an IDR flood. */
+#define NGX_RTC_PLI_MIN_INTERVAL_MS  1000u
+/* Sender SSRC of our PLI. Nothing sends media in that direction, so there is no
+ * SSRC of ours to name, and receivers key off the media SSRC. */
+#define NGX_RTC_PLI_SENDER_SSRC      1u
+
 typedef struct {
     ngx_flag_t  rtc;
     ngx_msec_t  handshake_timeout;
@@ -110,7 +119,8 @@ static ngx_int_t  ngx_rtc_stream_shm_gop_send(void *opaque,
                      const uint8_t *rtp, uint32_t len, uint8_t is_gop_start);
 static int32_t    ngx_rtc_stream_retransmit(ngx_rtc_session_t *sess,
                      uint16_t seq);
-static void       ngx_rtc_stream_replay_gop(ngx_rtc_session_t *sess);
+static ngx_uint_t ngx_rtc_stream_replay_gop(ngx_rtc_session_t *sess);
+static void       ngx_rtc_stream_request_keyframe(ngx_rtc_source_t *src);
 static char      *ngx_rtc_stream_rtc(ngx_conf_t *cf, ngx_command_t *cmd,
                      void *conf);
 static void      *ngx_rtc_stream_create_srv_conf(ngx_conf_t *cf);
@@ -1032,7 +1042,12 @@ ngx_rtc_stream_rtcp_cb(const ngx_rtc_rtcp_pkt_t *pkt, void *opaque)
                           (u_char *) sess->ice_ufrag,
                           sess->pacer_target_bps, sess->drop_pacer,
                           sess->drop_gop, (ngx_uint_t) sess->twcc_seq);
-            ngx_rtc_stream_replay_gop(sess);
+
+            /* Nothing in the cache to re-send means this viewer stays blank
+             * until the publisher happens to produce an IDR. Ask for one. */
+            if (0 == ngx_rtc_stream_replay_gop(sess)) {
+                ngx_rtc_stream_request_keyframe(sess->source);
+            }
         }
     } else if (NGX_RTC_RTCP_RTPFB == pkt->type
                && NGX_RTC_RTCP_FMT_TWCC == pkt->fmt) {
@@ -1247,8 +1262,11 @@ ngx_rtc_stream_dtls_done(void *user)
 
         /* Replay the latest GOP from the shared cache so a late subscriber
          * decodes its first frame immediately: the source GOP ring same-worker,
-         * the shm retransmit ring cross-worker. */
-        ngx_rtc_stream_replay_gop(sess);
+         * the shm retransmit ring cross-worker. Cold cache means this viewer
+         * has nothing to start from, so ask the publisher for an IDR. */
+        if (0 == ngx_rtc_stream_replay_gop(sess)) {
+            ngx_rtc_stream_request_keyframe(sess->source);
+        }
     }
 
     /* Phase 1: mark the cross-worker session skeleton ready and link it into
@@ -1493,24 +1511,100 @@ ngx_rtc_stream_retransmit(ngx_rtc_session_t *sess, uint16_t seq)
 
 
 /* Replay the latest GOP to a session from the shared cache: the source GOP ring
- * same-worker, the shm retransmit ring cross-worker. */
-static void
+ * same-worker, the shm retransmit ring cross-worker. Returns 1 when something
+ * was served, 0 when the cache held no keyframe -- the caller then has to ask
+ * the publisher, because the viewer will not decode until one arrives. */
+static ngx_uint_t
 ngx_rtc_stream_replay_gop(ngx_rtc_session_t *sess)
 {
     ngx_rtc_core_conf_t *ccf;
+    ngx_int_t            rc;
 
     if (0 != ngx_rtc_source_gop_ready(sess->source)) {
         ngx_rtc_rtp_ring_replay(&sess->source->gop, sess);
-        return;
+        return 1;
     }
 
     ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
-    if (NULL != ccf && NULL != ccf->sh) {
-        (void) ngx_rtc_shm_retransmit_replay_gop(ccf->sh,
-                (u_char *) sess->source->name,
-                ngx_strlen(sess->source->name),
-                ngx_rtc_stream_shm_gop_send, sess);
+    if (NULL == ccf || NULL == ccf->sh) {
+        return 0;
     }
+
+    rc = ngx_rtc_shm_retransmit_replay_gop(ccf->sh,
+            (u_char *) sess->source->name,
+            ngx_strlen(sess->source->name),
+            ngx_rtc_stream_shm_gop_send, sess);
+
+    return (rc > 0) ? 1 : 0;
+}
+
+
+/*
+ * Ask the publisher for a keyframe, because a viewer cannot be served from the
+ * cache and would otherwise stay blank until the next natural IDR -- which on a
+ * long-GOP publisher is seconds away.
+ *
+ * The request goes out over the publishing session's own SRTP context, on the
+ * same UDP connection its media arrives on. Collapsed per source onto one
+ * request per NGX_RTC_PLI_MIN_INTERVAL_MS: several viewers hitting the same
+ * gap, or one viewer re-sending PLI every few milliseconds, must not each
+ * produce an IDR on the uplink.
+ */
+static void
+ngx_rtc_stream_request_keyframe(ngx_rtc_source_t *src)
+{
+    ngx_rtc_session_t *sess;
+    ngx_connection_t  *c;
+    uint8_t            pkt[16];
+    uint32_t           len;
+    int                n;
+
+    if (NULL == src || 0 == src->publishing) {
+        return;
+    }
+
+    if (0 != src->pli_sent_ms
+            && ngx_current_msec - src->pli_sent_ms < NGX_RTC_PLI_MIN_INTERVAL_MS) {
+        return;
+    }
+
+    /* The publisher is the session that owns this source's ingest. */
+    for (sess = ngx_rtc_session_first(); NULL != sess; sess = ngx_rtc_session_next(sess)) {
+        if (sess->source == src && 0 != sess->publishing) {
+            break;
+        }
+    }
+    if (NULL == sess) {
+        return;
+    }
+
+    /* media_ssrc is the far end's video SSRC -- the stream we want an IDR for.
+     * sender_ssrc only has to identify us to ourselves; this direction sends no
+     * media, so there is no SSRC of ours to name, and receivers key off
+     * media_ssrc alone. */
+    if (NGX_RTC_OK != ngx_rtc_rtcp_encode_pli(NGX_RTC_PLI_SENDER_SSRC, src->video_ssrc,
+                                              pkt, sizeof(pkt), &len)) {
+        return;
+    }
+
+    n = (int) len;
+    if (0 != ngx_rtc_srtp_protect_rtcp(&sess->srtp, pkt, &n)) {
+        return;
+    }
+
+    c = (ngx_connection_t *) sess->conn;
+    if (NULL == c) {
+        return;
+    }
+
+    (void) c->send(c, pkt, (size_t) n);
+
+    src->pli_sent_ms = ngx_current_msec;
+    src->pli_requests++;
+
+    ngx_log_error(NGX_LOG_DEBUG, c->log, 0,
+                  "ngx_rtc_stream: PLI -> publisher src=\"%s\" media_ssrc=%uD n=%ui",
+                  src->name, src->video_ssrc, (ngx_uint_t) src->pli_requests);
 }
 
 

@@ -104,6 +104,8 @@ static ngx_int_t  ngx_rtc_chain_reader_get(ngx_rtc_chain_reader_t *rd,
                      u_char *out);
 static ngx_int_t  ngx_rtc_http_json_string(ngx_rtc_chain_reader_t *rd,
                      const char *key, char *out, size_t out_cap, size_t *out_len);
+static ngx_int_t  ngx_rtc_http_arg_decoded(ngx_http_request_t *r,
+                     const char *name, ngx_str_t *out);
 static size_t     ngx_rtc_http_max_sdp(ngx_http_request_t *r);
 static u_char    *ngx_rtc_http_render_stats(u_char *p, u_char *end);
 static void       ngx_rtc_stats_flush_send_failures(void);
@@ -1230,6 +1232,53 @@ ngx_rtc_http_kick(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
 
 /*
+ * ngx_http_arg() hands back the raw, still percent-encoded value: unlike the
+ * $arg_* variables -- ngx_http_variable_argument() unescapes -- it does no
+ * decoding at all, so its result can only be compared against a registry key
+ * by callers that agree on an encoding. Both kinds exist here. The Lua control
+ * plane reaches these endpoints through ngx.location.capture with an args
+ * table, which encodes via ngx.encode_args and therefore escapes "/" as %2F; a
+ * client pasting a query string escapes nothing. Decoding into the request pool
+ * before the comparison serves both: for an unencoded value the pass is a pure
+ * copy, because '%' is the only byte that means anything to it.
+ *
+ * Without this the Lua form silently addresses a different key -- lookup of
+ * "live%2Flivestream" misses "live/livestream" and the endpoint answers 404
+ * having done nothing.
+ */
+static ngx_int_t
+ngx_rtc_http_arg_decoded(ngx_http_request_t *r, const char *name,
+    ngx_str_t *out)
+{
+    u_char  *dst, *src, *start;
+
+    if (NGX_OK != ngx_http_arg(r, (u_char *) name, ngx_strlen(name), out)) {
+        return NGX_DECLINED;
+    }
+
+    /* ngx_unescape_uri never grows its output, so the value's own length is the
+     * exact bound. Nothing to decode for an empty value either. */
+    if (0 == out->len) {
+        return NGX_OK;
+    }
+
+    start = ngx_pnalloc(r->pool, out->len);
+    if (NULL == start) {
+        return NGX_ERROR;
+    }
+
+    dst = start;
+    src = out->data;
+    ngx_unescape_uri(&dst, &src, out->len, 0);
+
+    out->data = start;
+    out->len = (size_t) (dst - start);
+
+    return NGX_OK;
+}
+
+
+/*
  * Internal kick endpoint invoked by the Lua admin control plane via
  * ngx.location.capture. It flips the skeleton's close_requested flag and the
  * owning worker reaps it on the next timer tick. Only the id argument is used.
@@ -1245,7 +1294,7 @@ ngx_rtc_http_kick_handler(ngx_http_request_t *r)
         return NGX_HTTP_NOT_ALLOWED;
     }
 
-    if (NGX_OK != ngx_http_arg(r, (u_char *) "id", sizeof("id") - 1, &val)) {
+    if (NGX_OK != ngx_rtc_http_arg_decoded(r, "id", &val)) {
         return NGX_HTTP_BAD_REQUEST;
     }
 
@@ -1294,8 +1343,7 @@ ngx_rtc_http_disconnect_handler(ngx_http_request_t *r)
         return NGX_HTTP_NOT_ALLOWED;
     }
 
-    if (ngx_http_arg(r, (u_char *) "name", sizeof("name") - 1, &val)
-            != NGX_OK) {
+    if (ngx_rtc_http_arg_decoded(r, "name", &val) != NGX_OK) {
         return NGX_HTTP_BAD_REQUEST;
     }
 
@@ -1391,9 +1439,8 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
         return;
     }
 
-    if (NGX_OK != ngx_http_arg(r, (u_char *) "app", sizeof("app") - 1, &app)
-            || NGX_OK != ngx_http_arg(r, (u_char *) "stream",
-                                      sizeof("stream") - 1, &stream)
+    if (NGX_OK != ngx_rtc_http_arg_decoded(r, "app", &app)
+            || NGX_OK != ngx_rtc_http_arg_decoded(r, "stream", &stream)
             || 0 == app.len || 0 == stream.len
             || app.len + stream.len + 1 >= sizeof(name)) {
         ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
