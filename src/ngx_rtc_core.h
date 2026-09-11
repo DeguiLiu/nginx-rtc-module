@@ -384,6 +384,14 @@ struct ngx_rtc_source_s {
     /* GOP ring: caches recent plaintext RTP for fast-start replay + NACK. */
     ngx_rtc_rtp_ring_t gop;
 
+    /* When the last upstream keyframe request went out on this source, and how
+     * many have gone out. A viewer that cannot be served from the cache asks
+     * the publisher for a fresh IDR; several viewers asking at once, or one
+     * asking repeatedly, must not turn into an IDR flood on the uplink, so the
+     * requests are collapsed per source onto a minimum interval. */
+    ngx_msec_t pli_sent_ms;
+    uint32_t   pli_requests;
+
     /* WHIP uplink reorder buffer: caches video RTP by sequence number so a
      * lossy WAN does not deliver H264 out of order to the broadcast path. */
     ngx_rtc_jitter_t jitter;

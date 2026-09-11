@@ -40,10 +40,29 @@ ngx_rtc_stream_module(owner worker 出队 → SRTP → UDP)
 - **重传缓存下沉 shm**：每 source 一个固定窗口视频重传环写入共享内存，任意 worker
   订阅可回放最新 GOP、NACK/PLI 按 seq 命中；环槽统一在 slab pool 锁下读写/释放，append
   按「有无跨 worker viewer」门控（无跨 worker viewer 时同 worker 单 memcpy）。同 worker
-  直接读进程内 GOP 环，无锁。发布 worker 每包刷新 `publisher_seen_ms` 心跳，reaper 超过
+  直接读进程内 GOP 环，无锁。回放在同一把锁内**只复制到关键帧 access unit 结束**——发送循环
+  本就停在 RTP marker 位，其后的槽不会被任何人发出，因此不再把整段保留窗口搬进锁内。
+  **该锁同时是该环的生命周期保证**：source 回收路径在同一把锁内释放环，所以持锁期间不可能读到
+  已释放的环；把锁换成环私有锁之前必须先补一套等价的生命周期协议。
+  发布 worker 每包刷新 `publisher_seen_ms` 心跳，reaper 超过
   `NGX_RTC_SHM_PUBLISH_GRACE_MS` 仍未见心跳即判定发布者已死，回收 source 及其重传环；
   释放前再校验没有 session 骨架仍指向该 source。
-- **音频线程隔离**：AAC→Opus 转码在独立 pthread 中执行，避免阻塞 nginx 事件循环。
+- **上行关键帧请求（PLI）**：观众发 PLI 而本地 GOP 环与 shm 重传环都取不到关键帧时
+  （`ngx_rtc_stream_replay_gop()` 返回 0），或新订阅者冷启动时，由
+  `ngx_rtc_stream_request_keyframe()` 经发布会话的 SRTP 上下文向推流端发 PLI
+  （`ngx_rtc_rtcp_encode_pli()`），否则观众要等到下一个自然 IDR。按 source 限流
+  `NGX_RTC_PLI_MIN_INTERVAL_MS=1000`，避免多个观众同时踩缺口变成上行 IDR 洪水。
+  RTMP 推流源没有 SRTP 上下文，靠找不到发布会话安全跳过。
+- **SDP 只宣告能兑现的反馈**：`a=rtcp-fb` 声明的是作者能**接收**的反馈。sendonly（播放）
+  应答同时给 `nack` 与 `nack pli`（播放端 NACK 由 GOP 环回应）；recvonly（WHIP）应答只给
+  `nack pli`，因为接收侧没有 NACK 生成器，宣告它只会让推流端开 RTX 等一个不会来的请求。
+- **重推流的代际隔离**：bridge 收到新的 AVC sequence header 时清零 `gop.count`/`gop_start`，
+  shm 重传环由 `ngx_rtc_shm_retransmit_reset()` 以 `head = 0` 镜像。这是防止重推流后旧代
+  序号回绕命中新环的唯一手段。RTP 序号比较一律用 `(uint16_t)(seq - start)` 的模距离，
+  不比较绝对大小，因此 16-bit 回绕无需特殊处理。
+- **音频线程隔离与不丢弃**：AAC→Opus 转码在独立 pthread 中执行，避免阻塞 nginx 事件循环。
+  音频通路**禁止主动丢帧**：转码器要求输入严格连续，丢旧帧或丢新帧都会破坏解码器与重采样的
+  稳态。慢消费者整 GOP 丢弃只适用于视频；音频的背压只能来自 vring 的字节容量。
 - **会话状态机**：`ngx_rtc_session_fsm` 跟踪
   NEW → ICE_BOUND → DTLS_HANDSHAKE → SRTP_READY → CLOSED，只做状态判定、无副作用；
   close 类事件挂在根状态上，从任意状态收敛。绑定与 DTLS 起始转移带 guard（校验事件上下文里的
@@ -70,14 +89,4 @@ ngx_rtc_stream_module(owner worker 出队 → SRTP → UDP)
   4 个字段正交编码同样暂不枚举化，等真的出现非法组合缺陷再改；记录一处不一致备查：`owner_slot`
   与 `publishing` 是裸整数（靠 `pool->mutex` 保护），而 `srtp_ready`/`close_requested`/`expires`/
   `twcc_*` 是 `ngx_atomic_t`（靠原子性），两种同步原语混在同一结构里。
-- **尚未实现的 SRS 差距项**：以下来自 `docs/archive/architecture-review-vs-srs.md`（对照 SRS 6.0
-  的架构差距分析），均为评审时标注未动/未开工的开放项，已落地项不在此列。
-  - **统一桥接抽象（P2-2，未开工）**：`ngx_rtmp_rtc_bridge_module` 只做 RTMP→RTC 单向，WHIP
-    上行的转发逻辑硬编码在 `ngx_rtc_stream_module`；按反过度设计原则不先建接口，等 RTC→RTMP
-    录制/转推真正开工时，在改造 bridge 的同期抽出最小桥接接口。
-  - **上行 RTCP NACK 生成（未立项）**：`ngx_rtc_rtcp` 只有 NACK 解析
-    （`ngx_rtc_rtcp_nack_expand`），没有 nack-pkt-list 生成器；WHIP 上行 jitter 以
-    `NGX_RTC_JITTER_TIMEOUT_MS=50ms` 超时跳过缺包，未向推流端发 NACK。发送侧 NACK 响应退避已
-    落地，接收侧 NACK 生成暂不立项。
-
-详细设计见发行仓 `nginx-rtc-example/docs/`。
+详细设计见发行仓 `nginx-rtc-example/docs/`。尚未实现的能力与已知缺陷见 `docs/BACKLOG.md`。

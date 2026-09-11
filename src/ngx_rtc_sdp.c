@@ -953,24 +953,38 @@ static int32_t ngx_rtc_sdp_write_media(ngx_rtc_sdp_writer_t *w,
     }
 
     /* Declare RTCP feedback (RFC 4585) for the payload type used in this
-     * answer. RFC 3264 negotiation means the peer only enables NACK / PLI when
-     * both offer and answer carry a=rtcp-fb; without it the server-side
-     * retransmission / keyframe-request path would never be exercised. Only the
-     * video track advertises NACK / PLI: the server retransmits video only, so
-     * advertising NACK on audio would invite requests we cannot serve. */
+     * answer. a=rtcp-fb states what the SDP author can RECEIVE, and RFC 3264
+     * negotiation means the peer only acts on it when both offer and answer
+     * carry it -- so this list has to name exactly what the path behind it
+     * generates, no more. Only the video track appears: the server retransmits
+     * video only, so advertising anything on audio would invite requests we
+     * cannot serve. */
     if (ngx_rtc_sdp_streq(type, "video"))
     {
+        /* PLI holds in both directions: the server reads viewer PLI off the
+         * play path (replay from cache) and sends its own PLI down the WHIP
+         * path when a viewer cannot be served (ngx_rtc_stream_request_keyframe). */
         r = ngx_rtc_sdp_writer_append(w, "a=rtcp-fb:%u nack pli\r\n",
                                       (unsigned)pt);
         if (0 != r)
         {
             return r;
         }
-        r = ngx_rtc_sdp_writer_append(w, "a=rtcp-fb:%u nack\r\n",
-                                      (unsigned)pt);
-        if (0 != r)
+
+        /* NACK belongs to the sendonly answer only. The play path answers
+         * viewer NACK from the GOP ring, so declaring it is a promise the
+         * server keeps. The recvonly (WHIP) answer has no receive-side
+         * retransmission request generator at all: declaring it there makes
+         * the publisher enable RTX and wait for requests that never come, and
+         * is exactly what made "we advertise feedback we do not send" true. */
+        if (cfg->sendonly > 0)
         {
-            return r;
+            r = ngx_rtc_sdp_writer_append(w, "a=rtcp-fb:%u nack\r\n",
+                                          (unsigned)pt);
+            if (0 != r)
+            {
+                return r;
+            }
         }
     }
 

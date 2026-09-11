@@ -249,6 +249,15 @@ int32_t ngx_rtc_rtcp_encode_sdes(uint32_t ssrc, const char *cname,
                                  uint8_t *buf, uint32_t cap, uint32_t *len);
 
 /*
+ * Encode a PLI (RFC 4585 section 6.3.1): a PSFB with FMT=1 and no FCI, asking
+ * media_ssrc's sender for a keyframe. sender_ssrc identifies us; media_ssrc is
+ * the stream the keyframe is wanted for, i.e. the far end's video SSRC.
+ * Returns NGX_RTC_OK or NGX_RTC_ERR_TOO_SMALL (12 octets are needed).
+ */
+int32_t ngx_rtc_rtcp_encode_pli(uint32_t sender_ssrc, uint32_t media_ssrc,
+                                uint8_t *buf, uint32_t cap, uint32_t *len);
+
+/*
  * Append one already-encoded sub-packet to a compound buffer. The caller
  * owns compound and the running length *len, so several sub-packets can be
  * concatenated before a single sendto. Returns NGX_RTC_OK or

@@ -20,7 +20,12 @@ One `--add-module` registers four nginx modules from this tree:
 - `config` — nginx addon build script (reads `NGX_RTC_THIRD` for third-party static libs).
 - `src/` — pure-C core (`rtp/sdp/stun/dtls/srtp/ring/audio/rtcp/hsm/session_fsm`,
   no nginx headers, host-testable) + the four module glues.
-- `test/` — host unit tests (no nginx / no third-party dependency).
+- `test/` — host unit tests. Two header worlds: a configured nginx tree (the
+  Linux default) or the `test/include/` stubs (Windows). Some groups link the
+  real OpenSSL/libsrtp2/FFmpeg.
+- `docs/` — [ARCHITECTURE.md](docs/ARCHITECTURE.md) (how it works),
+  [BACKLOG.md](docs/BACKLOG.md) (what it does not do yet),
+  [BUILD-TEST.md](docs/BUILD-TEST.md), [nginx-coding-standards.md](docs/nginx-coding-standards.md).
 
 ## Build
 
@@ -33,10 +38,10 @@ export NGX_RTC_THIRD=/path/to/third          # include/ + lib/ (see nginx-rtc-ex
 ./configure ... --add-module=/path/to/nginx-rtc-module
 ```
 
-The host unit tests need none of that:
+The host unit tests need no nginx build:
 
 ```sh
-make -C test run_tests       # 145 cases
+make -C test test        # build + run; NGX_SRC= forces the stub header world
 ```
 
 ## License

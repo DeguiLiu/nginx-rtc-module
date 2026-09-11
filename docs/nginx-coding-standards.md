@@ -152,7 +152,7 @@ nginx 用自研的 `ngx_vslprintf`,**不是** `printf` 的薄封装。
 
 ### 6.1 一次可读事件收一个数据报,不要改成排空循环
 
-`ngx_event_recvmsg()` 的循环边界是 `do { ... } while (ev->available)`,而 Linux 下 `ev->available` 在进循环前被赋成 `ecf->multi_accept`(`event/ngx_event_udp.c:56-58`);`ev->available -= n` 的递减**只在 kqueue 分支**里做(`:343-345`)。`multi_accept` 默认 `off`,所以 **nginx 自己的 UDP 收包路径默认就是一个事件一个数据报**,只有运维显式 `multi_accept on` 才会排空到 `EAGAIN`。`ngx_stream_proxy_module` 的 UDP 转发同样如此。
+`ngx_event_recvmsg()` 的循环边界是 `do { ... } while (ev->available)`,而 Linux 下 `ev->available` 在进循环前被赋成 `ecf->multi_accept`(见 nginx 的 `src/event/ngx_event_udp.c`);`ev->available -= n` 的递减**只在 kqueue 分支**里做。`multi_accept` 默认 `off`,所以 **nginx 自己的 UDP 收包路径默认就是一个事件一个数据报**,只有运维显式 `multi_accept on` 才会排空到 `EAGAIN`。`ngx_stream_proxy_module` 的 UDP 转发同样如此。
 
 **不要"顺手"把它改成排空循环**:接收处理会经会话关闭路径把会话交回 `ngx_stream_finalize_session()`,排空循环必须在每个数据报之后重新判定会话是否仍然存活,否则就是 use-after-free。省下的那一次 epoll 往返远不抵这个风险。
 

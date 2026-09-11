@@ -19,7 +19,11 @@
 - `config` — nginx addon 构建脚本（通过 `NGX_RTC_THIRD` 定位第三方静态库）。
 - `src/` — 纯 C 核心（`rtp/sdp/stun/dtls/srtp/ring/audio/rtcp/hsm/session_fsm`，
   不依赖 nginx 头文件，可独立单测）+ 四个模块胶水代码。
-- `test/` — host 单测（不依赖 nginx / 第三方库）。
+- `test/` — host 单测。两套头世界：已 configure 的 nginx 树（Linux 默认）或
+  `test/include/` 的 stub（Windows）；部分用例链接真实的 OpenSSL/libsrtp2/FFmpeg。
+- `docs/` — [ARCHITECTURE.md](docs/ARCHITECTURE.md)（当前架构）、
+  [BACKLOG.md](docs/BACKLOG.md)（未实现能力与已知缺陷）、
+  [BUILD-TEST.md](docs/BUILD-TEST.md)、[nginx-coding-standards.md](docs/nginx-coding-standards.md)。
 
 ## 构建
 
@@ -34,7 +38,7 @@ export NGX_RTC_THIRD=/path/to/third          # include/ + lib/（见 nginx-rtc-e
 host 单测不需要这些：
 
 ```sh
-make -C test run_tests       # 145 个用例
+make -C test test            # 编译 + 运行；加 NGX_SRC= 强制走 stub 头世界
 ```
 
 ## License

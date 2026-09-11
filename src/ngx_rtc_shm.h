@@ -491,7 +491,10 @@ ngx_int_t ngx_rtc_shm_retransmit_get(ngx_rtc_shm_ctx_t *ctx, u_char *name,
                                      u_char *out, size_t out_cap,
                                      uint16_t *out_len);
 
-/* Replay the latest GOP (cb returns NGX_OK to continue, anything else to stop). */
+/* Replay the latest GOP (cb returns NGX_OK to continue, anything else to stop).
+ * Returns the number of cached packets handed to cb -- 0 means the ring held no
+ * keyframe to replay, which is what tells the caller to ask the publisher for a
+ * fresh IDR instead. -1 on error (bad arguments, no such source, no memory). */
 ngx_int_t ngx_rtc_shm_retransmit_replay_gop(ngx_rtc_shm_ctx_t *ctx,
                                             u_char *name, size_t len,
                                             ngx_rtc_shm_retransmit_cb cb,
