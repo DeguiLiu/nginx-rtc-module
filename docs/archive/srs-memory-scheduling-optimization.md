@@ -188,6 +188,15 @@ nginx 自身对「单写者、多读者」的做法是**版本号发布**，本�
 
 **这是 4.1 的前置条件，不是可选项。**
 
+**评审状态（2026-09-11）：PARTIAL。** 单写者无锁发布与延迟释放均未落地：`head`/`count` 仍是
+普通 `ngx_uint_t`，仍由 `pool->mutex` 保护（`src/ngx_rtc_shm.h:71-77`）；释放侧仍在同一把锁下
+`ngx_slab_free_locked`（`src/ngx_rtc_shm.c:163-165`、`993-996`），无 reader 计数或 epoch。
+已改的部分：`append` 改为接收发布者缓存的 `shm_src` 指针，锁内不再按名查 rbtree
+（`src/ngx_rtc_shm.c:1132-1200`、`src/ngx_rtc_shm.h:472-479`）；`remote_subscribers == 0`
+时完全跳过锁（`src/ngx_rtc_shm.c:1153`）；replay 的 1.5MB 缓冲分配已移到锁外
+（`src/ngx_rtc_shm.c:1280-1287`）。因此「只要存在跨 worker viewer，每个视频包仍持全局锁
+memcpy、回放仍在锁内整段拷贝」这一核心现象未变，量级仍待 §9 实测。
+
 ### 4.2 P1 同 worker 观众在摄入口的时间线上
 
 **现象**：`ngx_rtc_broadcast_rtp` 对 `snap_slots[i] == ngx_worker` 的观众直接内联
@@ -212,6 +221,12 @@ nginx 自身对「单写者、多读者」的做法是**版本号发布**，本�
 **代价与风险**：方案 1 会削弱同 worker 的「无锁本地环」快路径（NACK/PLI 仍读本地环，
 但实时发送多一次拷贝）；方案 2 需要保证分片期间 GOP 的完整性与顺序。
 
+**评审状态（2026-09-11）：OPEN。** 同 worker 仍在 `ngx_rtc_broadcast_rtp` 内联
+`ngx_rtc_session_send_rtp`（`src/ngx_rtmp_rtc_bridge_module.c:1121-1133`）；DTLS 完成时的
+GOP 回放仍是同步循环（`src/ngx_rtc_core.c:826-879`），未采用 0ms 定时器分片。该函数注释还
+明确反对定时器分片：分片会让旧 GOP 包与直播包交错，RTP 序号乱序反而破坏解码，所以方案 2 与
+现有实现形状的兼容性需要重评。
+
 ### 4.3 P1 每次回放分配 1.5MB
 
 **现象**：`ngx_rtc_shm_retransmit_replay_gop` 每次调用都
@@ -226,6 +241,10 @@ nginx 自身对「单写者、多读者」的做法是**版本号发布**，本�
 栈上小缓冲。**注**：若 4.1 按「版本号发布 + 无锁读」实现，则读侧只需持一个 `head`
 快照遍历环本身，这块 1.5MB 中转缓冲**整个消失**，本条与 4.1 应合并处理，不要分别做两遍。
 
+**评审状态（2026-09-11）：OPEN。** `ngx_rtc_shm_retransmit_replay_gop` 仍每次
+`ngx_alloc(NGX_RTC_SHM_RETX_RING_CAP * sizeof(slot))`（`src/ngx_rtc_shm.c:1283`），
+`ngx_free` 在 `1365`。分配已在锁外（`1289` 才加锁），但未改为 per-worker 复用缓冲。
+
 ### 4.4 P2 GOP 环与 shm 环双份预留
 
 **现象**：本地 GOP 环默认 2048 槽 ≈2.5MB/源（已可配：`rtc_gop_ring_slots`，
@@ -234,6 +253,10 @@ nginx 自身对「单写者、多读者」的做法是**版本号发布**，本�
 **建议**：评估在 shm 环存在时把本地环降级（例如只保留 IDR 起点索引），或把默认容量
 下调并给出按码率推导的配置建议。**注意**：本地环承担同 worker 的无锁 NACK/PLI 快路径，
 不能简单删除，需与 4.2 的方案一起决策。
+
+**评审状态（2026-09-11）：OPEN。** 两份缓存都在：进程内 `src->gop`
+（`src/ngx_rtc_core.h:387-388`，默认 2048 槽）与 shm `src->retransmit`
+（`src/ngx_rtc_shm.h:125-128`，`NGX_RTC_SHM_RETX_RING_CAP = 1024`），容量未下调或自适应。
 
 ### 4.5 P2 跨 worker 扇出静默截断
 
@@ -247,6 +270,10 @@ nginx 自身对「单写者、多读者」的做法是**版本号发布**，本�
 
 **建议**：溢出时记一次 warn + 累加计数器（最小改动）；或把订阅集合改为 shm 内按需扩展。
 
+**评审状态（2026-09-11）：OPEN。** 快照仍按插入序遍历、`n < max` 提前退出，无 warn 与计数器
+（`src/ngx_rtc_shm.c:1038-1049`）。另有一处同源的静默截断：每 worker 最多携带
+`NGX_RTC_RING_MAX_SESSIONS = 64` 个 session id（`src/ngx_rtmp_rtc_bridge_module.c:1141-1146`）。
+
 ### 4.6 P3 eventfd 唤醒放大
 
 **现象**：每个视频包对每个目标 worker 写一次 eventfd
@@ -254,6 +281,9 @@ nginx 自身对「单写者、多读者」的做法是**版本号发布**，本�
 
 **建议**：只在环由空转非空时写（用 `ngx_atomic_fetch_add` 的返回值判断），
 把唤醒次数压到每个排空周期一次。属于低风险微优化，可作为独立小改动。
+
+**评审状态（2026-09-11）：OPEN。** 仍每个目标 worker 每包写一次 eventfd
+（`src/ngx_rtmp_rtc_bridge_module.c:1154-1164`），无「空转非空」判断。
 
 ### 4.7 P3 会话的「两份真相」
 
@@ -265,6 +295,11 @@ nginx 自身对「单写者、多读者」的做法是**版本号发布**，本�
 
 **建议**：明确「进程内 FSM 只回答本进程，全局就绪看 shm `srtp_ready`」这一契约，
 并在统计接口与文档中固化（已在 ARCHITECTURE.md 记录，评审确认是否足够）。
+
+**评审状态（2026-09-11）：PARTIAL（契约已固化，结构未改）。** 契约「进程内 FSM 只回答本
+进程，全局就绪看 shm `srtp_ready`」已写入 `docs/ARCHITECTURE.md` 的会话状态机条目；shm 会话
+骨架也发布了 `state` 字段（`src/ngx_rtc_shm.h:175-183`）供 stats 读取。每进程一份 FSM 与 shm
+骨架并存的「两份真相」是既定设计，未取消。
 
 ## 5 不建议照搬 SRS 的部分
 
