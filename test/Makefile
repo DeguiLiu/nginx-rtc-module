@@ -9,7 +9,6 @@ CC      := gcc
 LDLIBS  := -lssl -lcrypto
 
 SRC_DIR   := ../src
-BUILD_DIR := build
 BIN       := run_tests
 
 # Where the nginx headers come from.
@@ -67,6 +66,13 @@ $(warning header world: stub -- the NGX_SRC probe found no configured nginx tree
 else
 $(info header world: real ($(NGX_SRC)))
 endif
+
+# One object directory per world. make does not know that a flag changed, so a
+# shared directory will happily link objects compiled against the other world's
+# headers -- the silent mismatch the line above exists to expose. The caller
+# may still override this (scripts/sanitize-tests.sh keys its own directory by
+# sanitizer).
+BUILD_DIR ?= build/$(if $(NGX_SRC),real,stub)
 
 # -Iinclude is LAST so that, in an NGX_SRC build, the real nginx headers win the
 # lookup and include/ only serves srtp2/srtp.h, which nginx does not ship.
@@ -150,7 +156,7 @@ test: $(BIN)
 	./$(BIN)
 
 clean:
-	rm -rf $(BUILD_DIR) $(BIN)
+	rm -rf build $(BIN)
 
 -include $(DEPS)
 
