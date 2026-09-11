@@ -684,6 +684,7 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
     char                candidate_ip[NGX_RTC_SDP_STR_LEN];
     char                video_fmtp_buf[128];
     ngx_uint_t          body_on_disk;
+    ngx_uint_t          src_created;
     size_t              max_sdp_len;
 
     /* Diagnostic only: NGX_LOG_ERR here printed a pointer pair on every play
@@ -833,7 +834,10 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
         return;
     }
 
-    src = ngx_rtc_source_get(name);
+    /* `src_created` drives the error rollback below: a source this request
+     * built and then failed to use is removed, an existing one is left alone.
+     * See ngx_rtc_source_create(). */
+    src = ngx_rtc_source_create(name, &src_created);
     if (NULL == src) {
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
@@ -869,6 +873,14 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
      * connection), so allocate from process memory, not the request pool. */
     sess = ngx_calloc(sizeof(ngx_rtc_session_t), r->connection->log);
     if (NULL == sess) {
+        /* A source this request created has nothing else pointing at it, and
+         * the only two source_remove() callers are session unsubscribe and the
+         * RTMP teardown, so it would stay in the registry -- ~260 KB each --
+         * for the worker's life. An existing source is someone else's and is
+         * left alone. */
+        if (0 != src_created) {
+            ngx_rtc_source_remove(name);
+        }
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
@@ -1422,6 +1434,7 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
     uint32_t              ans_len;
     char                  candidate_ip[NGX_RTC_SDP_STR_LEN];
     ngx_uint_t            body_on_disk;
+    ngx_uint_t            src_created;
     size_t                max_sdp_len;
 
     if (NULL == r->request_body || NULL == r->request_body->bufs) {
@@ -1500,7 +1513,8 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
         return;
     }
 
-    src = ngx_rtc_source_get(name);
+    /* src_created drives every rollback below -- see ngx_rtc_source_create(). */
+    src = ngx_rtc_source_create(name, &src_created);
     if (NULL == src) {
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
@@ -1509,13 +1523,21 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
     /* Process-local ownership (a single-worker deployment has no shm to
      * arbitrate): reject an RTMP-owned source before touching the shm. */
     if (NGX_RTC_PUBLISHER_RTMP == src->publisher_kind) {
+        if (0 != src_created) {
+            ngx_rtc_source_remove(name);
+        }
         ngx_http_finalize_request(r, NGX_HTTP_CONFLICT);
         return;
     }
 
     if (NGX_BUSY == ngx_rtc_publish_claim(src, NGX_RTC_PUBLISHER_WHIP)) {
         /* Already published by RTMP on this name: refuse the cross-protocol
-         * duplicate instead of sharing the source. */
+         * duplicate instead of sharing the source. A WHIP ingest arriving on a
+         * worker that has no local source for the name creates one here before
+         * the shm claim rejects it, so that orphan has to go back. */
+        if (0 != src_created) {
+            ngx_rtc_source_remove(name);
+        }
         ngx_http_finalize_request(r, NGX_HTTP_CONFLICT);
         return;
     }
@@ -1555,6 +1577,9 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
          * publisher, and every later publish on the name is refused until a
          * WHIP publish on it happens to succeed. */
         ngx_rtc_publish_release(src);
+        if (0 != src_created) {
+            ngx_rtc_source_remove(name);
+        }
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
@@ -1632,9 +1657,16 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
 
     if (ngx_rtc_sdp_generate_answer(&cfg, ans_buf, sizeof(ans_buf), &ans_len)
             != NGX_RTC_OK) {
+        /* Order matters: release the claim, unlink the session, free it, and
+         * only then remove a source this request created -- session_remove()
+         * has to run first or the source is still held by it and the guards in
+         * source_remove() would refuse, leaving the same orphan. */
         ngx_rtc_publish_release(sess->source);
         ngx_rtc_session_remove(sess);
         ngx_free(sess);
+        if (0 != src_created) {
+            ngx_rtc_source_remove(name);
+        }
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
@@ -1655,9 +1687,13 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
 
         outb = ngx_create_temp_buf(r->pool, ans_len);
         if (NULL == outb) {
+            /* Same order as the branch above. */
             ngx_rtc_publish_release(sess->source);
             ngx_rtc_session_remove(sess);
             ngx_free(sess);
+            if (0 != src_created) {
+                ngx_rtc_source_remove(name);
+            }
             ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
             return;
         }

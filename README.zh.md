@@ -1,5 +1,7 @@
 # nginx-rtc-module
 
+[English](README.md) | **中文**
+
 自研的 nginx C 扩展（addon），把 **RTMP / WHIP** 推流转换成 **WebRTC**
 （RTP/SRTP over UDP）播放，运行于 OpenResty/nginx。装配与部署示例仓库见
 [github.com/DeguiLiu/nginx-rtc-example](https://github.com/DeguiLiu/nginx-rtc-example)

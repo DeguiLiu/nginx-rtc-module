@@ -436,7 +436,20 @@ struct ngx_rtc_source_s {
 #endif
 };
 
-/* Find or create a source by "app/stream". Returns NULL on alloc failure. */
+/* Find or create a source by "app/stream". Returns NULL on alloc failure.
+ *
+ * `created`, when non-NULL, is set to 1 if this call built the source and 0 if
+ * it found an existing one. Callers on a signalling error path need that
+ * distinction to undo only their own work: a source is ~260 KB (it embeds the
+ * 256 KiB video_body), and ngx_rtc_source_remove() is reached only from session
+ * unsubscribe and RTMP publisher teardown, so a source created for a request
+ * that then failed would otherwise stay in the registry forever. Nothing
+ * depends on such a source being kept for a later request. */
+ngx_rtc_source_t *ngx_rtc_source_create(const char *name, ngx_uint_t *created);
+
+/* ngx_rtc_source_create(name, NULL): find or create, no report. The media-plane
+ * callers use this -- they hold the source for the session's lifetime and have
+ * no error path that abandons it. */
 ngx_rtc_source_t *ngx_rtc_source_get(const char *name);
 
 /* Find an existing source without creating it. Returns NULL if absent. */

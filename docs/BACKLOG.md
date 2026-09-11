@@ -104,3 +104,27 @@ pacer/BWE（SRS 6.0 的 RTC 路径没有 pacer）、对播放端发 SR（SRS 不
   丢包、乱序或抖动（全仓无 netem/tc 注入）。**方向**：给推流客户端加丢包/乱序注入能力。
 - **跨协议发布接管未跑过 e2e** — 三种接管场景（RTMP→WHIP、WHIP→RTMP、同协议重推）
   没有对应的 e2e 断言。
+
+## 9 本地演示环境的 supervisor 泄漏（非模块缺陷）
+
+`run.sh` 的 `keep-push` / `keep-transcode` 用 `setsid nohup` 脱离进程组启动，pidfile
+只有一个 `/tmp/rtc_keep_{push,tc}.pid`。这让 `stop` 只能杀掉 pidfile 里的那一个实例：
+一次未被配对的 `start`、或一次 `stop` 只杀掉了其中一个，就会留下一个父进程为 1 的
+孤儿 supervisor。孤儿继续每 3 秒轮询，发现没有 ffmpeg 就重新拉起推流，与后来启动的
+supervisor 争抢同一个流名。
+
+2026-09-11 观察到的一个实例（PID 867959，00:46 启动）导致 nginx 每约 40 秒被
+`stop`→`start` 一轮，推流反复建立又拆除。**这一度被误判为"RTMP 桥接不工作"**——实际
+`ngx_rtmp_rtc_bridge_module` 一直正常：`error.log` 里每轮都有
+`destroying audio transcoder, stream=live/livestream is_viewer=0 src_publishing=1
+publisher_kind=1`，即 RTMP 发布者身份被正确认领、AAC 转码器被正确创建，
+只是 40 秒后随整个进程被 SIGTERM 而拆除。`/rtc/v1/stats` 的 `streams` 为空是采样
+落在了"刚重启、尚未推流"的窗口内，不是桥接缺陷。
+
+**影响**：本机演示环境的推流与 RTC 输出会周期性中断，且 `/rtc/v1/stats`、`/metrics`
+的读数不可信。**不影响模块本身**。
+
+**方向**：supervisor 的 pidfile 应记录进程组或使用 `flock` 单实例锁，并在启动时
+先清理指向已死进程的陈旧 pidfile；`stop` 应按进程组（`kill -- -PGID`）而非单个 pid 终止。
+
+

@@ -1,5 +1,7 @@
 # nginx-rtc-module
 
+**English** | [中文](README.zh.md)
+
 Self-developed nginx C addon that turns **RTMP / WHIP** ingest into **WebRTC**
 (RTP/SRTP over UDP) playout, running on OpenResty/nginx. The assembly + deploy
 repo that consumes this addon lives at

@@ -951,6 +951,23 @@ ngx_rtc_shm_expire_locked(ngx_rtc_shm_ctx_t *ctx, ngx_uint_t forced)
 
             src->publishing = 0;
             src->publisher_kind = NGX_RTC_PUBLISHER_NONE;
+
+            /* Re-arm the empty-source deadline the publisher was holding off.
+             * try_publish() sets expires = 0 for as long as the source
+             * publishes, so a crashed publisher leaves it at 0 -- and the reap
+             * rule below is gated on `0 != src->expires`. Merely clearing
+             * `publishing` therefore reclaimed nothing: the source and its
+             * retransmit ring stayed pinned for the life of the zone, which is
+             * precisely what the heartbeat above exists to prevent. Only when
+             * no session ever unbinds (a publisher with no viewer) is this the
+             * sole chance to arm it; with a viewer, the last session to leave
+             * arms it at the "last session left" site instead, and re-arming
+             * here would only forget that grace -- so the `0 == expires`
+             * guard keeps the earlier deadline when one is already set. */
+            if (0 == src->expires) {
+                src->expires = ngx_current_msec
+                               + NGX_RTC_SHM_SOURCE_EXPIRE_MS;
+            }
         }
 
         if (0 == ngx_queue_empty(&src->subscribers)) {

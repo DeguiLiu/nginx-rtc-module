@@ -133,15 +133,15 @@ struct ngx_rtc_shm_source_s {
     ngx_rtc_shm_retransmit_t   *retransmit;
     ngx_uint_t                  retransmit_alloc_failed; /* lazy ring alloc failures */
 
-    /* Lock-cost instrumentation for that ring (see
-     * docs/archive/srs-memory-scheduling-optimization.md, sections 4.1 and 9).
-     * These exist to answer one question: is the shared slab pool mutex worth
-     * splitting? So the *_us fields measure from just before the lock to just
-     * before the unlock -- lock wait plus the work underneath, not the copy
-     * alone, because waiting is the cost being argued about.
+    /* Lock-cost instrumentation for that ring. These exist to answer one
+     * question: is the shared slab pool mutex worth splitting? So the *_us
+     * fields measure from just before the lock to just before the unlock --
+     * lock wait plus the work underneath, not the copy alone, because waiting
+     * is the cost being argued about.
      *
      * Written only while holding that mutex and read under it, so plain fields
-     * and no atomics. Counts are exact; the microsecond sums are wall clock. */
+     * and no atomics. Counts are exact; the microsecond sums are wall clock.
+     * Surfaced by /rtc/v1/stats as retx_lock / total_retx_lock. */
     ngx_uint_t                  retx_append_locked;  /* appends that took the mutex */
     ngx_uint_t                  retx_append_us;      /* us lost to it, append path */
     ngx_uint_t                  retx_replay_count;   /* GOP replays served */

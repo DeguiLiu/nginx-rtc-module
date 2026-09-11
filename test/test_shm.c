@@ -338,6 +338,54 @@ NGX_RTC_TEST(shm_source_outlives_a_session_that_points_at_it)
 }
 
 /*
+ * The above test forces the deadline by hand (`src->expires = now`). The real
+ * case cannot: try_publish() sets expires = 0 for as long as the source
+ * publishes (ngx_rtc_shm.c:653), so a crashed publisher leaves the source with
+ * expires == 0 permanently. Clearing `publishing` in the reaper does not re-arm
+ * it, and the reap rule below is gated on `0 != src->expires` -- so the source
+ * and its ~1.5 MB retransmit ring survive every sweep, which is the very
+ * outcome the heartbeat comment says it exists to prevent.
+ *
+ * The distinguishing condition is a publisher with NO viewer: then no session
+ * ever unbinds, so nothing runs the "last session left" arm at :329 either.
+ */
+NGX_RTC_TEST(shm_source_reclaims_a_dead_publisher_with_no_viewer)
+{
+    const char           *name = "live/crashed_noviewer";
+    ngx_rtc_shm_source_t *src;
+
+    shm_test_setup();
+    ngx_current_msec = 1000000;
+
+    src = ngx_rtc_shm_source_get(&g_ctx, (u_char *) name, ngx_strlen(name));
+    NGX_RTC_TEST_ASSERT(NULL != src);
+    NGX_RTC_TEST_ASSERT(NGX_OK == ngx_rtc_shm_source_try_publish(
+        &g_ctx, (u_char *) name, ngx_strlen(name), NGX_RTC_PUBLISHER_RTMP));
+
+    /* The invariant the leak turns on: publishing implies expires == 0. */
+    NGX_RTC_TEST_ASSERT(0 == src->expires);
+
+    /* Two sweeps, because the reaper both decides and collects, and the
+     * decision is what arms the deadline: the first sweep sees a silent
+     * heartbeat, clears `publishing` and arms expires = now + EXPIRE; only a
+     * later sweep, once that deadline has passed, may collect.
+     *
+     * No viewer is ever subscribed, so nothing runs the "last session left"
+     * arm -- this sweep is the only chance to set the deadline at all. */
+    src->publisher_seen_ms = (ngx_atomic_t) ngx_current_msec;
+    ngx_current_msec += NGX_RTC_SHM_PUBLISH_GRACE_MS + 1;
+    ngx_rtc_shm_expire(&g_ctx, 0);
+
+    /* Declared dead, deadline armed -- but not yet due. */
+    NGX_RTC_TEST_ASSERT(false == ngx_queue_empty(&g_ctx.source_list));
+
+    ngx_current_msec += NGX_RTC_SHM_SOURCE_EXPIRE_MS + 1;
+    ngx_rtc_shm_expire(&g_ctx, 0);
+
+    NGX_RTC_TEST_ASSERT(true == ngx_queue_empty(&g_ctx.source_list));
+}
+
+/*
  * A publisher that dies without releasing -- a worker crash, a SIGKILL -- never
  * runs ngx_rtc_publish_release(), so its shm source keeps publishing=1 and the
  * reaper used to skip it forever: the flag meant "an owner exists", and nothing

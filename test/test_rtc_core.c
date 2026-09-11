@@ -803,6 +803,71 @@ NGX_RTC_TEST(retransmit_misses_when_source_gop_empty)
                                NGX_RTC_ERR_PARSE);
 }
 
+/*
+ * ngx_rtc_source_create() has to tell the caller whether it built the source
+ * or found one, because the HTTP signaling error paths are only allowed to
+ * undo their own work.
+ *
+ * Those handlers call source_get() before they know whether the request will
+ * succeed, and several error branches return without ever creating a session.
+ * The source struct embeds a 256 KiB video_body, so an orphan is ~260 KB, and
+ * nothing else would ever free it: ngx_rtc_source_remove() is reached only from
+ * session unsubscribe and RTMP publisher teardown. Freeing unconditionally on
+ * those paths would be wrong for the other case -- a source that already
+ * existed and is serving other sessions -- and the guards inside remove() would
+ * be the only thing standing between that and a freed-in-use source. Reporting
+ * `created` puts the decision on the caller that knows which case it is in.
+ */
+NGX_RTC_TEST(source_create_reports_whether_it_created_or_found)
+{
+    const char           *name = "live/create_semantics";
+    ngx_rtc_source_t     *first;
+    ngx_rtc_source_t     *again;
+    ngx_uint_t            created_a;
+    ngx_uint_t            created_b;
+
+    /* The registry is process-global and the tests share it, so the name has to
+     * be one no other test uses, and the test removes what it made. */
+    ngx_rtc_source_remove(name);
+
+    /* A name not yet registered: created must report 1 and hand back a source. */
+    created_a = 0;
+    first = ngx_rtc_source_create(name, &created_a);
+    NGX_RTC_TEST_ASSERT(NULL != first);
+    NGX_RTC_TEST_ASSERT(1 == created_a);
+
+    /* The same name again: an existing source, so created must report 0 and the
+     * pointer must be the one already in the registry (not a second copy). */
+    created_b = 0;
+    again = ngx_rtc_source_create(name, &created_b);
+    NGX_RTC_TEST_ASSERT(first == again);
+    NGX_RTC_TEST_ASSERT(0 == created_b);
+
+    ngx_rtc_source_remove(name);
+}
+
+/*
+ * ngx_rtc_source_get() keeps its "find or create" contract -- the media-plane
+ * callers (stream_module) rely on it and never free on error -- so the split
+ * must not change its behaviour.
+ */
+NGX_RTC_TEST(source_get_still_creates_and_reuses)
+{
+    const char           *name = "live/get_semantics";
+    ngx_rtc_source_t     *first;
+    ngx_rtc_source_t     *again;
+
+    ngx_rtc_source_remove(name);
+
+    first = ngx_rtc_source_get(name);
+    NGX_RTC_TEST_ASSERT(NULL != first);
+
+    again = ngx_rtc_source_get(name);
+    NGX_RTC_TEST_ASSERT(first == again);
+
+    ngx_rtc_source_remove(name);
+}
+
 NGX_RTC_TEST(ring_reset_serves_only_new_generation)
 {
     ngx_rtc_rtp_ring_t ring;

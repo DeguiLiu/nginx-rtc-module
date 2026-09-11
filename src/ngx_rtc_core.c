@@ -135,11 +135,15 @@ ngx_rtc_session_from_node(ngx_rbtree_node_t *node)
 }
 
 ngx_rtc_source_t *
-ngx_rtc_source_get(const char *name)
+ngx_rtc_source_create(const char *name, ngx_uint_t *created)
 {
     ngx_rtc_source_t  *src;
     uint32_t           hash;
     size_t             len;
+
+    if (NULL != created) {
+        *created = 0;
+    }
 
     if (NULL == name) {
         return NULL;
@@ -177,7 +181,18 @@ ngx_rtc_source_get(const char *name)
     src->gop.capacity = 0;
     src->gop.slots = NULL;
 
+    /* Reported last, so it is set only on the path that really built one. */
+    if (NULL != created) {
+        *created = 1;
+    }
+
     return src;
+}
+
+ngx_rtc_source_t *
+ngx_rtc_source_get(const char *name)
+{
+    return ngx_rtc_source_create(name, NULL);
 }
 
 ngx_rtc_source_t *
