@@ -82,7 +82,7 @@ ngx_rtc_audio_create(const uint8_t *asc, uint32_t asc_len, int32_t bitrate)
     if (avcodec_open2(a->dec, codec, NULL) < 0) {
         goto fail;
     }
-#if LIBAVCODEC_VERSION_MAJOR < 61
+#if LIBAVCODEC_VERSION_MAJOR < 59
     if (0 == a->dec->channel_layout) {
         a->dec->channel_layout = (uint64_t)av_get_default_channel_layout(a->dec->channels);
     }
@@ -217,7 +217,7 @@ ngx_rtc_audio_transcode(ngx_rtc_audio_t *a, const uint8_t *aac, uint32_t aac_len
 static int32_t
 ngx_rtc_audio_init_swr(ngx_rtc_audio_t *a)
 {
-#if LIBAVCODEC_VERSION_MAJOR >= 61
+#if LIBAVCODEC_VERSION_MAJOR >= 59
     AVChannelLayout in_layout;
     AVChannelLayout out_layout;
     int             rc;
@@ -253,6 +253,12 @@ ngx_rtc_audio_init_swr(ngx_rtc_audio_t *a)
     }
 #endif
     if (swr_init(a->swr) < 0) {
+        /* Must release before returning. swr_ready stays 0, so the next frame
+         * calls this function again and swr_alloc_set_opts2() overwrites
+         * a->swr -- the context allocated above would be lost for good. The
+         * only other free is in ngx_rtc_audio_destroy(), which sees just the
+         * last pointer. */
+        swr_free(&a->swr);
         return -1;
     }
 
@@ -260,6 +266,7 @@ ngx_rtc_audio_init_swr(ngx_rtc_audio_t *a)
     if (av_samples_alloc(a->swr_data, NULL, (int)NGX_RTC_AUDIO_OPUS_CHANNELS,
                          (int)NGX_RTC_AUDIO_OPUS_FRAME_SIZE,
                          AV_SAMPLE_FMT_S16, 0) < 0) {
+        swr_free(&a->swr);
         return -1;
     }
 
