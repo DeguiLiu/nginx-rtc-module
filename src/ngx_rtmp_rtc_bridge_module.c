@@ -445,12 +445,6 @@ ngx_rtmp_rtc_rtcp_timer(ngx_event_t *ev)
 }
 
 
-/* RTCP sender-report / observability timer, armed once per worker. Exported
- * because nginx runs module init_process only for core/http/stream module
- * types - an NGX_RTMP_MODULE's init_process (ngx_rtmp_rtc_init_process below)
- * is never invoked - so the http module starts this timer from its own
- * (running) init_process. ngx_add_timer is idempotent, so both callers are
- * safe. */
 /* Safe RTCP SR cadence. The rtmp{} directive parser may leave the addon main
  * conf unset (NGX_CONF_UNSET_MSEC ~ 49 days); clamp to 2 s so the sender-report
  * / A/V-skew timer is always live. */
@@ -469,6 +463,15 @@ ngx_rtc_rtcp_sr_interval(void)
 }
 
 
+/* Arm the RTCP sender-report / observability timer for the calling worker.
+ * Exported because two init_process handlers call it: nginx walks
+ * cycle->modules[] with no module-type filter (ngx_process_cycle.c:966 for the
+ * worker process, :297 for single-process mode), so an NGX_RTMP_MODULE's
+ * init_process does run after all - this module's handler is merely ordered
+ * first (ngx_modules.c emits ngx_rtmp_rtc_bridge_module before
+ * ngx_rtc_http_module), and the http module's call then re-arms the same event.
+ * ngx_add_timer on an already-armed event only resets the deadline, so the
+ * duplicate is harmless. Worker-only. */
 void
 ngx_rtmp_rtc_rtcp_timer_start(ngx_cycle_t *cycle)
 {
@@ -488,8 +491,8 @@ ngx_rtmp_rtc_rtcp_timer_start(ngx_cycle_t *cycle)
 static ngx_int_t
 ngx_rtmp_rtc_init_process(ngx_cycle_t *cycle)
 {
-    /* Kept for nginx builds that do run RTMP-module init_process; normally a
-     * no-op because the http module already started the timer. */
+    /* Runs in every worker ahead of the http module's handler; the second
+     * ngx_add_timer is harmless (see ngx_rtmp_rtc_rtcp_timer_start above). */
     ngx_rtmp_rtc_rtcp_timer_start(cycle);
 
     return NGX_OK;
