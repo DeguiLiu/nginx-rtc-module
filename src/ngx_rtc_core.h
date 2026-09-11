@@ -381,6 +381,13 @@ struct ngx_rtc_source_s {
     uint32_t audio_asc_len;
     void    *audio_ctx;   /* ngx_rtc_audio_t *, owned by the bridge module */
 
+    /* Set once the bridge has reported that audio_ctx is NULL while raw AAC
+     * frames keep arriving, and cleared every time a transcoder is created.
+     * Per source, not per worker: a worker-wide one-shot spends its only
+     * warning on the first stream to fail and leaves every later one -- and a
+     * second failure on this same source after a republish -- silent. */
+    uint8_t  audio_noctx_warned;
+
     /* GOP ring: caches recent plaintext RTP for fast-start replay + NACK. */
     ngx_rtc_rtp_ring_t gop;
 

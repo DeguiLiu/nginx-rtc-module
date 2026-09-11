@@ -443,14 +443,6 @@ void ngx_rtc_shm_source_set_ssrc(ngx_rtc_shm_ctx_t *ctx, u_char *name,
                                  size_t len, uint32_t video_ssrc,
                                  uint32_t audio_ssrc);
 
-/* Mirror a source's packet/octet counters (used by the WHIP producer path,
- * which does not run the RTMP bridge's sync_shm). */
-void ngx_rtc_shm_source_set_media_stats(ngx_rtc_shm_ctx_t *ctx, u_char *name,
-                                        size_t len, ngx_uint_t video_pkts,
-                                        ngx_uint_t video_octets,
-                                        ngx_uint_t audio_pkts,
-                                        ngx_uint_t audio_octets);
-
 /* Expire sweep: reap half-open sessions and empty non-publishing sources whose
  * expires has elapsed. forced=1 also sweeps entries not yet due (allocation
  * pressure fallback). Safe to call on every worker. */

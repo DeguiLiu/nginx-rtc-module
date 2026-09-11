@@ -867,32 +867,6 @@ ngx_rtc_shm_source_set_ssrc(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len,
 }
 
 
-void
-ngx_rtc_shm_source_set_media_stats(ngx_rtc_shm_ctx_t *ctx, u_char *name,
-                                   size_t len, ngx_uint_t video_pkts,
-                                   ngx_uint_t video_octets,
-                                   ngx_uint_t audio_pkts,
-                                   ngx_uint_t audio_octets)
-{
-    ngx_rtc_shm_source_t *src;
-
-    if (NULL == ctx || NULL == name || 0 == len
-            || len >= NGX_RTC_SHM_SOURCE_NAME_MAX) {
-        return;
-    }
-
-    ngx_shmtx_lock(&ctx->pool->mutex);
-    src = ngx_rtc_shm_source_locked_lookup(ctx, name, len);
-    if (NULL != src) {
-        src->video_pkts = video_pkts;
-        src->video_octets = video_octets;
-        src->audio_pkts = audio_pkts;
-        src->audio_octets = audio_octets;
-    }
-    ngx_shmtx_unlock(&ctx->pool->mutex);
-}
-
-
 /*
  * True when some session skeleton still points at `src`.
  *

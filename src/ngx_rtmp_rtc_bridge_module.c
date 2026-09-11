@@ -85,15 +85,6 @@ typedef struct {
  * postconfigure after this one, so a hook installed here never fires. */
 static ngx_rtmp_rtc_main_conf_t *ngx_rtmp_rtc_main_conf;
 
-/* One-shot per worker. A raw AAC frame arriving with no transcoder handle means
- * the AAC sequence header was never accepted (missing, over-long, or arriving
- * after this frame), and the stream then carries no audio until the next
- * republish. That failure was silent: the only symptoms were audio RTP packet
- * count 0 and askew=0 in the avsync line, with nothing in error.log -- see the
- * 2026-09-10 investigation in docs/. Warn once so the next occurrence names the
- * stream immediately instead of being reconstructed from counters. */
-static ngx_uint_t ngx_rtmp_rtc_audio_noctx_warned;
-
 
 static ngx_command_t ngx_rtmp_rtc_commands[] = {
 
@@ -297,6 +288,32 @@ ngx_rtmp_rtc_release_publish(ngx_rtmp_session_t *s)
      * teardown that found the tag already cleared, stranding the transcoder
      * thread and its queues with no owner left to stop them. */
     if (NULL != src->audio_ctx) {
+        ngx_uint_t  level;
+
+        /* Attribute the destroy. s->publisher is set only on a session that
+         * consumes someone else's stream -- the live module assigns it to
+         * every subscriber context and the gop-cache module to every player,
+         * never to the publisher itself -- so a non-NULL value here means a
+         * viewer's teardown reached the publisher's transcoder. That is the
+         * shape of the 2026-09-11 incident: live/livestream ran without audio
+         * for four hours while its publisher stayed connected, and the only
+         * trace was one line from the raw-frame path with no way back to the
+         * session that caused it. The connection number is already in the log
+         * prefix; the stream name and the three flags are what could not be
+         * reconstructed. Warn rather than inform when the source was still
+         * live, because that teardown is the bug and a viewer's is not. The
+         * level is hoisted out of the call: ngx_log_error's macro expands
+         * `level` into `>= level` unparenthesized, and gcc flags a ternary
+         * there under -Wint-in-bool-context. */
+        level = (NULL != s->publisher && 0 != src->publishing)
+                    ? NGX_LOG_WARN : NGX_LOG_INFO;
+
+        ngx_log_error(level, s->connection->log, 0,
+                      "ngx_rtmp_rtc: destroying audio transcoder, stream=%s "
+                      "is_viewer=%ui src_publishing=%ui publisher_kind=%ui",
+                      name, (ngx_uint_t) (NULL != s->publisher),
+                      src->publishing, src->publisher_kind);
+
         ngx_rtc_audio_worker_destroy((ngx_rtc_audio_worker_t *) src->audio_ctx);
         src->audio_ctx = NULL;
     }
@@ -1028,6 +1045,15 @@ ngx_rtmp_rtc_audio(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h, ngx_chain_t *in)
                           "ngx_rtmp_rtc: audio worker create failed, "
                           "stream=%s has no audio", name);
         }
+
+        /* Arm or clear the raw-frame warning for this episode. A failed create
+         * is already reported by the branch above, so it counts as reported --
+         * otherwise the very next raw frame logs the same failure a second
+         * time. A successful create clears the flag, so a later NULL (the
+         * transcoder destroyed while the publisher keeps sending) is reported
+         * again rather than suppressed by the previous episode's warning. */
+        src->audio_noctx_warned = (NULL != src->audio_ctx) ? 0 : 1;
+
         return NGX_OK;
     }
 
@@ -1036,14 +1062,19 @@ ngx_rtmp_rtc_audio(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h, ngx_chain_t *in)
     }
 
     if (NULL == src->audio_ctx) {
-        /* Every raw frame lands here for the rest of the publish, so warn
-         * once per worker rather than per frame. */
-        if (0 == ngx_rtmp_rtc_audio_noctx_warned) {
-            ngx_rtmp_rtc_audio_noctx_warned = 1;
+        /* Every raw frame lands here for the rest of the episode, so warn
+         * once per source rather than per frame. The cause is deliberately
+         * not named: audio_ctx is NULL either because the sequence header was
+         * never accepted or because a transcoder that did exist was destroyed
+         * afterwards, and asserting the first sent an earlier investigation
+         * down the wrong path. */
+        if (0 == src->audio_noctx_warned) {
+            src->audio_noctx_warned = 1;
             ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
-                          "ngx_rtmp_rtc: raw AAC frame with no transcoder "
-                          "handle, stream=%s; this stream has no audio until "
-                          "the next republish", name);
+                          "ngx_rtmp_rtc: no audio transcoder for stream=%s "
+                          "(audio_ctx is NULL), so raw AAC frames are dropped "
+                          "and the RTC output carries no audio until a new AAC "
+                          "sequence header creates one", name);
         }
         return NGX_OK;
     }
