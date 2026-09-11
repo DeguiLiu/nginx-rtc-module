@@ -7,9 +7,9 @@
 | 序 | 项 | 建议 | 理由 |
 | --- | --- | --- | --- |
 | 1 | `NGX_SRC` 探测路径依赖 | **做** | 现状让「验真头」取决于 checkout 在哪，是个隐式环境耦合 |
-| 2 | sanitize 组缺依赖静默跳过 | **做** | 绿灯可能意味着 25 个用例没跑，CI 语义错误 |
+| 2 | sanitize 组缺依赖静默跳过 | **做** | 绿灯可能意味着 20 个用例没跑，CI 语义错误 |
 | 3 | 分支切分靠人工 | **做**（校验脚本） | 本仓历史里已漂移过三次 |
-| 4 | 平台守卫散落 | **做**（集中到一个头） | 每加一个源文件就要记得两分支同步 |
+| 4 | 平台守卫散落 | **不做**（现状 + 校验脚本兜底） | §4 推导后方案不成立，见该节结论 |
 | 5 | host 测试包含 .c 文件 | **不动** | 替代方案更差，只需补一条约束 |
 
 ---
@@ -18,7 +18,7 @@
 
 ### 1.1 现状
 
-`test/Makefile:36`：
+`test/Makefile:35`：
 
 ```make
 NGX_SRC ?= $(shell for d in $(CURDIR)/../../nginx-rtc-example/build/src/openresty-*/build/nginx-*; do \
@@ -70,7 +70,7 @@ if [ 0 -eq "$HAVE_SRTP" ]; then
 fi
 ```
 
-三组（25 个用例）整组跳过，**退出码 0**。命令行上会打印 SKIPPED，但在 CI 日志里，一次 `exit 0` 与「全部通过」没有区别。
+三组（20 个用例：srtp 10 + audio 5 + audio_worker 5）整组跳过，**退出码 0**。命令行上会打印 SKIPPED，但在 CI 日志里，一次 `exit 0` 与「全部通过」没有区别。
 
 ### 2.2 后果
 
@@ -151,7 +151,10 @@ actual=$(git diff --name-only main win32-compat | sort)
 
 要点：
 
-- **双向校验** —— `git diff win32-compat main` 必须为空（win32-compat 是严格超集），这条比白名单更重要，因为它能抓住「main 上多了东西」
+- **双向校验** —— 注意 `git diff main win32-compat` **不会**为空：win32-compat 本来就有 win32 集合（9 个文件，形态是 `A` 或 `M`）。真正该卡的是两条：
+  1. 该 diff 的 `A`/`M` 路径集合**恰好等于白名单**；
+  2. 该 diff 里**不得出现 `D`** —— `D` 意为「main 有、win32-compat 没有」，也就是 main 上多了东西，超集关系已破。
+  （脚本已按此实现，见 `scripts/check-branch-split.sh`）
 - 白名单变化必须**显式改脚本**，于是每次加 win32 文件都会留下一条 diff，评审时看得见
 - 对 example 仓库同样一份
 
@@ -279,3 +282,17 @@ test/include/ngx_core.h       winsock2.h vs sys/socket.h
 - 第 4 步：文档改动，无代码风险
 
 **全部改动都不触碰 `src/`，因此不影响模块行为，也不需要 e2e。**
+
+---
+
+## 7 落地状态（2026-09-11）
+
+| 项 | 状态 | 落地物 |
+| --- | --- | --- |
+| §2 退出码 | 已落地 | `scripts/sanitize-tests.sh`：缺依赖 `exit 77`，`--require-all` 时 `exit 1`，跳过信息带用例数（20） |
+| §3 分支切分校验 | 已落地 | `scripts/check-branch-split.sh` + `scripts/branch-split.allow`（两仓库各一份，正文同一份） |
+| §1 两个头世界 | 已落地 | `scripts/check-worlds.sh`（stub + real 各跑一遍且都要求 FAIL: 0、PASS == TOTAL）；`sanitize-tests.sh` 透传 `NGX_SRC` |
+| §5.3 约束文字 | 已落地 | `test/Makefile` 的 `test_test_stream_module.o` 规则上方注明「该 TU 拿不到 `-Werror`」 |
+| §4 平台守卫 | 不做 | 结论见 §4，机械约束由 §3 的 token 断言承担 |
+
+四处的更正（§1.1 行号、§2 用例数、§3.2 判据、§4 结论表）已按实测改过。
