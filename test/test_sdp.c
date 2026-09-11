@@ -218,6 +218,42 @@ NGX_RTC_TEST(sdp_generate_answer)
     NGX_RTC_TEST_ASSERT(str_contains(buf, "a=ssrc:222 cname:222\r\n"));
 }
 
+/*
+ * The WHIP answer. a=rtcp-fb declares what the answer's author can RECEIVE, and
+ * the recvonly direction produces only one of the two: the server sends PLI
+ * upstream when a viewer cannot be served from the cache, but it has no
+ * receive-side NACK generator at all. Declaring nack here makes the publisher
+ * enable RTX and wait for retransmission requests that never arrive -- feedback
+ * advertised and never sent, which is what the comment above the emit site
+ * used to talk itself into.
+ */
+NGX_RTC_TEST(sdp_generate_answer_recvonly_omits_nack)
+{
+    ngx_rtc_sdp_answer_t cfg;
+    char buf[2048];
+    uint32_t out_len = 0;
+
+    ngx_rtc_sdp_answer_init(&cfg);
+    cfg.ice_ufrag = "srvUfrag";
+    cfg.ice_pwd = "srvPwd";
+    cfg.fingerprint_algo = "sha-256";
+    cfg.fingerprint = "AA:BB:CC:DD";
+    cfg.setup = "passive";
+    cfg.candidate_ip = "192.168.1.10";
+    cfg.candidate_port = 8000u;
+    cfg.video_ssrc = 111u;
+    cfg.audio_ssrc = 222u;
+    cfg.sendonly = -1; /* WHIP: the server receives the publisher's media */
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(
+        ngx_rtc_sdp_generate_answer(&cfg, buf, sizeof(buf), &out_len),
+        NGX_RTC_OK);
+
+    NGX_RTC_TEST_ASSERT(str_contains(buf, "a=recvonly\r\n"));
+    NGX_RTC_TEST_ASSERT(str_contains(buf, "a=rtcp-fb:102 nack pli\r\n"));
+    NGX_RTC_TEST_ASSERT(!str_contains(buf, "a=rtcp-fb:102 nack\r\n"));
+}
+
 NGX_RTC_TEST(sdp_generate_answer_too_small)
 {
     ngx_rtc_sdp_answer_t cfg;

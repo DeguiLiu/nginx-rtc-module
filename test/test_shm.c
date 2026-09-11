@@ -436,3 +436,94 @@ NGX_RTC_TEST(shm_source_survives_release_while_a_session_points_at_it)
     ngx_rtc_shm_expire(&g_ctx, 0);
     NGX_RTC_TEST_ASSERT(true == ngx_queue_empty(&g_ctx.source_list));
 }
+
+/* --- GOP replay ------------------------------------------------------- */
+
+typedef struct {
+    uint16_t  seq[64];
+    uint32_t  n;
+} shm_replay_rec_t;
+
+static ngx_int_t
+shm_replay_record(void *opaque, const uint8_t *rtp, uint32_t len,
+                  uint8_t is_gop_start)
+{
+    shm_replay_rec_t *rec = opaque;
+
+    (void) is_gop_start;
+
+    if (rec->n < 64u && len > 4u) {
+        rec->seq[rec->n] = (uint16_t)(((uint16_t) rtp[2] << 8) | (uint16_t) rtp[3]);
+    }
+    rec->n++;
+    return NGX_OK;
+}
+
+/* A 20-byte packet: real length (the replay only trusts the marker bit on a
+ * packet longer than the RTP header), sequence in bytes 2..3, marker in bit 7
+ * of byte 1. */
+static void
+shm_replay_make_rtp(uint8_t *rtp, uint16_t seq, int marker)
+{
+    ngx_memzero(rtp, 20);
+    rtp[0] = 0x80;
+    rtp[1] = (uint8_t)((0 != marker ? 0x80 : 0x00) | 96);
+    rtp[2] = (uint8_t)(seq >> 8);
+    rtp[3] = (uint8_t)(seq & 0xff);
+}
+
+/*
+ * The replay copies the cached GOP out of shared memory under the slab pool
+ * mutex -- the global lock every worker's slab allocation also takes -- and
+ * then sends it outside. The send loop stops at the marker bit that ends the
+ * keyframe's access unit, so everything past it is sent by nobody; copying it
+ * under the global lock buys a lock hold proportional to the retained window
+ * (up to 1024 * 1508 bytes) to throw all of it away.
+ *
+ * The count returned is what tells the caller whether the cache could serve
+ * this viewer at all, so "copied" and "served" have to be the same number.
+ */
+NGX_RTC_TEST(shm_replay_copies_only_the_keyframe_access_unit)
+{
+    ngx_rtc_shm_source_t *src;
+    shm_replay_rec_t      rec;
+    uint8_t               rtp[20];
+    uint16_t              seq;
+    ngx_int_t             rc;
+    const char           *name = "live/replay";
+    size_t                nlen = ngx_strlen(name);
+
+    shm_test_setup();
+
+    src = ngx_rtc_shm_source_get(&g_ctx, (u_char *) name, nlen);
+    NGX_RTC_TEST_ASSERT(NULL != src);
+
+    /* The ring only fills while a viewer on another worker is subscribed. */
+    src->remote_subscribers = 1;
+
+    /* One IDR access unit: three packets, the marker on the last. */
+    for (seq = 100u; seq < 103u; seq++) {
+        shm_replay_make_rtp(rtp, seq, 102u == seq);
+        ngx_rtc_shm_retransmit_append(&g_ctx, src, rtp, sizeof(rtp),
+                                      100u == seq);
+    }
+
+    /* Then live packets that a GOP replay must leave alone. */
+    for (seq = 103u; seq < 108u; seq++) {
+        shm_replay_make_rtp(rtp, seq, 0);
+        ngx_rtc_shm_retransmit_append(&g_ctx, src, rtp, sizeof(rtp), 0);
+    }
+
+    (void) ngx_memzero(&rec, sizeof(rec));
+    rc = ngx_rtc_shm_retransmit_replay_gop(&g_ctx, (u_char *) name, nlen,
+                                           shm_replay_record, &rec);
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(rc, 3);   /* the access unit, not the window */
+    NGX_RTC_TEST_ASSERT_I64_EQ(rec.n, 3);
+    NGX_RTC_TEST_ASSERT_I64_EQ(rec.seq[0], 100u);
+    NGX_RTC_TEST_ASSERT_I64_EQ(rec.seq[1], 101u);
+    NGX_RTC_TEST_ASSERT_I64_EQ(rec.seq[2], 102u);
+
+    shm_test_teardown(name);
+}
+

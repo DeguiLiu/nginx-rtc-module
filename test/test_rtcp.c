@@ -634,6 +634,44 @@ NGX_RTC_TEST(rtcp_remb_pli_not_misdetected)
     NGX_RTC_TEST_ASSERT_I64_EQ(pkt.has_remb, 0);
 }
 
+/*
+ * The uplink keyframe request. A PLI is a PSFB with FMT=1 and no FCI: common
+ * header, sender SSRC, media SSRC, nothing else (RFC 4585 6.3.1). It has to
+ * survive a round trip through the same parser this module reads feedback with,
+ * otherwise we would be sending something we could not ourselves recognise.
+ */
+NGX_RTC_TEST(rtcp_encode_pli_round_trip)
+{
+    ngx_rtc_rtcp_pkt_t pkt;
+    uint8_t buf[NGX_RTC_RTCP_MAX_PACKET];
+    uint32_t len = 0;
+    uint32_t consumed = 0;
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(
+            ngx_rtc_rtcp_encode_pli(0x11111111u, 0x22222222u, buf, sizeof(buf), &len),
+            NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_I64_EQ(len, 12u);
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(buf, len, &pkt, &consumed),
+                               NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_I64_EQ(consumed, len);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.version, 2);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.type, NGX_RTC_RTCP_PSFB);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.fmt, NGX_RTC_RTCP_FMT_PLI);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt.ssrc, 0x11111111u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt.media_ssrc, 0x22222222u);
+}
+
+NGX_RTC_TEST(rtcp_encode_pli_rejects_small_buffer)
+{
+    uint8_t buf[11];
+    uint32_t len = 0;
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(
+            ngx_rtc_rtcp_encode_pli(1u, 2u, buf, sizeof(buf), &len),
+            NGX_RTC_ERR_TOO_SMALL);
+}
+
 NGX_RTC_TEST(rtcp_remb_ssrc_list_truncated_to_bound)
 {
     ngx_rtc_rtcp_pkt_t pkt;

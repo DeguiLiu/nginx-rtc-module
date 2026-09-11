@@ -9,7 +9,6 @@ CC      := gcc
 LDLIBS  := -lssl -lcrypto
 
 SRC_DIR   := ../src
-BIN       := run_tests
 
 # Where the nginx headers come from.
 #
@@ -73,6 +72,16 @@ endif
 # may still override this (scripts/sanitize-tests.sh keys its own directory by
 # sanitizer).
 BUILD_DIR ?= build/$(if $(NGX_SRC),real,stub)
+
+# The executable is keyed by world for the same reason the objects are, and the
+# reason is not symmetry: with one shared path, alternating worlds leaves the
+# binary from the LAST world newer than the other world's objects, so make sees
+# it up to date and the suite re-runs the previous world's binary. `make` prints
+# the world it *would* compile for while the binary reports the one it was
+# actually built in -- the exact confusion the `header world:` line exists to
+# remove, and it fooled scripts/check-worlds.sh, which reads both lines out of
+# one log. Keying the path makes the two impossible to disagree.
+BIN       := $(BUILD_DIR)/run_tests
 
 # -Iinclude is LAST so that, in an NGX_SRC build, the real nginx headers win the
 # lookup and include/ only serves srtp2/srtp.h, which nginx does not ship.
@@ -162,6 +171,12 @@ test: $(BIN)
 clean:
 	rm -rf build $(BIN)
 
+# The binary used to be ./run_tests directly under this directory, and both
+# READMEs document `make -C test run_tests`. Kept as an alias so that
+# invocation still names a target: it builds the current world's binary. Use
+# `make test` to build and run it.
+run_tests: $(BIN)
+
 -include $(DEPS)
 
-.PHONY: all test clean
+.PHONY: all test clean run_tests

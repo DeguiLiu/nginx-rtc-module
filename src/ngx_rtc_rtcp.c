@@ -696,6 +696,28 @@ int32_t ngx_rtc_rtcp_encode_sdes(uint32_t ssrc, const char *cname,
     return NGX_RTC_OK;
 }
 
+int32_t ngx_rtc_rtcp_encode_pli(uint32_t sender_ssrc, uint32_t media_ssrc,
+                                uint8_t *buf, uint32_t cap, uint32_t *len)
+{
+    /* PLI carries no FCI: header + sender SSRC + media SSRC, 12 octets. */
+    if ((NULL == buf) || (NULL == len))
+    {
+        return NGX_RTC_ERR_INVALID;
+    }
+
+    if (cap < 12u)
+    {
+        return NGX_RTC_ERR_TOO_SMALL;
+    }
+
+    ngx_rtc_rtcp_wr_header(buf, NGX_RTC_RTCP_PSFB, NGX_RTC_RTCP_FMT_PLI, 12u);
+    ngx_rtc_rtcp_wr_u32(buf + 4, sender_ssrc);
+    ngx_rtc_rtcp_wr_u32(buf + 8, media_ssrc);
+
+    *len = 12u;
+    return NGX_RTC_OK;
+}
+
 int32_t ngx_rtc_rtcp_compound_append(uint8_t *compound, uint32_t cap, uint32_t *len,
                                      const uint8_t *pkt, uint32_t pkt_len)
 {

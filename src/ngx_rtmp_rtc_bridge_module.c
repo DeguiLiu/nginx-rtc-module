@@ -255,11 +255,34 @@ ngx_rtmp_rtc_source_name(ngx_rtmp_session_t *s, char *out, size_t cap)
 static void
 ngx_rtmp_rtc_release_publish(ngx_rtmp_session_t *s)
 {
+    ngx_rtmp_live_ctx_t *lctx;
     ngx_rtc_source_t    *src;
     char                 name[NGX_RTC_SOURCE_NAME_MAX];
 
     if (0 != s->auto_pushed
             || NGX_OK != ngx_rtmp_rtc_source_name(s, name, sizeof(name))) {
+        return;
+    }
+
+    /*
+     * Only the publishing session may tear this source down. DISCONNECT fires
+     * for every RTMP session that ends -- an RTMP player, an HTTP-FLV viewer --
+     * and those resolve to the same app/stream as the publisher, so without
+     * this gate a viewer leaving "live/x" destroyed the publisher's AAC->Opus
+     * transcoder: audio_ctx became NULL and every later raw AAC frame was
+     * dropped for the rest of the publish, with no way back short of a
+     * republish. It then went on to release the publish claim and free the
+     * local source.
+     *
+     * ctx->publishing is the discriminator, and it outlives the teardown:
+     * ngx_rtmp_live_close_stream clears ctx->stream->publishing but never
+     * ctx->publishing, so it still reads true for the session that published
+     * and false for a viewer. It is also the exact condition the media path
+     * uses to decide who may publish (see ngx_rtmp_rtc_av), so the two cannot
+     * disagree about which session owns the stream.
+     */
+    lctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_live_module);
+    if (NULL == lctx || 0 == lctx->publishing) {
         return;
     }
 
@@ -1019,8 +1042,7 @@ ngx_rtmp_rtc_audio(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h, ngx_chain_t *in)
             ngx_rtmp_rtc_audio_noctx_warned = 1;
             ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
                           "ngx_rtmp_rtc: raw AAC frame with no transcoder "
-                          "handle, stream=%s; the AAC sequence header was "
-                          "never accepted, so this stream has no audio until "
+                          "handle, stream=%s; this stream has no audio until "
                           "the next republish", name);
         }
         return NGX_OK;

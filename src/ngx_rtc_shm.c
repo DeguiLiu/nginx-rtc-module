@@ -1275,7 +1275,7 @@ ngx_rtc_shm_retransmit_replay_gop(ngx_rtc_shm_ctx_t *ctx, u_char *name,
 
     if (NULL == ctx || NULL == name || 0 == len
             || len >= NGX_RTC_SHM_SOURCE_NAME_MAX || NULL == cb) {
-        return NGX_ERROR;
+        return -1;
     }
 
     /* Allocate the replay buffer outside the lock: the ring capacity is a
@@ -1284,7 +1284,7 @@ ngx_rtc_shm_retransmit_replay_gop(ngx_rtc_shm_ctx_t *ctx, u_char *name,
     buf = ngx_alloc((size_t) NGX_RTC_SHM_RETX_RING_CAP * sizeof(*buf),
                     ngx_cycle->log);
     if (NULL == buf) {
-        return NGX_ERROR;
+        return -1;
     }
 
     t0 = ngx_rtc_shm_now_us();
@@ -1293,7 +1293,7 @@ ngx_rtc_shm_retransmit_replay_gop(ngx_rtc_shm_ctx_t *ctx, u_char *name,
     if (NULL == src || NULL == src->retransmit) {
         ngx_shmtx_unlock(&ctx->pool->mutex);
         ngx_free(buf);
-        return NGX_ERROR;
+        return -1;
     }
     r = src->retransmit;
 
@@ -1313,6 +1313,17 @@ ngx_rtc_shm_retransmit_replay_gop(ngx_rtc_shm_ctx_t *ctx, u_char *name,
         for (i = start; i < r->head; i++) {
             idx = i & (r->cap - 1u);
             buf[n++] = r->slots[idx];
+
+            /* The send loop below stops at the marker bit that closes the
+             * keyframe's access unit. Nothing past that packet is sent by
+             * anybody, so copying the rest under the pool mutex -- the global
+             * lock every worker's slab allocation also takes -- would buy a
+             * lock hold proportional to the whole retained window to throw all
+             * of it away. Stop at the same packet, on the same rule. */
+            if (NGX_RTC_RTP_HEADER_SIZE < buf[n - 1u].len
+                    && 0 != (buf[n - 1u].data[1] & NGX_RTC_RTP_MARKER)) {
+                break;
+            }
         }
     }
     if (0 != n) {
@@ -1364,7 +1375,7 @@ ngx_rtc_shm_retransmit_replay_gop(ngx_rtc_shm_ctx_t *ctx, u_char *name,
     }
 
     ngx_free(buf);
-    return rc;
+    return (ngx_int_t) n;
 }
 
 
