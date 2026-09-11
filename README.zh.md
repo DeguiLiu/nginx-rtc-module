@@ -34,7 +34,7 @@ export NGX_RTC_THIRD=/path/to/third          # include/ + lib/（见 nginx-rtc-e
 host 单测不需要这些：
 
 ```sh
-make -C test run_tests       # 87 个用例
+make -C test run_tests       # 145 个用例
 ```
 
 ## Windows 可移植性

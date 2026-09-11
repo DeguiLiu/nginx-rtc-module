@@ -36,7 +36,7 @@ export NGX_RTC_THIRD=/path/to/third          # include/ + lib/ (see nginx-rtc-ex
 The host unit tests need none of that:
 
 ```sh
-make -C test run_tests       # 87 cases
+make -C test run_tests       # 145 cases
 ```
 
 ## Windows portability
