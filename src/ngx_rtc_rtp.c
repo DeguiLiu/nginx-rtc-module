@@ -36,6 +36,53 @@ static uint32_t ngx_rtc_rtp_build_header(uint8_t *buf, uint16_t seq, uint32_t ti
     return NGX_RTC_RTP_HEADER_SIZE;
 }
 
+/*
+ * Drop CSRCs and the header extension from an incoming RTP packet in place.
+ *
+ * The downlink re-stamps its own transport-wide-cc extension per viewer, so a
+ * publisher's per-hop extensions must not reach the broadcast path: a browser
+ * adds them whenever the answer echoed its extmap, which would both shift the
+ * H264 payload offset used by the STAP-A/FU-A checks and corrupt every packet
+ * the moment this module inserts its own extension at offset 12.
+ */
+int32_t ngx_rtc_rtp_strip_header_ext(uint8_t *rtp, uint32_t *len)
+{
+    uint32_t hdr;
+    uint32_t ext_words;
+
+    if ((NULL == rtp) || (NULL == len) || (*len < NGX_RTC_RTP_HEADER_SIZE))
+    {
+        return NGX_RTC_ERR_PARSE;
+    }
+
+    hdr = NGX_RTC_RTP_HEADER_SIZE + (4u * (uint32_t)(rtp[0] & NGX_RTC_RTP_CSRC_MASK));
+
+    if (0 != (rtp[0] & NGX_RTC_RTP_EXTENSION))
+    {
+        if ((hdr + 4u) > *len)
+        {
+            return NGX_RTC_ERR_PARSE;
+        }
+        ext_words = ((uint32_t)rtp[hdr + 2] << 8) | (uint32_t)rtp[hdr + 3];
+        hdr += 4u + (4u * ext_words);
+    }
+
+    if (hdr > *len)
+    {
+        return NGX_RTC_ERR_PARSE;
+    }
+
+    if (hdr != NGX_RTC_RTP_HEADER_SIZE)
+    {
+        (void)memmove(rtp + NGX_RTC_RTP_HEADER_SIZE, rtp + hdr, *len - hdr);
+        *len = NGX_RTC_RTP_HEADER_SIZE + (*len - hdr);
+    }
+
+    rtp[0] = (uint8_t)(rtp[0] & (uint8_t)~(NGX_RTC_RTP_CSRC_MASK | NGX_RTC_RTP_EXTENSION));
+
+    return NGX_RTC_OK;
+}
+
 int32_t ngx_rtc_rtp_header_write(const ngx_rtc_rtp_header_t *hdr, uint8_t *buf, uint32_t cap)
 {
     if ((NULL == hdr) || (NULL == buf))
