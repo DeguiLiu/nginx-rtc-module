@@ -3,10 +3,10 @@
  *
  * One worker thread owns a stateful ngx_rtc_audio_t and consumes raw AAC frames
  * from an input ring, emitting Opus frames into an output ring. The rings are
- * plain ngx_rtc_ring_t buffers serialised by a single pthread mutex; the wakeup
- * condition variable signals "input available or stop requested". This file
- * uses only C11/POSIX primitives (no nginx API) so the thread never enters
- * nginx data structures.
+ * variable-length byte rings (ngx_rtc_vring_t) serialised by a single pthread
+ * mutex; the wakeup condition variable signals "input available or stop
+ * requested". This file uses only C11/POSIX primitives (no nginx API) so the
+ * thread never enters nginx data structures.
  */
 
 #include "ngx_rtc_audio_worker.h"
@@ -22,15 +22,14 @@
  * more than enough to absorb transcode jitter without unbounded latency. */
 #define NGX_RTC_AUDIO_WORKER_RING_CAP 16u
 
-typedef struct {
-    uint32_t len;
-    uint8_t  data[NGX_RTC_AUDIO_AAC_MAX];
-} ngx_rtc_audio_in_t;
-
-typedef struct {
-    uint32_t len;
-    uint8_t  data[NGX_RTC_AUDIO_OPUS_MAX_PACKET];
-} ngx_rtc_audio_out_t;
+/* Byte-arena capacities: hold RING_CAP entries of the max-size frame (4-byte
+ * length prefix + payload), so the bounded-queue depth matches the fixed-size
+ * ring this replaces. Entries still store only the actual payload bytes, so the
+ * hot-path copy is proportional to real audio size, not the max. */
+#define NGX_RTC_AUDIO_IN_ARENA_BYTES \
+    (NGX_RTC_AUDIO_WORKER_RING_CAP * (4u + NGX_RTC_AUDIO_AAC_MAX))
+#define NGX_RTC_AUDIO_OUT_ARENA_BYTES \
+    (NGX_RTC_AUDIO_WORKER_RING_CAP * (4u + NGX_RTC_AUDIO_OPUS_MAX_PACKET))
 
 struct ngx_rtc_audio_worker_s {
     pthread_t       thread;
@@ -39,8 +38,8 @@ struct ngx_rtc_audio_worker_s {
     int             stop;          /* guarded by lock */
 
     ngx_rtc_audio_t *a;           /* transcoder, owned by the thread */
-    ngx_rtc_ring_t   in;          /* raw AAC frames, worker -> thread */
-    ngx_rtc_ring_t   out;         /* Opus frames, thread -> worker */
+    ngx_rtc_vring_t  in;          /* raw AAC frames, worker -> thread */
+    ngx_rtc_vring_t  out;         /* Opus frames, thread -> worker */
 
     uint32_t         in_dropped;   /* guarded by lock */
     uint32_t         out_dropped;  /* guarded by lock */
@@ -78,13 +77,11 @@ ngx_rtc_audio_worker_create(const uint8_t *asc, uint32_t asc_len,
         goto fail;
     }
 
-    if (ngx_rtc_ring_init(&w->in, NGX_RTC_AUDIO_WORKER_RING_CAP,
-                          sizeof(ngx_rtc_audio_in_t)) != 0) {
+    if (ngx_rtc_vring_init(&w->in, NGX_RTC_AUDIO_IN_ARENA_BYTES) != 0) {
         goto fail;
     }
 
-    if (ngx_rtc_ring_init(&w->out, NGX_RTC_AUDIO_WORKER_RING_CAP,
-                          sizeof(ngx_rtc_audio_out_t)) != 0) {
+    if (ngx_rtc_vring_init(&w->out, NGX_RTC_AUDIO_OUT_ARENA_BYTES) != 0) {
         goto fail;
     }
 
@@ -99,10 +96,10 @@ fail:
         ngx_rtc_audio_destroy(w->a);
     }
     if (NULL != w->out.buf) {
-        ngx_rtc_ring_destroy(&w->out);
+        ngx_rtc_vring_destroy(&w->out);
     }
     if (NULL != w->in.buf) {
-        ngx_rtc_ring_destroy(&w->in);
+        ngx_rtc_vring_destroy(&w->in);
     }
     if (cond_ok) {
         pthread_cond_destroy(&w->cond);
@@ -129,8 +126,8 @@ ngx_rtc_audio_worker_destroy(ngx_rtc_audio_worker_t *w)
     pthread_join(w->thread, NULL);
 
     ngx_rtc_audio_destroy(w->a);
-    ngx_rtc_ring_destroy(&w->in);
-    ngx_rtc_ring_destroy(&w->out);
+    ngx_rtc_vring_destroy(&w->in);
+    ngx_rtc_vring_destroy(&w->out);
     pthread_cond_destroy(&w->cond);
     pthread_mutex_destroy(&w->lock);
 
@@ -141,19 +138,15 @@ int
 ngx_rtc_audio_worker_push(ngx_rtc_audio_worker_t *w, const uint8_t *aac,
                           uint32_t len)
 {
-    ngx_rtc_audio_in_t in;
-    int                rc;
+    int rc;
 
     if (NULL == w || NULL == aac || 0 == len
             || len > NGX_RTC_AUDIO_AAC_MAX) {
         return -1;
     }
 
-    in.len = len;
-    memcpy(in.data, aac, len);
-
     pthread_mutex_lock(&w->lock);
-    rc = ngx_rtc_ring_push(&w->in, &in);
+    rc = ngx_rtc_vring_push(&w->in, aac, len);
     if (0 == rc) {
         pthread_cond_signal(&w->cond);
     } else {
@@ -168,8 +161,9 @@ int
 ngx_rtc_audio_worker_drain(ngx_rtc_audio_worker_t *w,
                            ngx_rtc_audio_frame_fn emit, void *opaque)
 {
-    ngx_rtc_audio_out_t out;
-    int                 drained;
+    uint8_t  opus[NGX_RTC_AUDIO_OPUS_MAX_PACKET];
+    uint32_t opus_len;
+    int      drained;
 
     if (NULL == w || NULL == emit) {
         return 0;
@@ -179,7 +173,7 @@ ngx_rtc_audio_worker_drain(ngx_rtc_audio_worker_t *w,
     for (;;) {
         pthread_mutex_lock(&w->lock);
         {
-            int ok = ngx_rtc_ring_pop(&w->out, &out);
+            int ok = ngx_rtc_vring_pop(&w->out, opus, sizeof(opus), &opus_len);
             if (ok != 0) {
                 pthread_mutex_unlock(&w->lock);
                 break;
@@ -187,7 +181,7 @@ ngx_rtc_audio_worker_drain(ngx_rtc_audio_worker_t *w,
         }
         pthread_mutex_unlock(&w->lock);
 
-        (void)emit(opaque, out.data, out.len);
+        (void)emit(opaque, opus, opus_len);
         drained++;
     }
 
@@ -217,11 +211,12 @@ static void *
 ngx_rtc_audio_worker_main(void *arg)
 {
     ngx_rtc_audio_worker_t *w = arg;
-    ngx_rtc_audio_in_t      in;
+    uint8_t                 aac[NGX_RTC_AUDIO_AAC_MAX];
+    uint32_t                aac_len;
 
     for (;;) {
         pthread_mutex_lock(&w->lock);
-        while (!w->stop && ngx_rtc_ring_empty(&w->in)) {
+        while (0 == w->stop && ngx_rtc_vring_empty(&w->in)) {
             pthread_cond_wait(&w->cond, &w->lock);
         }
 
@@ -230,10 +225,10 @@ ngx_rtc_audio_worker_main(void *arg)
             break;
         }
 
-        (void)ngx_rtc_ring_pop(&w->in, &in);
+        (void)ngx_rtc_vring_pop(&w->in, aac, sizeof(aac), &aac_len);
         pthread_mutex_unlock(&w->lock);
 
-        (void)ngx_rtc_audio_transcode(w->a, in.data, in.len,
+        (void)ngx_rtc_audio_transcode(w->a, aac, aac_len,
                                       ngx_rtc_audio_worker_emit, w);
     }
 
@@ -244,18 +239,14 @@ static int32_t
 ngx_rtc_audio_worker_emit(void *opaque, const uint8_t *opus, uint32_t len)
 {
     ngx_rtc_audio_worker_t *w = opaque;
-    ngx_rtc_audio_out_t     out;
 
     if (NULL == w || NULL == opus || 0 == len
             || len > NGX_RTC_AUDIO_OPUS_MAX_PACKET) {
         return -1;
     }
 
-    out.len = len;
-    memcpy(out.data, opus, len);
-
     pthread_mutex_lock(&w->lock);
-    if (ngx_rtc_ring_push(&w->out, &out) != 0) {
+    if (ngx_rtc_vring_push(&w->out, opus, len) != 0) {
         w->out_dropped++;
     }
     pthread_mutex_unlock(&w->lock);
