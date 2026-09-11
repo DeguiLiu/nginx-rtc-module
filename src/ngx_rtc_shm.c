@@ -1,13 +1,14 @@
-/*
- * ngx_rtc_shm.c - slab-backed source/session registry.
+/**
+ * @file    ngx_rtc_shm.c
+ * @brief   Slab-backed source / session registry, media rings and per-source
+ *          GOP retransmit rings.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
- * Phase 0/1 of multi-worker-shm-design.md, which lives in the deploy repo at
- * nginx-rtc-example/docs/ -- this repo has no docs/ of its own, so the bare
- * filename that used to be here named nothing. Pure data-structure code: it
- * owns no nginx configuration and defines no nginx module. The `rtc_zone`
- * directive and the module identity live in ngx_rtc_core_module.c, which is
- * what lets this file be compiled by the host test suite with plain slab/shmtx
- * stubs (see test/test_shm.c).
+ * Pure data-structure code: it owns no nginx configuration and defines no nginx
+ * module. The `rtc_zone` directive and the module identity live in
+ * ngx_rtc_core_module.c, which is what lets this file be compiled by the host
+ * test suite with plain slab/shmtx stubs (see test/test_shm.c).
  *
  * Lists reuse nginx's intrusive ngx_queue_t (doubly-linked, O(1) remove) rather
  * than hand-rolled singly-linked lists; the source name index reuses

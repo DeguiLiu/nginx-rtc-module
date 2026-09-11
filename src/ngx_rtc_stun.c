@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_stun.c - STUN (RFC 5389) binding request/response, pure C11.
+/**
+ * @file    ngx_rtc_stun.c
+ * @brief   STUN (RFC 5389) binding request/response, pure C11.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Translated from SRS: src/protocol/srs_protocol_rtc_stun.hpp/.cpp
  * (SrsStunPacket::decode / encode_binding_response).

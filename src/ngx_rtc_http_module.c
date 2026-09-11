@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_http_module.c - HTTP signaling: /rtc/v1/play/ offer/answer.
+/**
+ * @file    ngx_rtc_http_module.c
+ * @brief   HTTP signaling: /rtc/v1/play/ offer/answer, WHIP, stats and admin.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Parses the client's SDP offer, creates (or reuses) the RTC source and a
  * player session, then returns an SDP answer with the server ICE/DTLS/SSRC

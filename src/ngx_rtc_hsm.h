@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_hsm.h - Hierarchical State Machine (HSM) engine.
+/**
+ * @file    ngx_rtc_hsm.h
+ * @brief   Hierarchical State Machine (HSM) engine.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * A data-driven hierarchical state machine. States form a parent chain, and an
  * event is first offered to the current state, then bubbles up to its parents

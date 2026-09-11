@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_jitter.c - WHIP uplink reorder buffer (pure C11).
+/**
+ * @file    ngx_rtc_jitter.c
+ * @brief   WHIP uplink reorder buffer (pure C11).
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * See ngx_rtc_jitter.h. The buffer is intentionally tiny and allocation-free:
  * a fixed slot array indexed by seq & (capacity - 1) with a 16-bit modular

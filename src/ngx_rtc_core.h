@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_core.h - shared RTC source / session registry.
+/**
+ * @file    ngx_rtc_core.h
+ * @brief   Shared RTC source / session registry.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * A source holds one live stream's RTP state (SSRC/PT/seq/timestamp, SPS/PPS)
  * and its list of player sessions. A session binds one WebRTC player (ICE +

@@ -1,8 +1,12 @@
-/*
- * ngx_rtc_hsm.c - Hierarchical State Machine (HSM) engine.
+/**
+ * @file    ngx_rtc_hsm.c
+ * @brief   Hierarchical State Machine (HSM) engine.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Pure C11 implementation; depends only on ngx_rtc_hsm.h and the C standard
- * library. Ported from the lightweight HSM framework by Andreas Misje.
+ * library. Ported from the lightweight HSM framework by Andreas Misje; the
+ * upstream MIT notice follows.
  */
 
 /*

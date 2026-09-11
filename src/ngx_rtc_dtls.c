@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_dtls.c - DTLS (RFC 5764) server side + SRTP key export, pure C11.
+/**
+ * @file    ngx_rtc_dtls.c
+ * @brief   DTLS (RFC 5764) server side + SRTP key export, pure C11.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Translated from SRS: src/app/srs_app_rtc_dtls.cpp
  * (SrsDtlsCertificate::initialize / srs_build_dtls_ctx / SrsDtlsImpl).

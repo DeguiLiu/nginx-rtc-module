@@ -1,5 +1,8 @@
-/*
- * ngx_rtmp_rtc_bridge_module.c - RTMP -> RTC bridge.
+/**
+ * @file    ngx_rtmp_rtc_bridge_module.c
+ * @brief   RTMP to RTC bridge.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Registers as a raw RTMP audio/video handler (same pattern as
  * ngx_rtmp_gop_cache_module). For the publishing session it parses the FLV

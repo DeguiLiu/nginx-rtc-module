@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_audio_worker.c - thread-isolated AAC -> Opus transcoder.
+/**
+ * @file    ngx_rtc_audio_worker.c
+ * @brief   Thread-isolated AAC to Opus transcoder.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * One worker thread owns a stateful ngx_rtc_audio_t and consumes raw AAC frames
  * from an input ring, emitting Opus frames into an output ring. The rings are

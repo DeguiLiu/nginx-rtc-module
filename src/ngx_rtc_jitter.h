@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_jitter.h - WHIP uplink reorder buffer (pure C11).
+/**
+ * @file    ngx_rtc_jitter.h
+ * @brief   WHIP uplink reorder buffer (pure C11).
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * The WHIP media path receives SRTP-decrypted RTP directly from the socket and
  * would otherwise broadcast packets in arrival order. On a lossy WAN this can

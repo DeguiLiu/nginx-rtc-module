@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_session_fsm.c - session lifecycle state machine (pure state tracking).
+/**
+ * @file    ngx_rtc_session_fsm.c
+ * @brief   Session lifecycle state machine (pure state tracking).
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Tracks the session lifecycle NEW -> ICE_BOUND -> DTLS_HANDSHAKE ->
  * SRTP_READY -> CLOSED. CLOSE/TIMEOUT/RTCP_BYE are handled at the root so the
