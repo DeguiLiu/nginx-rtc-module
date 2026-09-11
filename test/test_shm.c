@@ -3,12 +3,19 @@
  *
  * This unit was deliberately left out of the host build until now: it locks a
  * real shm mutex and allocates from a slab pool, neither of which exists here.
- * The stubs in test/include/ngx_core.h map the mutex onto a pthread mutex and
- * the slab onto malloc/free, which is exactly what the sanitizer build needs --
- * a double free or a leak in this file is then caught by ASan instead of only
- * by reading the code. That gap is not hypothetical: the eventfd leak fixed in
- * ngx_rtc_core_init_module() lives in this file and was found by review, not by
- * a test.
+ *
+ * The slab stays malloc-backed in both header worlds -- one allocation per
+ * object instead of a sub-allocation of one zone -- and that is the point of
+ * not linking ngx_slab.c. A real slab hands the sanitizer a single large
+ * allocation, under which a leak or an overflow inside it is invisible; with
+ * malloc per object, LeakSanitizer and ASan keep per-object granularity. That
+ * gap is not hypothetical: the eventfd leak fixed in ngx_rtc_core_init_module()
+ * lives in this file, and the source leak the reaper covers was caught here.
+ *
+ * The mutex is the part that differs. Against the real headers the pool carries
+ * nginx's own ngx_shmtx_t and ngx_shmtx_lock() spins on mtx->lock, so setup has
+ * to call ngx_shmtx_create() -- a zeroed struct leaves that pointer NULL. Only
+ * the Windows build, which uses test/include/, maps it onto a pthread mutex.
  *
  * Scope: the source/session registry lifecycle, which is where the slab
  * allocations and the ownership transitions live. The nginx-facing entry points
