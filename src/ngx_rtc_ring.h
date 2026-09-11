@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_ring.h - bounded single-consumer fixed-size ring buffer (pure C11).
+/**
+ * @file    ngx_rtc_ring.h
+ * @brief   Bounded single-consumer fixed-size ring buffer (pure C11).
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Stores capacity fixed-size elements and exposes FIFO push/pop with monotonic
  * head/tail counters. It is not internally synchronised: a caller that shares a

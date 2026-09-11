@@ -1,5 +1,13 @@
-/*
- * ngx_rtc_ring.c - bounded fixed-size ring buffer (see ngx_rtc_ring.h).
+/**
+ * @file    ngx_rtc_ring.c
+ * @brief   Bounded single-consumer fixed-size ring buffer (see ngx_rtc_ring.h).
+ * @version 0.5.0
+ * @license MIT, see LICENSE
+ *
+ * Owns the slot storage and the head/tail counters declared in the header.
+ * ngx_rtc_ring_init rounds the requested capacity up to a power of two so the
+ * index wrap is a mask, and allocates the slot array with malloc - the ring is
+ * deliberately outside the nginx pool so a pthread may use it.
  */
 
 #include "ngx_rtc_ring.h"

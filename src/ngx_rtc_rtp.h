@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_rtp.h - H264 NALU to RTP packetization (RFC 6184)
+/**
+ * @file    ngx_rtc_rtp.h
+ * @brief   H264 NALU to RTP packetization (RFC 6184).
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Pure C11 translation of SRS 6.0:
  *   src/kernel/srs_kernel_rtc_rtp.hpp  (constants kStapA/kFuA/kStart/kEnd/kNalTypeMask,

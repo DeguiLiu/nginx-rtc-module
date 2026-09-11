@@ -1,6 +1,9 @@
-/*
- * ngx_rtc_avsync.h - A/V sync: map a media RTP timestamp onto the NTP wall
- * clock through the RTCP Sender Report (SR) anchor.
+/**
+ * @file    ngx_rtc_avsync.h
+ * @brief   Map a media RTP timestamp onto the NTP wall clock via the RTCP
+ *          Sender Report anchor.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Pure C11 translation of SRS 6.0 SrsRtcRecvTrack:
  *   update_send_report_time (SrsRtcPublishStream::on_rtcp_sr) -> ngx_rtc_avsync_on_sr
