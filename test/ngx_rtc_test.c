@@ -4,6 +4,21 @@
 
 #include "ngx_rtc_test.h"
 
+/*
+ * Which nginx headers this run was compiled against.
+ *
+ * The two worlds are different struct layouts and different macros, so a green
+ * run only ever says "these headers are fine" -- and the make output that named
+ * the world has long scrolled away by the time a result gets quoted. A log that
+ * does not carry the world with it is how a stub-only 145/145 came to be read as
+ * covering nginx's own headers.
+ */
+#ifdef NGX_RTC_REAL_NGINX_HEADERS
+#define NGX_RTC_HEADER_WORLD "real (nginx's own headers)"
+#else
+#define NGX_RTC_HEADER_WORLD "stub (test/include)"
+#endif
+
 #define NGX_RTC_TEST_MAX_CASES 256
 
 static ngx_rtc_test_entry_t g_entries[NGX_RTC_TEST_MAX_CASES];
@@ -98,6 +113,7 @@ int ngx_rtc_test_run_all(void)
     }
 
     (void)printf("\n==== ngx-rtc host unit tests ====\n");
+    (void)printf("header world: %s\n", NGX_RTC_HEADER_WORLD);
     (void)printf("TOTAL: %d  PASS: %d  FAIL: %d\n", total, passed, failed);
 
     /*
