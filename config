@@ -1,6 +1,8 @@
 # nginx addon: self-developed WebRTC RTC module.
-# Registers three nginx modules (RTMP bridge + HTTP signaling + stream UDP)
-# and compiles the pure-C RTC core (rtp/sdp/stun/dtls/srtp/registry).
+# Registers four nginx modules -- core (the rtc_zone registry), the RTMP
+# bridge, HTTP signaling and the stream UDP media plane -- and compiles the
+# pure-C RTC core (rtp/sdp/rtcp/stun/dtls/srtp/hsm/ring/jitter/avsync/audio/
+# registry).
 ngx_addon_name=ngx_rtc_module
 
 RTC_CORE_SRCS="                                                   \
