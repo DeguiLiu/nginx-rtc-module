@@ -88,14 +88,53 @@ int ngx_rtc_source_gop_ready(const ngx_rtc_source_t *src)
 
 ### 已知代价
 
-- **`replay_gop` 回放期分配堆缓冲**:回放在 pool 锁内把整段 GOP 拷到堆缓冲(≤ cap×slot ≈
-  1.5 MB),放锁后逐包发送;慢 viewer 的阻塞 `sendto` 不阻塞发布者 `append`。代价是每次回放
-  一次堆分配,但只发生在 fast-start/PLI(低频),且缓冲在函数内释放。
+- **`replay_gop` 回放期分配堆缓冲**:堆缓冲在 pool 锁外分配(≤ cap×slot ≈ 1.5 MB),锁内把
+  整段 GOP 拷出,放锁后逐包发送;慢 viewer 的阻塞 `sendto` 不阻塞发布者 `append`。代价是每次
+  回放一次堆分配,但只发生在 fast-start/PLI(低频),且缓冲在函数内释放。
 - **分配失败按包重试**:zone 耗尽时 `append` 对每包重试一次 lazy alloc 并持 pool 锁,失败
   计入 `retransmit_alloc_failed`(stats 可见)。保留重试是权衡:zone 空间会随其他流结束而
   释放,环可自愈;日志只在首次失败时打一条,防止 zone 饥饿时按包速率刷 error log。
 - **首个跨 worker viewer 不即时 fast-start**:append 按 `remote_subscribers > 0` 门控,该
   viewer 订阅前环为空,首帧要等下一个 IDR(≤1 GOP);后续跨 worker viewer 环已预热,不受影响。
+
+以下性能/内存开放项来自 `docs/archive/srs-memory-scheduling-optimization.md` §4 的 2026-09-11
+状态复核,行号已按当前 `src/` 重新核实;已落地的部分一并注明,未落地前不应视为已解决。
+
+- **4.1(P0,PARTIAL)重传环共用 slab 全局锁**:单写者无锁发布与延迟释放均未落地——`head`/
+  `count`/`gop_start` 仍是普通 `ngx_uint_t`、由 `pool->mutex` 保护(`src/ngx_rtc_shm.h:72-74`),
+  释放侧仍在同一把锁下 `ngx_slab_free_locked`(`src/ngx_rtc_shm.c:164`、`src/ngx_rtc_shm.c:994`),
+  无读者计数或 epoch。已落地部分:`append` 接收发布者缓存的 `shm_src` 指针、锁内不再按名查
+  rbtree(`src/ngx_rtc_shm.c:1133`、`src/ngx_rtc_shm.h:472-475`),`0 == src->remote_subscribers`
+  时完全跳过锁(`src/ngx_rtc_shm.c:1153`),回放的 ~1.5MB 缓冲分配已移出锁外
+  (`src/ngx_rtc_shm.c:1280-1286`)。核心现象未变:有跨 worker viewer 时每个视频包仍持全局锁
+  memcpy,回放仍在锁内整段拷贝。原评审据自身算术估计 `append` 持锁占比约 0.004%、真正值得处理
+  的是回放约 100µs,该量级仍待实测(stats 已埋点 `total_retx_lock.append_locked`/`append_us`
+  与 `replay_count`/`replay_slots`/`replay_us`)。
+- **4.2(P1,OPEN)同 worker 观众在摄入口时间线上**:广播对同 worker 观众仍内联
+  `ngx_rtc_session_send_rtp`(`src/ngx_rtmp_rtc_bridge_module.c:1127-1133`);DTLS 完成时的
+  GOP 回放仍是同步循环(`src/ngx_rtc_core.c:826-880`),未采用 0ms 定时器分片。该函数注释明确
+  反对分片:定时器会让旧 GOP 包与直播包交错,RTP 序号乱序反而破坏解码(`src/ngx_rtc_core.c:842`),
+  故原「方案 2」与现有实现形状的兼容性需重评。
+- **4.3(P1,OPEN)每次回放分配 1.5MB**:`ngx_rtc_shm_retransmit_replay_gop` 仍每次
+  `ngx_alloc(NGX_RTC_SHM_RETX_RING_CAP * sizeof(slot))`(`src/ngx_rtc_shm.c:1283-1284`),
+  `ngx_free` 在 `src/ngx_rtc_shm.c:1365`;分配已在锁外(`src/ngx_rtc_shm.c:1290` 才加锁),
+  但未改为 per-worker 复用缓冲。若 4.1 按版本号发布 + 无锁读实现,这块中转缓冲会整体消失,
+  故 4.3 应与 4.1 合并处理。
+- **4.4(P2,OPEN)GOP 环与 shm 环双份预留**:两份缓存都在——进程内 `src->gop`
+  (`src/ngx_rtc_core.h:388`,默认 `NGX_RTC_GOP_RING_CAP=2048`,`src/ngx_rtc_core.h:164`)与
+  shm `src->retransmit`(`src/ngx_rtc_shm.h:127`,`NGX_RTC_SHM_RETX_RING_CAP=1024`,
+  `src/ngx_rtc_shm.h:60`),容量未下调或自适应。本地环承担同 worker 无锁 NACK/PLI 快路径,
+  不能简单删除,需与 4.2 一起决策。
+- **4.5(P2,OPEN)跨 worker 扇出静默截断**:订阅快照仍按插入序遍历、`n < max` 提前退出,无 warn
+  与计数器(`src/ngx_rtc_shm.c:1039-1041`);另有同源静默截断:每 worker 最多携带
+  `NGX_RTC_RING_MAX_SESSIONS=64` 个 session id(`src/ngx_rtc_shm.h:61`、
+  `src/ngx_rtmp_rtc_bridge_module.c:1142-1145`)。
+- **4.6(P3,OPEN)eventfd 唤醒放大**:仍对每个目标 worker 每包写一次 eventfd
+  (`src/ngx_rtmp_rtc_bridge_module.c:1154-1163`),无「空转非空」判断。
+- **4.7(P3,PARTIAL)会话的「两份真相」**:契约「进程内 FSM 只回答本进程,全局就绪看 shm
+  `srtp_ready`」已固化(见 `docs/ARCHITECTURE.md` 会话状态机条目),shm 会话骨架发布了只读
+  `state` 字段供 stats 读取(`src/ngx_rtc_shm.h:176-183`);每进程一份 FSM 与 shm 骨架并存的
+  「两份真相」是既定设计,结构未改。
 
 ## 内存占用
 
@@ -110,7 +149,7 @@ int ngx_rtc_source_gop_ready(const ngx_rtc_source_t *src)
 
 ## 实现状态
 
-已落地(全部编译通过,host 87/87,e2e PASS):
+已落地(全部编译通过,host 145/145,e2e PASS):
 
 - `src/ngx_rtc_core.h/.c`:删除 `sess->rtx`/`rtx_gen` 与 5 个 rtx 函数;新增
   `ngx_rtc_session_retransmit` / `ngx_rtc_session_retransmit_send` /
@@ -118,12 +157,20 @@ int ngx_rtc_source_gop_ready(const ngx_rtc_source_t *src)
   `nack_seen[NGX_RTC_NACK_BUDGET]`。
 - `src/ngx_rtc_shm.h/.c`:新增 per-source 重传环,四个 API
   `retransmit_reset/append/get/replay_gop`,删除 `gop_snapshot_*`;环槽读写/释放统一在 slab
-  pool 锁下(修 use-after-free),三处 free 路径(`session_free_locked`/`expire`/`source_remove`)
-  补 free 重传环(修泄漏);append 以 `remote_subscribers` 门控(修单 viewer 1→2 memcpy 回归)。
+  pool 锁下(修 use-after-free);`append` 直接接收发布者缓存的 `shm_src` 指针,锁内不再按名查
+  rbtree,并以 `remote_subscribers` 门控(无跨 worker viewer 时完全跳过 pool 锁,修单 viewer
+  1→2 memcpy 回归);重传环只由 `ngx_rtc_shm_expire_locked` 与 `ngx_rtc_shm_source_remove`
+  两处 free,两处都先过 `ngx_rtc_shm_source_referenced_locked()`(`session_free_locked` 不再
+  free source,只补 `expires` 宽限)——既修泄漏也修跨 worker 裸指针的 use-after-free。
+- `src/ngx_rtc_shm.c`:reaper 增加发布者心跳判定。发布源的 `publisher_seen_ms` 静默超过
+  `NGX_RTC_SHM_PUBLISH_GRACE_MS`(10000ms)即视为发布者已死并回收;崩溃的 worker 不会执行
+  `ngx_rtc_publish_release()`,否则该 source 及其 ~1.5MB 重传环会被钉到整个 zone 生命周期。
 - `src/ngx_rtmp_rtc_bridge_module.c`:broadcast 去 `rtx_push`;emit 镜像到 shm 环;
   AVC 序列头重置源环 + shm 环(防重推流 seq 回绕误命中)。
 - `src/ngx_rtc_stream_module.c`:NACK/PLI/fast-start 统一走 `ngx_rtc_stream_retransmit` /
-  `ngx_rtc_stream_replay_gop`;WHIP 收包补 `src->gop` push;drain/close 去 rtx 残留。
+  `ngx_rtc_stream_replay_gop`;WHIP 收包补 `src->gop` push,并经
+  `ngx_rtc_stream_shm_source()` 缓存 `shm_src`(每 `NGX_RTC_SHM_SYNC_MS` 复核一次,不再每包
+  按名重解析);drain/close 去 rtx 残留。
 - `src/ngx_rtc_core.h`:源 `video_body`/`audio_body` 用匿名 union 复用一块 scratch
   (pipeline 数据结构复用)。
 - `src/ngx_rtc_http_module.c`:stats 新增 `retransmit_alloc_failed` 计数。
@@ -139,11 +186,13 @@ int ngx_rtc_source_gop_ready(const ngx_rtc_source_t *src)
 
 ## 验证
 
-- **host 单测**:`make -C test test` 全绿 91/91;`-Wall -Wextra -Werror` 无告警。
+- **host 单测**:`make -C test test` 全绿 145/145;`-Wall -Wextra -Werror` 无告警。
 - **reset 后新流首包单测**:`ring_reset_serves_only_new_generation`(test_rtc_core.c)。
   老代包推至 seq 回绕点、按重推流语义 reset(count/gop_start 清零)、再推新生代,断言
   老 seq 全 miss、新 seq 命中、replay 只出新生代 GOP。shm `retransmit_reset`
-  (head/count/gop_start 清零)与其语义一致;shm 层不进 host 构建,由 e2e 覆盖。
+  (head/count/gop_start 清零)与其语义一致。shm 层已进 host 构建(`test/Makefile` 编译
+  `ngx_rtc_shm.c`):`test_shm.c` 覆盖注册表、源/会话生命周期、reaper 心跳回收与
+  `referenced_locked` 拒释放;shm 重传环的 append/get/replay 仍由 e2e 覆盖。
 - **全量编译**:`NGX_RTC_MODULE_SRC=<repo> NGX_RTC_THIRD=<third> scripts/build-openresty.sh`
   0 error。
 - **e2e**:`./run.sh nginx` + `./run.sh keep-push` + `./run.sh verify`,断言首帧 < 1s、

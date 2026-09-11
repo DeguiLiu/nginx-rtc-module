@@ -12,7 +12,8 @@
 3. **全仓只有一处真正需要状态机:源发布权(publish ownership)**。但它**不该用 HSM 引擎**
    —— 它要解决的是「两个副本 + 一把锁的原子更新」,不是层级与冒泡。用普通转移函数。
 4. shm session 骨架(5 状态)排第二,但转移已全部集中在 `ngx_rtc_shm.c` 内,收益小得多,
-   **建议不动**。
+   **建议不动**。本轮只给它加了一个只读 `state` 字节供 `/rtc/v1/stats` 观测;转移判定仍由
+   `owner_slot` / `srtp_ready` / `close_requested` / `expires` 四个字段驱动,状态收敛方案未动。
 5. DTLS / avsync / jitter 那几处 2-3 状态的标志位**不该**上状态机,属于过度设计。
 
 ## 1 判据
@@ -38,17 +39,17 @@
 ### 2.1 已形式化的部分
 
 `ngx_rtc_session_fsm`(5 状态:NEW → ICE_BOUND → DTLS_HANDSHAKE → SRTP_READY → CLOSED)。
-驱动点 15 处,分布在 4 个文件:
+驱动/查询点 13 处,分布在 4 个文件:
 
 | 文件 | 驱动点 |
 | --- | --- |
-| `ngx_rtc_stream_module.c` | init 440、STUN 绑定 557、DTLS 首包 607、RTCP 654、SRTP 799、握手完成 1108、关闭 1219、回收扫描 1444 |
-| `ngx_rtc_http_module.c` | 会话创建 700、WHIP 创建 1322 |
-| `ngx_rtc_core.c` | 未处理事件上报 335、发送路径就绪判定 476 |
-| `ngx_rtmp_rtc_bridge_module.c` | SR 上报 376 |
+| `ngx_rtc_stream_module.c` | init 439、STUN 绑定 600、DTLS 首包 654、RTCP 715、SRTP 860、握手完成 1228、关闭 1338、回收扫描 1548 |
+| `ngx_rtc_http_module.c` | 会话创建 802、WHIP 创建 1414 |
+| `ngx_rtc_core.c` | 未处理事件上报 347、发送路径就绪判定 535 |
+| `ngx_rtmp_rtc_bridge_module.c` | SR 上报 383 |
 
 反面确认(全仓扫描):**除了这个 FSM,不存在任何 `switch (state)` / `if (state == X)` 的
-状态推进代码**。仅有的两个 switch 是 `ngx_rtc_rtcp.c:378`(按 RTCP 包类型分派)与
+状态推进代码**。仅有的两个 switch 是 `ngx_rtc_rtcp.c:416`(按 RTCP 包类型分派)与
 `ngx_rtc_sdp.c:682`(按 SDP 行首字符分派),都不是状态机。也没有 `stage` / `sub_stage` /
 `phase` 这类字段。也就是说,本仓**没有藏起来的、正在腐坏的状态机**。
 
@@ -56,8 +57,8 @@
 
 | # | 状态承载 | 状态数 | 写入点 | 作用域 | 跨 worker 共享 | 判定 |
 | --- | --- | --- | --- | --- | --- | --- |
-| A | 源发布权 `publisher_kind` + `publishing` | 3 | **5(本地)+ 2(shm)** | per-source | **是** | **该做** |
-| B | shm session 骨架 `owner_slot`/`srtp_ready`/`close_requested`/`expires` | 5 | 10(9 处已在 shm.c 内) | per-session | **是** | 可选,收益小 |
+| A | 源发布权 `publisher_kind` + `publishing` | 3 | **3 函数(`ngx_rtc_shm.c`)+ 2(shm)** | per-source | **是** | **该做** |
+| B | shm session 骨架 `owner_slot`/`srtp_ready`/`close_requested`/`expires`(+只读 `state`) | 5 | 集中在 `ngx_rtc_shm.c` | per-session | **是** | 可选,收益小 |
 | C | DTLS `handshake_done` | 2 | 3 | per-session | 否 | 不做 |
 | D | avsync `has_anchor`/`has_slope` | 3 | 3 | per-source/track | 否 | 不做 |
 | E | jitter `initialized` | 2 | 2 | per-source | 否 | 不做 |
@@ -71,10 +72,10 @@
   「该做什么」。真正持有 nginx 连接与 DTLS/SRTP 上下文的 `ngx_rtc_stream_module.c` 才是
   执行者。这样避免了「状态机里存指针 → 生命周期与连接脱钩」这一类最难查的缺陷。
 - **守卫承载了真实的判定责任,不是装饰。** `s_session_dtls_guard()`
-  (`ngx_rtc_session_fsm.c:68-85`)要求「只有长度与类型都像 DTLS 记录的报文才能建立 DTLS
+  (`ngx_rtc_session_fsm.c:69-85`)要求「只有长度与类型都像 DTLS 记录的报文才能建立 DTLS
   上下文」。这挡住了一个真实场景:UDP 分派只看首字节做的启发式判断,可能把噪声误判成
   DTLS。守卫把它补成了长度+范围检查。
-- **闸门语义使「只建立一次」成为结构性保证。** `ngx_rtc_stream_module.c:600` 用
+- **闸门语义使「只建立一次」成为结构性保证。** `ngx_rtc_stream_module.c:647` 用
   `dtls_pending()` 包住 DTLS 上下文的创建,转移一旦发生该谓词即为假,所以重复到达的
   DTLS 记录不会重复创建上下文。这是状态机真正在挣饭钱的地方。
 - **根状态收敛了关闭类事件。** CLOSE / TIMEOUT / RTCP_BYE 挂在根上,任何状态都能关闭;
@@ -97,15 +98,16 @@
 **它确实是状态机。** 三个状态(NONE / RTMP / WHIP),两个事件(claim / release),且有
 必须拒绝的非法转移:
 
-- 「另一种协议已持有该名字时再 claim」→ `NGX_BUSY`(`ngx_rtc_shm.c:933`);
-- 「非持有者 release」→ 忽略(`ngx_rtc_shm.c:961`)。
+- 「另一种协议已持有该名字时再 claim」→ `NGX_BUSY`(`ngx_rtc_shm.c:645-647`);
+- 「非持有者 release」→ 忽略(`ngx_rtc_shm.c:677-681`)。
 
 **shm 那一半已经是正确的状态机了。** `ngx_rtc_shm_source_try_publish` /
 `release_publish` 在 `pool->mutex` 内完成状态转移,守卫条件正确,`publishing` 与
 `publisher_kind` 同步更新。这一半不该动。
 
 **真正的问题在进程本地的镜像。** `ngx_rtc_source_t` 上有第二份
-`publisher_kind` / `publishing`,由 5 处互不相干的代码手写:
+`publisher_kind` / `publishing`,由 5 处互不相干的代码手写(下表为收敛前的旧写入点,
+行号为当时版本):
 
 | 位置 | 做什么 |
 | --- | --- |
@@ -161,11 +163,17 @@ HSM 引擎对「两个副本 + 一把锁」一无所知,而这恰恰是这里唯
 状态链 `UNBOUND(owner_slot == -1) → BOUND → READY(srtp_ready) → CLOSE_REQUESTED →
 FREED` 由 4 个字段正交编码:`owner_slot` / `srtp_ready` / `close_requested` / `expires`。
 2×2×2 共 8 种组合里合法的大概只有 4-5 种,非法组合无人阻挡 —— 这是典型的「该用枚举」。
-`owner_slot` 是 `ngx_int_t`,`-1` 哨兵用法正确(`ngx_rtc_shm.h:124`),没有类型错误。
+`owner_slot` 是 `ngx_int_t`,`-1` 哨兵用法正确(`ngx_rtc_shm.h:161`),没有类型错误。
+
+本轮另加了一个只读 `state` 字节(`ngx_rtc_shm.h:175-183`)供 `/rtc/v1/stats` 观测:
+只有拥有该 UDP 会话的 worker 能写(`ngx_rtc_shm_session_set_state()` 接受 `owner_slot == -1`
+或与本 worker slot 相等),CLOSED 从不写入(关闭即释放骨架)。它不参与转移判定,转移仍由
+上面 4 个字段负责,所以下面「枚举化」的判断不变。
 
 但**转移点几乎全部已在 `ngx_rtc_shm.c` 内部**(`session_add` / `bind` / `activate` /
 `remove_if_owner` / `request_close` / `expire_locked` / `session_free_locked`),
-外部只有 5 个驱动调用。集中度已经很高,收敛成一个枚举主要是可读性收益,不是缺陷修复。
+外部只有 5 个驱动调用(`set_state` 只写上面那个观测字节,不驱动转移)。集中度已经很高,
+收敛成一个枚举主要是可读性收益,不是缺陷修复。
 **结论:等它真的出一次「非法组合」缺陷再改**,现在改属于推测性重构。
 
 顺带记录一处不一致以便将来处理:`owner_slot` 与 `publishing` 是裸整数(靠 `pool->mutex`
@@ -228,11 +236,13 @@ FAIL test_hsm.c:265: g_log ("Au") != "u" ("u")
 TOTAL: 114  PASS: 113  FAIL: 1
 ```
 
-`"Au"` 中的 `A` 就是「退出动作已经跑了」的直接证据。修复后:
+`"Au"` 中的 `A` 就是「退出动作已经跑了」的直接证据。修复后当次运行:
 
 ```
 TOTAL: 114  PASS: 114  FAIL: 0
 ```
+
+该用例此后一直保留;当前 host 套件已增至 `TOTAL: 145  PASS: 145  FAIL: 0`。
 
 ## 7 结论与建议次序
 
@@ -251,7 +261,7 @@ TOTAL: 114  PASS: 114  FAIL: 0
 | 写入口收敛 | `grep 'publisher_kind *=\|publishing *='` 在 `ngx_rtc_core.h` 的
 `ngx_rtc_source_t` 上只剩 `ngx_rtc_shm.c` 的三个函数(shm source 与 shm session 上的同名字段不在此列) |
 | 编译 | `rc=0`,改动文件零告警(仅有 `ngx_rtc_audio.c` 既存的 ffmpeg 弃用告警) |
-| host 单测 | 114 / 114 |
+| host 单测 | 145 / 145 |
 | `nginx -t` | 配置解析通过 |
 | **e2e** | **未跑。**规范 §11:胶水层改动 host 单测覆盖不到,必须 e2e。归属仲裁的
 三条路径都只在运行期可见,见下 |
