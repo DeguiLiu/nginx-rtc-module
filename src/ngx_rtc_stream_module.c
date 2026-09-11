@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_stream_module.c - nginx stream (UDP) module: STUN + DTLS + SRTP.
+/**
+ * @file    ngx_rtc_stream_module.c
+ * @brief   nginx stream (UDP) module: STUN + DTLS + SRTP media plane.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Handles the media plane of WebRTC playback over UDP 8000:
  *   - STUN BindingRequest -> BindingResponse (matches session by ICE ufrag)

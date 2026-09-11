@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_audio.c - AAC -> Opus audio transcoder (pure C11).
+/**
+ * @file    ngx_rtc_audio.c
+ * @brief   AAC to Opus audio transcoder (pure C11).
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * See ngx_rtc_audio.h for the pipeline. The FFmpeg side follows SRS 6.0
  * SrsAudioTranscoder (init_dec / init_enc / init_swr / init_fifo /

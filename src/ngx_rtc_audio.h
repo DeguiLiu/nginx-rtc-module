@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_audio.h - AAC -> Opus audio transcoder (pure C11).
+/**
+ * @file    ngx_rtc_audio.h
+ * @brief   AAC to Opus audio transcoder (pure C11).
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Translation of SRS 6.0 SrsAudioTranscoder:
  *   src/app/srs_app_rtc_codec.cpp  (initialize / transcode / decode_and_resample / encode)

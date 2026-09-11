@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_session_fsm.h - session lifecycle state machine.
+/**
+ * @file    ngx_rtc_session_fsm.h
+ * @brief   Session lifecycle state machine (pure state tracking).
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Single-responsibility state machine: this HSM tracks the session lifecycle
  * (NEW -> ICE_BOUND -> DTLS_HANDSHAKE -> SRTP_READY -> CLOSED) and answers

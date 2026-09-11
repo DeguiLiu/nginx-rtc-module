@@ -1,10 +1,13 @@
-/*
- * ngx_rtc_glue.h - cross-module glue entry points.
+/**
+ * @file    ngx_rtc_glue.h
+ * @brief   Cross-module glue entry points.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
- * nginx only invokes module init_process for core/http/stream module types; an
- * NGX_RTMP_MODULE's init_process is never run, so a periodic timer living in a
- * rtmp module would never fire. Entry points here are called from a module
- * whose init_process nginx does run (the http module).
+ * The periodic RTCP sender-report timer lives in the rtmp bridge module, but its
+ * starter is reached through here so the http module can call it from its own
+ * init_process. Both handlers do run - nginx walks cycle->modules[] with no
+ * module-type filter - and the duplicate call only re-arms the same event.
  */
 
 #ifndef NGX_RTC_GLUE_H

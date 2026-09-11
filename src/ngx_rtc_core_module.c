@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_core_module.c - the `rtc_zone` directive and the core module identity.
+/**
+ * @file    ngx_rtc_core_module.c
+ * @brief   The `rtc_zone` directive and the core module identity.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Split out of ngx_rtc_shm.c, which carried three unrelated jobs: the
  * slab-backed source/session registry, this module's configuration parsing, and

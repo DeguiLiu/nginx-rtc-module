@@ -1,6 +1,9 @@
-/*
- * ngx_rtc_core.c - RTC source / session registry
- *                  + GOP ring (plaintext RTP cache) helpers.
+/**
+ * @file    ngx_rtc_core.c
+ * @brief   RTC source / session registry plus GOP ring (plaintext RTP cache)
+ *          helpers.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Registries reuse nginx data structures instead of hand-rolled singly-linked
  * lists:

@@ -1,15 +1,21 @@
-/*
- * ngx_rtc_shm.h - shared-memory skeleton for cross-worker RTC metadata.
+/**
+ * @file    ngx_rtc_shm.h
+ * @brief   Shared-memory registry for cross-worker RTC metadata.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
- * Phase 0 of multi-worker-shm-design.md, which lives in the deploy repo at
- * nginx-rtc-example/docs/ -- this repo has no docs/ of its own. A `rtc_zone`
- * directive plus a slab-backed source / session registry. Only value types and
- * pointers to other shm allocations live in this zone; DTLS/SRTP/connection/
- * audio handles stay in per-worker process memory and are attached by the later
- * phases.
+ * A `rtc_zone` directive plus a slab-backed source / session registry, the
+ * per-worker media rings and the per-source GOP retransmit rings. Only value
+ * types and pointers to other shm allocations live in this zone; DTLS/SRTP/
+ * connection/audio handles stay in per-worker process memory and are attached
+ * when a worker first touches a session. See docs/ARCHITECTURE.md.
  *
- * The pure-C protocol core (rtp/sdp/stun/dtls/srtp) remains nginx-free; this
- * header is nginx-only and is not compiled into the host unit tests.
+ * The registry half of ngx_rtc_shm.c is plain data-structure code and does run
+ * in the host unit tests (test/test_shm.c, over slab/shmtx stubs); what needs
+ * the nginx config system, and so stays out of them, is
+ * ngx_rtc_core_module.c. This header itself is nginx-only.
+ *
+ * The pure-C protocol core (rtp/sdp/stun/dtls/srtp) remains nginx-free.
  */
 
 #ifndef NGX_RTC_SHM_H

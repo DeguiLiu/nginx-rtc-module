@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_rtcp.h - RTCP codec core (RFC 3550 / RFC 4585)
+/**
+ * @file    ngx_rtc_rtcp.h
+ * @brief   RTCP codec core (RFC 3550 / RFC 4585).
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Pure C11 translation of SRS 6.0:
  *   src/kernel/srs_kernel_rtc_rtcp.cpp  (SrsRtcpCommon/SrsRtcpSR/SrsRtcpRR,

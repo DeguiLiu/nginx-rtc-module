@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_audio_worker.h - thread-isolated AAC -> Opus transcoder.
+/**
+ * @file    ngx_rtc_audio_worker.h
+ * @brief   Thread-isolated AAC to Opus transcoder.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Wraps the pure ngx_rtc_audio_t transcoder with a dedicated pthread so the
  * FFmpeg decode / resample / Opus encode never blocks the nginx worker event
