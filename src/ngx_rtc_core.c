@@ -666,7 +666,7 @@ ngx_rtc_session_send_rtp(ngx_rtc_session_t *sess, const uint8_t *rtp, uint32_t l
     }
 
     n = (int)len;
-    if (ngx_rtc_srtp_protect_rtp(&sess->srtp, sess->cipher, &n) != 0) {
+    if (0 != ngx_rtc_srtp_protect_rtp(&sess->srtp, sess->cipher, &n)) {
         /* Nothing reached the socket, so give the transport-wide sequence back
          * (see the send branch below for why). Counted separately from the
          * socket failures: this is the one abandon point that used to be silent,
@@ -854,9 +854,9 @@ ngx_rtc_rtp_ring_replay(ngx_rtc_rtp_ring_t *r, ngx_rtc_session_t *sess)
     sent = 0;
     for (i = start; i < r->head; i++) {
         idx = i & (r->capacity - 1u);
-        if (ngx_rtc_session_send_rtp(sess, r->slots[idx].data,
-                                     r->slots[idx].len,
-                                     r->slots[idx].is_gop_start) == 0) {
+        if (0 == ngx_rtc_session_send_rtp(sess, r->slots[idx].data,
+                                          r->slots[idx].len,
+                                          r->slots[idx].is_gop_start)) {
             /* Stop bursting into a full socket: the client is not draining fast
              * enough and the rest of the keyframe would just be dropped. The
              * next NACK/PLI recovers what was lost. */

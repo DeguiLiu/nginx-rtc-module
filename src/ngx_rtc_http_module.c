@@ -477,7 +477,7 @@ ngx_rtc_http_find_shm_zone(ngx_cycle_t *cycle, ngx_str_t *name)
 
     for (i = 0; /* void */ ; i++) {
         if (i >= part->nelts) {
-            if (part->next == NULL) {
+            if (NULL == part->next) {
                 break;
             }
             part = part->next;
@@ -513,9 +513,9 @@ ngx_rtc_stats_mirror_timer(ngx_event_t *ev)
     len = (size_t)(p - buf);
 
     if (NULL != ngx_rtc_stats_shdict_zone) {
-        if (ngx_http_lua_ffi_shdict_store(ngx_rtc_stats_shdict_zone, 0,
+        if (NGX_OK != ngx_http_lua_ffi_shdict_store(ngx_rtc_stats_shdict_zone, 0,
                 key.data, key.len, NGX_RTC_SHDICT_TSTRING, buf, len,
-                0, 0, 0, &errmsg, &forcible) != NGX_OK) {
+                0, 0, 0, &errmsg, &forcible)) {
             ngx_log_error(NGX_LOG_ERR, ev->log, 0,
                           "ngx_rtc: shdict store failed: %s",
                           (NULL != errmsg) ? errmsg : "unknown");
@@ -536,7 +536,7 @@ ngx_rtc_http_init_process(ngx_cycle_t *cycle)
     }
 
     /* Idempotent; the stream module may already have done this. */
-    if (ngx_rtc_dtls_global_init() != 0) {
+    if (0 != ngx_rtc_dtls_global_init()) {
         ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
                       "ngx_rtc_http: DTLS init failed");
         return NGX_ERROR;
@@ -675,8 +675,8 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
      * order is not guaranteed. */
     sdp_len = 0;
     ngx_rtc_chain_reader_init(&rd, r->request_body->bufs);
-    if (ngx_rtc_http_json_string(&rd, "sdp",
-            sdp, body_len + 1, &sdp_len) != NGX_OK) {
+    if (NGX_OK != ngx_rtc_http_json_string(&rd, "sdp",
+            sdp, body_len + 1, &sdp_len)) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "rtc_play: no usable sdp field in the body "
                       "(missing, or the body ended inside the value)");
@@ -686,8 +686,8 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
 
     su_len = 0;
     ngx_rtc_chain_reader_init(&rd, r->request_body->bufs);
-    if (ngx_rtc_http_json_string(&rd, "streamurl",
-            streamurl, sizeof(streamurl), &su_len) != NGX_OK) {
+    if (NGX_OK != ngx_rtc_http_json_string(&rd, "streamurl",
+            streamurl, sizeof(streamurl), &su_len)) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "rtc_play: no usable streamurl field in the body "
                       "(missing, unterminated, or over %uz bytes)",
@@ -746,7 +746,7 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
                   "rtc_play: streamurl='%s' name='%s'", streamurl, name);
 
     /* Parse the client offer. */
-    if (ngx_rtc_sdp_parse_offer(sdp, sdp_len, &offer) != NGX_RTC_OK) {
+    if (NGX_RTC_OK != ngx_rtc_sdp_parse_offer(sdp, sdp_len, &offer)) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "rtc_play: sdp parse failed, sdp_len=%uz", sdp_len);
         ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
@@ -1045,7 +1045,7 @@ ngx_rtc_http_json_string(ngx_rtc_chain_reader_t *rd, const char *key,
     for (;;) {
         /* Skip to the next quote that may open the field. */
         for (;;) {
-            if (ngx_rtc_chain_reader_get(rd, &ch) != NGX_OK) {
+            if (NGX_OK != ngx_rtc_chain_reader_get(rd, &ch)) {
                 return NGX_ERROR;
             }
             if ('"' == ch) {
@@ -1058,7 +1058,7 @@ ngx_rtc_http_json_string(ngx_rtc_chain_reader_t *rd, const char *key,
         mark = *rd;
 
         for (k = 0; k < key_len; k++) {
-            if (ngx_rtc_chain_reader_get(rd, &ch) != NGX_OK
+            if (NGX_OK != ngx_rtc_chain_reader_get(rd, &ch)
                     || ch != (u_char)key[k]) {
                 *rd = mark;
                 break;
@@ -1068,14 +1068,14 @@ ngx_rtc_http_json_string(ngx_rtc_chain_reader_t *rd, const char *key,
             continue;
         }
 
-        if (ngx_rtc_chain_reader_get(rd, &ch) != NGX_OK || '"' != ch) {
+        if (NGX_OK != ngx_rtc_chain_reader_get(rd, &ch) || '"' != ch) {
             *rd = mark;
             continue;
         }
 
         /* Field name matched; the next non-space byte must be ':'. */
         for (;;) {
-            if (ngx_rtc_chain_reader_get(rd, &ch) != NGX_OK) {
+            if (NGX_OK != ngx_rtc_chain_reader_get(rd, &ch)) {
                 return NGX_ERROR;
             }
             if (' ' != ch && '\t' != ch) {
@@ -1087,7 +1087,7 @@ ngx_rtc_http_json_string(ngx_rtc_chain_reader_t *rd, const char *key,
         }
 
         for (;;) {
-            if (ngx_rtc_chain_reader_get(rd, &ch) != NGX_OK) {
+            if (NGX_OK != ngx_rtc_chain_reader_get(rd, &ch)) {
                 return NGX_ERROR;
             }
             if (' ' != ch && '\t' != ch) {
@@ -1106,7 +1106,7 @@ ngx_rtc_http_json_string(ngx_rtc_chain_reader_t *rd, const char *key,
          * different source; both are refused rather than guessed at. */
         olen = 0;
         for (;;) {
-            if (ngx_rtc_chain_reader_get(rd, &ch) != NGX_OK) {
+            if (NGX_OK != ngx_rtc_chain_reader_get(rd, &ch)) {
                 return NGX_ERROR;
             }
             if ('"' == ch) {
@@ -1116,7 +1116,7 @@ ngx_rtc_http_json_string(ngx_rtc_chain_reader_t *rd, const char *key,
                 return NGX_ERROR;
             }
             if ('\\' == ch) {
-                if (ngx_rtc_chain_reader_get(rd, &ch) != NGX_OK) {
+                if (NGX_OK != ngx_rtc_chain_reader_get(rd, &ch)) {
                     return NGX_ERROR;
                 }
                 if ('n' == ch) {
@@ -1167,7 +1167,7 @@ ngx_rtc_http_kick_handler(ngx_http_request_t *r)
         return NGX_HTTP_NOT_ALLOWED;
     }
 
-    if (ngx_http_arg(r, (u_char *) "id", sizeof("id") - 1, &val) != NGX_OK) {
+    if (NGX_OK != ngx_http_arg(r, (u_char *) "id", sizeof("id") - 1, &val)) {
         return NGX_HTTP_BAD_REQUEST;
     }
 
@@ -1301,9 +1301,9 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
         return;
     }
 
-    if (ngx_http_arg(r, (u_char *) "app", sizeof("app") - 1, &app) != NGX_OK
-            || ngx_http_arg(r, (u_char *) "stream",
-                            sizeof("stream") - 1, &stream) != NGX_OK
+    if (NGX_OK != ngx_http_arg(r, (u_char *) "app", sizeof("app") - 1, &app)
+            || NGX_OK != ngx_http_arg(r, (u_char *) "stream",
+                                      sizeof("stream") - 1, &stream)
             || 0 == app.len || 0 == stream.len
             || app.len + stream.len + 1 >= sizeof(name)) {
         ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);

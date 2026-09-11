@@ -359,7 +359,7 @@ ngx_rtc_shm_session_bind(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag, size_t len,
         return NGX_DECLINED;
     }
 
-    if (sess->owner_slot == -1) {
+    if (-1 == sess->owner_slot) {
         sess->owner_slot = (ngx_int_t) slot;
     }
 
@@ -412,7 +412,7 @@ ngx_rtc_shm_session_activate(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag, size_t len,
         return NGX_DECLINED;
     }
 
-    if (sess->owner_slot == -1) {
+    if (-1 == sess->owner_slot) {
         sess->owner_slot = (ngx_int_t) slot;
     }
 
@@ -941,10 +941,10 @@ ngx_rtc_shm_expire_locked(ngx_rtc_shm_ctx_t *ctx, ngx_uint_t forced)
          q = next) {
         next = ngx_queue_next(q);
         sess = ngx_queue_data(q, ngx_rtc_shm_session_t, queue);
-        if (sess->owner_slot != -1) {
+        if (-1 != sess->owner_slot) {
             continue;
         }
-        if (sess->expires != 0
+        if (0 != sess->expires
                 && (forced || now >= (ngx_msec_t) sess->expires)) {
             ngx_rtc_shm_session_free_locked(ctx, sess);
         }
@@ -985,7 +985,7 @@ ngx_rtc_shm_expire_locked(ngx_rtc_shm_ctx_t *ctx, ngx_uint_t forced)
          * ngx_rtc_shm_source_referenced_locked(). A source held back this way
          * keeps its elapsed `expires`, so it is collected on the first pass
          * after the last session pointing at it goes away. */
-        if (src->expires != 0
+        if (0 != src->expires
                 && (forced || now >= (ngx_msec_t) src->expires)
                 && 0 == ngx_rtc_shm_source_referenced_locked(ctx, src)) {
             ngx_queue_remove(&src->queue);
