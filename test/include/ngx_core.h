@@ -21,16 +21,8 @@
 #include <sys/time.h>
 #include <sys/types.h>
 
-/* ngx_connection_t carries a sockaddr for the UDP peer address. nginx gets
- * these through ngx_config.h's platform switch; this stub is compiled by both
- * the Linux host build and the MinGW cross build, so it makes the same switch
- * itself rather than assuming a POSIX socket header exists. */
-#ifdef _WIN32
-#include <winsock2.h>
-#include <ws2tcpip.h>   /* socklen_t: winsock2.h alone does not define it */
-#else
+/* ngx_connection_t carries a sockaddr for the UDP peer address. */
 #include <sys/socket.h>
-#endif
 
 typedef unsigned char u_char;
 typedef unsigned long ngx_msec_t;
