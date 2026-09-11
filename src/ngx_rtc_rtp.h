@@ -42,6 +42,8 @@
 #define NGX_RTC_RTP_HEADER_SIZE 12u
 #define NGX_RTC_RTP_MARKER      0x80u
 #define NGX_RTC_RTP_VERSION_CC  0x80u /* V=2, no padding, no extension, CC=0 */
+#define NGX_RTC_RTP_EXTENSION   0x10u /* X bit: header extension present */
+#define NGX_RTC_RTP_CSRC_MASK   0x0fu /* CC field: 32-bit CSRC count */
 
 /* H264 NALU header bit masks and RFC 6184 packet types. */
 #define NGX_RTC_H264_NAL_TYPE_MASK 0x1fu
@@ -57,6 +59,18 @@
  * most this many NAL bytes; the whole RTP packet stays below 12+2+1200=1214.
  */
 #define NGX_RTC_H264_MTU 1200u
+
+/* Largest plaintext RTP packet the bridge can build (12 RTP + FU-A header +
+ * NGX_RTC_H264_MTU payload). */
+#define NGX_RTC_MAX_RTP_PKT   (NGX_RTC_RTP_HEADER_SIZE + 2u + NGX_RTC_H264_MTU)
+
+/* Rewrite an incoming RTP packet in place to the 12-byte fixed-header form by
+ * dropping any CSRC list and header extension (payload shifted down, CC and X
+ * cleared). The 12-byte prefix (seq/ts/SSRC/PT) is untouched, so a stripped
+ * packet is byte-identical to what the RTMP bridge builds. Returns NGX_RTC_OK
+ * with *len possibly reduced, or NGX_RTC_ERR_PARSE when the header length runs
+ * past the packet (the caller drops it). */
+int32_t ngx_rtc_rtp_strip_header_ext(uint8_t *rtp, uint32_t *len);
 
 /* RTP clock rates and default payload types (same as SRS 6.0). */
 #define NGX_RTC_H264_CLOCK_RATE  90000u

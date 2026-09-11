@@ -196,10 +196,12 @@ static void ngx_rtc_rtcp_parse_sdes(const uint8_t *buf, uint32_t total, ngx_rtc_
     }
 }
 
-/* Summarise a transport-wide CC feedback (RFC 8888 4.2): count lost and
- * received packets from the run-length / status-vector chunk list. Recv deltas
- * are not needed for the loss summary, so they are skipped by not consuming
- * them. */
+/* Summarise a transport-wide CC feedback: count lost and received packets from
+ * the run-length / status-vector chunk list. The wire format is
+ * draft-holmer-rmcat-transport-wide-cc-extensions-01 (the one negotiated as the
+ * "transport-cc" RTP header extension), NOT RFC 8888, which defines a different
+ * feedback layout that has no chunks at all. Recv deltas are not needed for the
+ * loss summary, so they are skipped by not consuming them. */
 static void ngx_rtc_rtcp_parse_twcc(const uint8_t *buf, uint32_t total,
                                     ngx_rtc_rtcp_pkt_t *pkt)
 {
@@ -229,26 +231,62 @@ static void ngx_rtc_rtcp_parse_twcc(const uint8_t *buf, uint32_t total,
         p += 2;
 
         if (0 == (chunk >> 15)) {
-            /* run length chunk: bit 14 = status, bits 13..0 = run length */
-            run = chunk & 0x3FFFu;
+            /* Run length chunk (draft-holmer-rmcat-transport-wide-cc-extensions
+             * -01 section 3.1.3): T is one bit, the repeated packet status
+             * symbol is TWO bits and the run length is 13. The status vector
+             * chunk below does use a single size bit, so reading a single
+             * status bit here is an easy mistake -- and a costly one: a normal
+             * "received, small delta" run has bit 14 clear, so it reads as a
+             * lost run, and its length picks up the status bit and becomes
+             * 8192 + n, which the count clamp below turns into "everything
+             * left in this feedback was lost". Almost every arrival takes that
+             * path, so a clean link reports near-total loss. */
+            run = chunk & 0x1FFFu;
+            symbol = (chunk >> 13) & 0x3u;
+
             if (run > count - parsed) {
                 run = count - parsed;
             }
-            if (chunk & 0x4000u) {
-                pkt->twcc_received += run;
-            } else {
+            if (0 == symbol) {
                 pkt->twcc_lost += run;
+            } else {
+                pkt->twcc_received += run;
             }
             parsed += run;
         } else {
-            /* status vector chunk: seven 2-bit symbols */
-            for (symbol = 0; symbol < 7u && parsed < count; symbol++) {
-                if (0 == ((chunk >> (12u - symbol * 2u)) & 0x3u)) {
-                    pkt->twcc_lost++;
-                } else {
-                    pkt->twcc_received++;
+            /* Status vector chunk (draft-holmer-rmcat-transport-wide-cc-
+             * extensions-01 section 3.1.4): T is one bit, S is one bit, and the
+             * symbol list fills the remaining 14 bits. S=0 packs fourteen 1-bit
+             * symbols, S=1 packs seven 2-bit ones. Only the 2-bit form was read
+             * here, so an S=0 chunk advanced the cursor by 7 symbols instead of
+             * 14, walked the rest of the feedback at the wrong stride, drifted
+             * into the recv-delta section and counted arrival-time bytes as
+             * packet status.
+             *
+             * A symbol of zero means "not received" in BOTH forms. Section
+             * 3.1.4's prose says the 1-bit form is "'packet received' (0) and
+             * 'packet not received' (1)", but its own Example 1 draws the
+             * symbols `0 1 1 1 1 1 0 0 0 1 1 1 0 0` and labels the leading 0
+             * "packet not received", which agrees with the 2-bit semantics in
+             * 3.1.1. The example is right and the prose is not. */
+            if (0 == (chunk & 0x4000u)) {
+                for (symbol = 0; symbol < 14u && parsed < count; symbol++) {
+                    if (0 == ((chunk >> (13u - symbol)) & 0x1u)) {
+                        pkt->twcc_lost++;
+                    } else {
+                        pkt->twcc_received++;
+                    }
+                    parsed++;
                 }
-                parsed++;
+            } else {
+                for (symbol = 0; symbol < 7u && parsed < count; symbol++) {
+                    if (0 == ((chunk >> (12u - symbol * 2u)) & 0x3u)) {
+                        pkt->twcc_lost++;
+                    } else {
+                        pkt->twcc_received++;
+                    }
+                    parsed++;
+                }
             }
         }
     }

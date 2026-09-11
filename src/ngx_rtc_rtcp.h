@@ -94,7 +94,7 @@
 /* Feedback message types carried in the header FMT field (RFC 4585). */
 #define NGX_RTC_RTCP_FMT_NACK 1u  /* RTPFB generic NACK (section 6.2.1) */
 #define NGX_RTC_RTCP_FMT_PLI  1u  /* PSFB PLI keyframe request (section 6.3.1) */
-#define NGX_RTC_RTCP_FMT_TWCC 15u /* RTPFB transport-wide CC (not decoded here) */
+#define NGX_RTC_RTCP_FMT_TWCC 15u /* RTPFB transport-wide CC (draft-holmer-01) */
 #define NGX_RTC_RTCP_FMT_REMB 15u /* PSFB application-layer REMB (draft-alvestrand-rmcat-remb) */
 
 /* SRS kRtcpPacketSize; enough for any single RTCP datagram on the wire. */
