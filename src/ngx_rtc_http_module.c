@@ -574,8 +574,10 @@ ngx_rtc_http_init_process(ngx_cycle_t *cycle)
     }
 
     /* The RTCP sender-report / A/V-skew timer lives in the rtmp bridge module,
-     * but nginx never runs an NGX_RTMP_MODULE's init_process - so start it
-     * here, from an init_process that nginx does run. */
+     * whose own init_process also runs (nginx applies no module-type filter when
+     * walking cycle->modules[]), and runs before this one. The call below is
+     * therefore a redundant re-arm of the same event, kept only because both
+     * modules are always built together. See ngx_rtmp_rtc_rtcp_timer_start. */
     ngx_rtmp_rtc_rtcp_timer_start(cycle);
 
     return NGX_OK;
