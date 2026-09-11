@@ -261,8 +261,9 @@ nginx 用自研的 `ngx_vslprintf`,**不是** `printf` 的薄封装。
 | 层 | 门禁 |
 | --- | --- |
 | 纯 C 核心 | `make -C test test` 全绿。生产源用 nginx 自己的警告集(`-O -W -Wall -Wpointer-arith -Wno-unused-parameter`,见 `test/Makefile` 的 `NGX_CFLAGS`);测试文件另用 `-Wall -Wextra -Werror`。nginx 自身不开 `-Werror`,故生产源也不开 |
-| registry / 媒体面 | `test_shm.c` 覆盖 source/session 生命周期与所有权;`test_stream_module.c` 覆盖 UDP 媒体面的会话生命周期。Windows 交叉构建走 `test/include/` 的 stub,Linux 走 nginx 真实头 |
-| e2e 独占 | SRTP(需 libsrtp2)、RTMP 广播路径、配置解析、zone 初始化与 worker notify fd——这些 host 单测**覆盖不到**,必须 e2e 验证 |
+| registry / 媒体面 | `test_shm.c` 覆盖 source/session 生命周期与所有权;`test_stream_module.c` 只覆盖 DTLS 完成回调与关闭路径(1 例),STUN bind / RTCP / SRTP 分支不在其中。Windows 交叉构建走 `test/include/` 的 stub,Linux 走 nginx 真实头 |
+| 独立构建组 | `scripts/sanitize-tests.sh` 另起 4 组,各自链接真实核心单元:`srtp`(10 例)、`dtls`(5 例)、`audio`(5 例)、`audio_worker`(5 例,TSan 目标)。`srtp` / `audio` / `audio_worker` 需要 libsrtp2 与 ffmpeg,依赖缺失时该组**整体跳过**,不算失败 |
+| e2e 独占 | RTMP 广播路径、配置解析、zone 初始化与 worker notify fd——这些 host 单测**覆盖不到**,必须 e2e 验证 |
 
 改格式串、改内存所有权、改跨 worker 指针这类改动,**e2e 不能省**;只跑 host 单测会给出虚假的安全感。
 
