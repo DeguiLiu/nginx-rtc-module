@@ -1162,12 +1162,22 @@ ngx_rtc_session_pacer_cap(ngx_rtc_session_t *sess, uint64_t bps)
 }
 
 /* The session owns no ngx_log_t; its UDP connection does. A session without a
- * connection never reaches the control loop, so there is nothing to log. */
+ * connection never reaches the control loop, so there is nothing to log -- but
+ * "nothing to log" cannot be expressed as NULL here. nginx's ngx_log_error()
+ * tests log->log_level BEFORE it decides to emit anything, so it dereferences
+ * the handle on every call: handing back NULL is a crash, not a no-op. Both
+ * callers are debug traces on the ring replay and the TWCC control loop, which
+ * the host tests drive on sessions that have no connection yet.
+ *
+ * A permanently silent log (log_level 0 is below every level) is the value that
+ * actually means "emit nothing". */
+static ngx_log_t ngx_rtc_silent_log;
+
 static ngx_log_t *
 ngx_rtc_session_log(const ngx_rtc_session_t *sess)
 {
-    if (NULL == sess->conn) {
-        return NULL;
+    if (NULL == sess || NULL == sess->conn) {
+        return &ngx_rtc_silent_log;
     }
 
     return ((ngx_connection_t *) sess->conn)->log;

@@ -11,7 +11,8 @@ enum
 {
     EV_GO = 1,
     EV_INT = 2,
-    EV_SELF = 3
+    EV_SELF = 3,
+    EV_DEEP = 4
 };
 
 static int  g_guard_allow;
@@ -89,10 +90,12 @@ static bool guard_go(ngx_rtc_hsm_t *sm, const ngx_rtc_hsm_event_t *event)
 static const ngx_rtc_hsm_state_t s_top;
 static const ngx_rtc_hsm_state_t s_a;
 static const ngx_rtc_hsm_state_t s_b;
+static const ngx_rtc_hsm_state_t s_deep;
 
 static const ngx_rtc_hsm_transition_t s_a_trans[] =
 {
-    { EV_GO,  &s_b,   guard_go, NULL,        NGX_RTC_HSM_TRANSITION_EXTERNAL },
+    { EV_GO,   &s_b,    guard_go, NULL,        NGX_RTC_HSM_TRANSITION_EXTERNAL },
+    { EV_DEEP, &s_deep, NULL,     NULL,        NGX_RTC_HSM_TRANSITION_EXTERNAL },
 };
 
 static const ngx_rtc_hsm_transition_t s_b_trans[] =
@@ -130,6 +133,18 @@ static const ngx_rtc_hsm_state_t s_b =
     .transitions     = s_b_trans,
     .num_transitions = sizeof(s_b_trans) / sizeof(s_b_trans[0]),
     .name            = "B",
+};
+
+/* Two levels below s_top: entering it needs two entry-path slots even though
+ * only one state (s_b) sits between it and the LCA. */
+static const ngx_rtc_hsm_state_t s_deep =
+{
+    .parent          = &s_b,
+    .entry_action    = NULL,
+    .exit_action     = NULL,
+    .transitions     = NULL,
+    .num_transitions = 0,
+    .name            = "DEEP",
 };
 
 NGX_RTC_TEST(hsm_guard_gates_transition)
@@ -215,4 +230,86 @@ NGX_RTC_TEST(hsm_is_in_state_descendant_check)
 
     NGX_RTC_TEST_ASSERT(true == ngx_rtc_hsm_is_in_state(&sm, &s_b));
     NGX_RTC_TEST_ASSERT(false == ngx_rtc_hsm_is_in_state(&sm, &s_a));
+}
+
+/*
+ * A target deeper than the caller's entry-path buffer must leave the machine
+ * exactly where it was. The previous implementation ran the exit actions first
+ * and only then discovered the buffer was too small, then asserted: the state
+ * stayed named A while A's exit action had already fired (log "Au" instead of
+ * "u"), and in a production build the assert aborted the whole worker.
+ */
+NGX_RTC_TEST(hsm_short_entry_path_leaves_state_unchanged)
+{
+    ngx_rtc_hsm_t sm;
+    const ngx_rtc_hsm_state_t *path[1];
+    ngx_rtc_hsm_event_t ev;
+
+    g_guard_allow = 1;
+    log_clear();
+
+    /* One slot, but s_deep is two levels below the LCA (s_top). */
+    ngx_rtc_hsm_init(&sm, &s_a, path, 1, NULL, on_unhandled);
+    NGX_RTC_TEST_ASSERT_STR_EQ(ngx_rtc_hsm_get_current_state_name(&sm), "A");
+
+    log_clear();
+
+    ev.id = EV_DEEP;
+    ev.context = NULL;
+
+    /* The transition is refused and the event is reported unhandled. */
+    NGX_RTC_TEST_ASSERT(false == ngx_rtc_hsm_dispatch(&sm, &ev));
+    NGX_RTC_TEST_ASSERT(1 == g_unhandled_count);
+
+    /* No exit action ran, and the machine is still in A. */
+    NGX_RTC_TEST_ASSERT_STR_EQ(g_log, "u");
+    NGX_RTC_TEST_ASSERT_STR_EQ(ngx_rtc_hsm_get_current_state_name(&sm), "A");
+    NGX_RTC_TEST_ASSERT(true == ngx_rtc_hsm_is_in_state(&sm, &s_a));
+    NGX_RTC_TEST_ASSERT(false == ngx_rtc_hsm_is_in_state(&sm, &s_deep));
+}
+
+/*
+ * A mirror instance learns its real state from outside -- the shm session
+ * skeleton records that DTLS/SRTP finished on the owning worker, while this
+ * worker never saw a single handshake packet. Restoring must therefore set the
+ * state WITHOUT running entry/exit actions: those belong to transitions that
+ * did not happen here, and running them would also demand transitions the
+ * table deliberately does not have (nothing leads from NEW to SRTP_READY).
+ */
+NGX_RTC_TEST(hsm_restore_state_sets_state_without_actions)
+{
+    ngx_rtc_hsm_t sm;
+    const ngx_rtc_hsm_state_t *path[4];
+
+    log_clear();
+    ngx_rtc_hsm_init(&sm, &s_a, path, 4, NULL, on_unhandled);
+    NGX_RTC_TEST_ASSERT_STR_EQ(ngx_rtc_hsm_get_current_state_name(&sm), "A");
+
+    log_clear();
+
+    NGX_RTC_TEST_ASSERT(true == ngx_rtc_hsm_restore_state(&sm, &s_b));
+
+    /* Restoring is not a transition: exit_a and enter_b must NOT run. */
+    NGX_RTC_TEST_ASSERT_STR_EQ(g_log, "");
+    NGX_RTC_TEST_ASSERT_STR_EQ(ngx_rtc_hsm_get_current_state_name(&sm), "B");
+    NGX_RTC_TEST_ASSERT(true == ngx_rtc_hsm_is_in_state(&sm, &s_b));
+    NGX_RTC_TEST_ASSERT(false == ngx_rtc_hsm_is_in_state(&sm, &s_a));
+
+    /* The restored state answers is_in_state for its ancestors too. */
+    NGX_RTC_TEST_ASSERT(true == ngx_rtc_hsm_is_in_state(&sm, &s_top));
+}
+
+/* A refused restore leaves the machine exactly where it was. */
+NGX_RTC_TEST(hsm_restore_state_rejects_null)
+{
+    ngx_rtc_hsm_t sm;
+    const ngx_rtc_hsm_state_t *path[4];
+
+    ngx_rtc_hsm_init(&sm, &s_a, path, 4, NULL, on_unhandled);
+
+    NGX_RTC_TEST_ASSERT(false == ngx_rtc_hsm_restore_state(NULL, &s_b));
+    NGX_RTC_TEST_ASSERT(false == ngx_rtc_hsm_restore_state(&sm, NULL));
+
+    NGX_RTC_TEST_ASSERT_STR_EQ(ngx_rtc_hsm_get_current_state_name(&sm), "A");
+    NGX_RTC_TEST_ASSERT(0 == g_unhandled_count);
 }

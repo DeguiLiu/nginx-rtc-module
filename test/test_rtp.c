@@ -412,3 +412,128 @@ NGX_RTC_TEST(rtp_single_and_opus_packetize)
     NGX_RTC_TEST_ASSERT_I64_EQ(g_coll_buf[0][1], 0xEFu); /* M=1 + PT 111 */
     NGX_RTC_TEST_ASSERT_MEM_EQ(g_coll_buf[0] + 12, opus, sizeof(opus));
 }
+
+/* ------------------------------------------------------------------ */
+/* RTP header-extension stripping (WHIP uplink normalization).         */
+/* ------------------------------------------------------------------ */
+
+NGX_RTC_TEST(rtp_strip_header_ext_removes_extension)
+{
+    uint8_t  pkt[64];
+    uint32_t len;
+    uint32_t i;
+
+    /* 12-byte header (V=2, X=1, CC=0) + one-word 0xBEDE extension + 8 payload
+     * bytes: the shape a browser emits when the answer echoed transport-cc. */
+    (void)memset(pkt, 0, sizeof(pkt));
+    pkt[0] = 0x90u;
+    pkt[1] = 102u;
+    pkt[2] = 0x12u;
+    pkt[3] = 0x34u;
+    pkt[8] = 0x01u;
+    pkt[9] = 0x02u;
+    pkt[10] = 0x03u;
+    pkt[11] = 0x04u;
+    pkt[12] = 0xBEu;
+    pkt[13] = 0xDEu;
+    pkt[14] = 0x00u;
+    pkt[15] = 0x01u;
+    pkt[16] = 0x31u;
+    pkt[17] = 0x00u;
+    pkt[18] = 0x05u;
+    pkt[19] = 0x00u;
+    for (i = 0u; i < 8u; i++)
+    {
+        pkt[20u + i] = (uint8_t)(0xA0u + i);
+    }
+    len = 28u;
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtp_strip_header_ext(pkt, &len),
+                               NGX_RTC_OK);
+    /* Extension gone: the payload sits at the fixed-header boundary. */
+    NGX_RTC_TEST_ASSERT_U64_EQ(len, 20u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt[0], 0x80u); /* X and CC cleared */
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt[12], 0xA0u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt[19], 0xA7u);
+    /* The 12-byte prefix (seq/ts/SSRC/PT) is untouched. */
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt[2], 0x12u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt[11], 0x04u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt[1], 102u);
+}
+
+NGX_RTC_TEST(rtp_strip_header_ext_drops_csrc_list_too)
+{
+    uint8_t  pkt[64];
+    uint32_t len;
+    uint32_t i;
+
+    /* V=2, X=1, CC=2: CSRC list at 12..19, then the extension header/body. */
+    (void)memset(pkt, 0, sizeof(pkt));
+    pkt[0] = 0x92u;
+    pkt[1] = 111u;
+    for (i = 12u; i < 20u; i++)
+    {
+        pkt[i] = (uint8_t)(0xC0u + i);
+    }
+    pkt[20] = 0xBEu;
+    pkt[21] = 0xDEu;
+    pkt[22] = 0x00u;
+    pkt[23] = 0x01u;
+    for (i = 0u; i < 4u; i++)
+    {
+        pkt[24u + i] = (uint8_t)(0x70u + i);
+    }
+    for (i = 0u; i < 4u; i++)
+    {
+        pkt[28u + i] = (uint8_t)(0xB0u + i);
+    }
+    len = 32u;
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtp_strip_header_ext(pkt, &len),
+                               NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_U64_EQ(len, 16u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt[0], 0x80u);
+    /* The 4-byte payload that followed the CSRC list + extension moved to 12. */
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt[12], 0xB0u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt[15], 0xB3u);
+}
+
+NGX_RTC_TEST(rtp_strip_header_ext_rejects_malformed)
+{
+    uint8_t  pkt[16];
+    uint32_t len;
+
+    (void)memset(pkt, 0, sizeof(pkt));
+
+    /* No extension: the packet is left exactly as it was. */
+    pkt[0] = 0x80u;
+    len = 12u;
+    pkt[12] = 0x5Au;
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtp_strip_header_ext(pkt, &len),
+                               NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_U64_EQ(len, 12u);
+    NGX_RTC_TEST_ASSERT_U64_EQ(pkt[12], 0x5Au);
+
+    /* X set but the 4-byte extension header runs past the packet. */
+    pkt[0] = 0x90u;
+    len = 13u;
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtp_strip_header_ext(pkt, &len),
+                               NGX_RTC_ERR_PARSE);
+
+    /* Extension length word claims more words than the packet holds. */
+    pkt[14] = 0xFFu;
+    pkt[15] = 0xFFu;
+    len = 20u;
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtp_strip_header_ext(pkt, &len),
+                               NGX_RTC_ERR_PARSE);
+
+    /* Shorter than the fixed header. */
+    len = 8u;
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtp_strip_header_ext(pkt, &len),
+                               NGX_RTC_ERR_PARSE);
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtp_strip_header_ext(NULL, &len),
+                               NGX_RTC_ERR_PARSE);
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtp_strip_header_ext(pkt, NULL),
+                               NGX_RTC_ERR_PARSE);
+}

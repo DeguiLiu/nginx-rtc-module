@@ -11,12 +11,14 @@ RTC_CORE_SRCS="                                                   \
                 $ngx_addon_dir/src/ngx_rtc_srtp.c                 \
                 $ngx_addon_dir/src/ngx_rtc_core.c                 \
                 $ngx_addon_dir/src/ngx_rtc_ring.c                 \
+                $ngx_addon_dir/src/ngx_rtc_jitter.c               \
                 $ngx_addon_dir/src/ngx_rtc_audio.c                \
                 $ngx_addon_dir/src/ngx_rtc_audio_worker.c         \
                 $ngx_addon_dir/src/ngx_rtc_rtcp.c                 \
                 $ngx_addon_dir/src/ngx_rtc_avsync.c               \
                 $ngx_addon_dir/src/ngx_rtc_hsm.c                  \
                 $ngx_addon_dir/src/ngx_rtc_session_fsm.c          \
+                $ngx_addon_dir/src/ngx_rtc_shm.c                  \
                 "
 
 RTC_CORE_DEPS="                                                   \
@@ -27,6 +29,7 @@ RTC_CORE_DEPS="                                                   \
                 $ngx_addon_dir/src/ngx_rtc_srtp.h                 \
                 $ngx_addon_dir/src/ngx_rtc_core.h                 \
                 $ngx_addon_dir/src/ngx_rtc_ring.h                 \
+                $ngx_addon_dir/src/ngx_rtc_jitter.h               \
                 $ngx_addon_dir/src/ngx_rtc_audio.h                \
                 $ngx_addon_dir/src/ngx_rtc_audio_worker.h         \
                 $ngx_addon_dir/src/ngx_rtc_rtcp.h                 \
@@ -37,9 +40,12 @@ RTC_CORE_DEPS="                                                   \
 
 if [ -f auto/module ]; then
     # rtc_zone directive (NGX_CORE_MODULE): shared-memory zone for multi-worker.
+    # Only the config parsing and the module identity live here; the registry
+    # itself (ngx_rtc_shm.c) is a plain C unit in RTC_CORE_SRCS, which is what
+    # lets the host test suite compile it under ASan (see test/test_shm.c).
     ngx_module_type=CORE
     ngx_module_name="ngx_rtc_core_module"
-    ngx_module_srcs="$ngx_addon_dir/src/ngx_rtc_shm.c"
+    ngx_module_srcs="$ngx_addon_dir/src/ngx_rtc_core_module.c"
     ngx_module_deps="$ngx_addon_dir/src/ngx_rtc_shm.h"
     . auto/module
 
@@ -76,7 +82,7 @@ else
                     $ngx_addon_dir/src/ngx_rtmp_rtc_bridge_module.c   \
                     $ngx_addon_dir/src/ngx_rtc_http_module.c          \
                     $ngx_addon_dir/src/ngx_rtc_stream_module.c        \
-                    $ngx_addon_dir/src/ngx_rtc_shm.c                  "
+                    $ngx_addon_dir/src/ngx_rtc_core_module.c          "
 
     NGX_ADDON_DEPS="$NGX_ADDON_DEPS $RTC_CORE_DEPS"
 fi
