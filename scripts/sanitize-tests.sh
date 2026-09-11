@@ -11,6 +11,20 @@
 #   SAN=undefined scripts/sanitize-tests.sh   # UBSan only
 #   SAN=thread scripts/sanitize-tests.sh      # TSan: separate run, see below
 #
+# Exit codes. The srtp / audio / audio_worker groups need libsrtp2; when it is
+# missing the run used to print SKIPPED and exit 0, which is indistinguishable
+# from "all five groups passed" in a CI log. It now exits 77 -- automake's SKIP
+# convention -- so a caller can tell "incomplete" from "green" without parsing
+# output. --require-all makes the same condition a hard failure (exit 1), which
+# is what CI should pass:
+#
+#   0   every group ran and passed
+#   1   a group failed, or --require-all was given and a group could not run
+#   77  a group was skipped for a missing dependency (not --require-all)
+#
+# NGX_SRC is passed through to make when the caller set it; otherwise make
+# probes for the nginx tree and prints which header world it picked.
+#
 # ASan and TSan cannot be linked into one binary, so TSan is its own invocation;
 # it is only meaningful for the units that actually have threads.
 #
@@ -66,6 +80,24 @@ set -euo pipefail
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 SAN=${SAN:-address,undefined}
+
+# The srtp / audio / audio_worker groups are the ones that need libsrtp2; keep
+# their case count here so the skip message can say how much did not run.
+SKIPPED_CASES=20
+REQUIRE_ALL=0
+
+for arg in "$@"; do
+    case "$arg" in
+        --require-all)
+            REQUIRE_ALL=1
+            ;;
+        *)
+            echo "sanitize-tests: unknown argument '$arg'" >&2
+            echo "usage: sanitize-tests.sh [--require-all]" >&2
+            exit 2
+            ;;
+    esac
+done
 
 # Keyed by sanitizer so switching SAN never reuses objects compiled with a
 # different set of flags (make does not track flag changes).
@@ -182,6 +214,7 @@ run_group() {
     make -C "$ROOT/test" -j"${JOBS:-$(nproc)}" \
         NGX_CFLAGS="$NGX_CFLAGS" \
         TEST_CFLAGS="$TEST_CFLAGS" \
+        ${NGX_SRC:+NGX_SRC="$NGX_SRC"} \
         EXTRA_CPPFLAGS="$cpp" \
         LDLIBS="$libs -fsanitize=$SAN" \
         BUILD_DIR="$BUILD_DIR/$name" \
@@ -200,10 +233,15 @@ run_group main \
 
 if [ 0 -eq "$HAVE_SRTP" ]; then
     echo
-    echo "== srtp / audio / audio_worker: SKIPPED ==" >&2
+    echo "== srtp / audio / audio_worker: SKIPPED ($SKIPPED_CASES cases did not run) ==" >&2
     echo "   no libsrtp2.a under ${THIRD:-<unset>}; build it with" >&2
     echo "   nginx-rtc-example/scripts/build-deps.sh" >&2
-    exit 0
+    if [ 1 -eq "$REQUIRE_ALL" ]; then
+        echo "   --require-all: a group that cannot run is a failure here" >&2
+        exit 1
+    fi
+    echo "   exit 77 (automake's SKIP convention): incomplete, not green" >&2
+    exit 77
 fi
 
 AV_LIBS="$THIRD/lib/libavcodec.a $THIRD/lib/libswresample.a \
