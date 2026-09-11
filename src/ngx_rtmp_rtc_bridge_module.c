@@ -315,17 +315,17 @@ ngx_rtmp_rtc_send_sr_sdes(ngx_rtc_session_t *sess, ngx_rtc_source_t *src)
     sr.octet_count = src->video_octets;
     sr.ntp = 0;   /* 0 = fill from wall clock */
 
-    if (ngx_rtc_rtcp_encode_sr(&sr, sub, sizeof(sub), &sub_len) == NGX_RTC_OK) {
-        if (ngx_rtc_rtcp_compound_append(compound, sizeof(compound), &out_len,
-                                         sub, sub_len) != NGX_RTC_OK) {
+    if (NGX_RTC_OK == ngx_rtc_rtcp_encode_sr(&sr, sub, sizeof(sub), &sub_len)) {
+        if (NGX_RTC_OK != ngx_rtc_rtcp_compound_append(compound, sizeof(compound),
+                                                &out_len, sub, sub_len)) {
             return;
         }
     }
 
-    if (ngx_rtc_rtcp_encode_sdes(sr.ssrc, "ngx-rtc", sub, sizeof(sub),
-                                 &sub_len) == NGX_RTC_OK) {
-        if (ngx_rtc_rtcp_compound_append(compound, sizeof(compound), &out_len,
-                                         sub, sub_len) != NGX_RTC_OK) {
+    if (NGX_RTC_OK == ngx_rtc_rtcp_encode_sdes(sr.ssrc, "ngx-rtc", sub, sizeof(sub),
+                                               &sub_len)) {
+        if (NGX_RTC_OK != ngx_rtc_rtcp_compound_append(compound, sizeof(compound),
+                                                &out_len, sub, sub_len)) {
             return;
         }
     }
@@ -335,7 +335,7 @@ ngx_rtmp_rtc_send_sr_sdes(ngx_rtc_session_t *sess, ngx_rtc_source_t *src)
     }
 
     n = (int)out_len;
-    if (ngx_rtc_srtp_protect_rtcp(&sess->srtp, compound, &n) != 0) {
+    if (0 != ngx_rtc_srtp_protect_rtcp(&sess->srtp, compound, &n)) {
         return;
     }
 
@@ -432,8 +432,8 @@ ngx_rtmp_rtc_rtcp_timer(ngx_event_t *ev)
             }
 
             ngx_log_error(NGX_LOG_INFO, ev->log, 0,
-                          "ngx_rtmp_rtc: avsync src=\"%s\" vskew=%dms "
-                          "askew=%dms av=%dms ring_drops=%ui adrop_in=%ui "
+                          "ngx_rtmp_rtc: avsync src=\"%s\" vskew=%ims "
+                          "askew=%ims av=%ims ring_drops=%ui adrop_in=%ui "
                           "adrop_out=%ui",
                           src->name, vskew, askew, av,
                           (ngx_uint_t) src->ring_drops, (ngx_uint_t) idr,
@@ -675,7 +675,7 @@ ngx_rtmp_rtc_av(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h, ngx_chain_t *in)
         return NGX_OK;
     }
 
-    if ((pos[0] & 0x0f) != NGX_RTC_VIDEO_H264) {
+    if (NGX_RTC_VIDEO_H264 != (pos[0] & 0x0f)) {
         return NGX_OK;
     }
 
@@ -699,7 +699,7 @@ ngx_rtmp_rtc_av(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h, ngx_chain_t *in)
      * protocol really holds the name, so it is the deciding call. The claim
      * inside it also rewrites the local tag, so no pre-clearing is needed here.
      */
-    if (ngx_rtmp_rtc_sync_shm(src) != NGX_OK) {
+    if (NGX_OK != ngx_rtmp_rtc_sync_shm(src)) {
         /* Another protocol publishes this name (WHIP): reject the RTMP ingest. */
         return NGX_ERROR;
     }
@@ -870,14 +870,14 @@ ngx_rtmp_rtc_video(ngx_rtc_source_t *src, ngx_rtmp_header_t *h,
 
     for (i = 0; i < count; i++) {
         /* Drop B frames (WebRTC low-latency playout does not support them). */
-        if (ngx_rtc_h264_is_b_frame(nalus[i], sizes[i]) == 1) {
+        if (1 == ngx_rtc_h264_is_b_frame(nalus[i], sizes[i])) {
             continue;
         }
 
         marker = (i == count - 1) ? 1 : 0;
 
         /* Prepend SPS+PPS (STAP-A) before an IDR so the decoder can start. */
-        if (ngx_rtc_h264_nalu_type(nalus[i], sizes[i]) == NGX_RTC_NALU_IDR
+        if (NGX_RTC_NALU_IDR == ngx_rtc_h264_nalu_type(nalus[i], sizes[i])
                 && src->sps_len > 0 && src->pps_len > 0) {
             const uint8_t *stap[2];
             uint32_t       stap_len[2];
@@ -943,7 +943,7 @@ ngx_rtmp_rtc_audio(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h, ngx_chain_t *in)
     }
     /* See ngx_rtmp_rtc_av: the shm source arbitrates ownership, and the claim
      * inside sync_shm rewrites the local tag, so no pre-clearing is needed. */
-    if (ngx_rtmp_rtc_sync_shm(src) != NGX_OK) {
+    if (NGX_OK != ngx_rtmp_rtc_sync_shm(src)) {
         /* Another protocol publishes this name (WHIP): reject the RTMP ingest. */
         return NGX_ERROR;
     }
@@ -1151,14 +1151,14 @@ ngx_rtc_broadcast_rtp(ngx_rtc_source_t *src, const uint8_t *rtp,
 
         /* The plaintext RTP is written into the shm slot once by enqueue; no
          * stack staging entry is built here. */
-        if (ngx_rtc_shm_ring_enqueue(shm->rings[w],
+        if (NGX_OK == ngx_rtc_shm_ring_enqueue(shm->rings[w],
                 (uint8_t) (is_video ? 0 : 1),
                 (uint8_t) (0 != is_gop_start ? 1 : 0),
-                rtp, (uint16_t) len, sess_ids, nsess) == NGX_OK) {
+                rtp, (uint16_t) len, sess_ids, nsess)) {
             uint64_t one;
             ssize_t  rc;
             one = 1;
-            if (shm->notify_fd[w] != -1) {
+            if (-1 != shm->notify_fd[w]) {
                 rc = write(shm->notify_fd[w], &one, sizeof(one));
                 (void) rc;
             }

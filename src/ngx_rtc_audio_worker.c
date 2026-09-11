@@ -62,12 +62,12 @@ ngx_rtc_audio_worker_create(const uint8_t *asc, uint32_t asc_len,
         return NULL;
     }
 
-    if (pthread_mutex_init(&w->lock, NULL) != 0) {
+    if (0 != pthread_mutex_init(&w->lock, NULL)) {
         goto fail;
     }
     mutex_ok = 1;
 
-    if (pthread_cond_init(&w->cond, NULL) != 0) {
+    if (0 != pthread_cond_init(&w->cond, NULL)) {
         goto fail;
     }
     cond_ok = 1;
@@ -77,15 +77,15 @@ ngx_rtc_audio_worker_create(const uint8_t *asc, uint32_t asc_len,
         goto fail;
     }
 
-    if (ngx_rtc_vring_init(&w->in, NGX_RTC_AUDIO_IN_ARENA_BYTES) != 0) {
+    if (0 != ngx_rtc_vring_init(&w->in, NGX_RTC_AUDIO_IN_ARENA_BYTES)) {
         goto fail;
     }
 
-    if (ngx_rtc_vring_init(&w->out, NGX_RTC_AUDIO_OUT_ARENA_BYTES) != 0) {
+    if (0 != ngx_rtc_vring_init(&w->out, NGX_RTC_AUDIO_OUT_ARENA_BYTES)) {
         goto fail;
     }
 
-    if (pthread_create(&w->thread, NULL, ngx_rtc_audio_worker_main, w) != 0) {
+    if (0 != pthread_create(&w->thread, NULL, ngx_rtc_audio_worker_main, w)) {
         goto fail;
     }
 
@@ -174,7 +174,7 @@ ngx_rtc_audio_worker_drain(ngx_rtc_audio_worker_t *w,
         pthread_mutex_lock(&w->lock);
         {
             int ok = ngx_rtc_vring_pop(&w->out, opus, sizeof(opus), &opus_len);
-            if (ok != 0) {
+            if (0 != ok) {
                 pthread_mutex_unlock(&w->lock);
                 break;
             }
@@ -246,7 +246,7 @@ ngx_rtc_audio_worker_emit(void *opaque, const uint8_t *opus, uint32_t len)
     }
 
     pthread_mutex_lock(&w->lock);
-    if (ngx_rtc_vring_push(&w->out, opus, len) != 0) {
+    if (0 != ngx_rtc_vring_push(&w->out, opus, len)) {
         w->out_dropped++;
     }
     pthread_mutex_unlock(&w->lock);

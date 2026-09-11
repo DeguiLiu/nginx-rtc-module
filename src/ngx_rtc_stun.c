@@ -175,8 +175,8 @@ ngx_rtc_stun_verify_request(const ngx_rtc_stun_t *stun,
     if (NULL == HMAC(EVP_sha1(), ice_pwd, (int)strlen(ice_pwd),
             tmp, stun->message_integrity_offset - 4u, hmac_out, &hmac_len)
             || hmac_len != 20u
-            || memcmp(data + stun->message_integrity_offset,
-                      hmac_out, 20u) != 0) {
+            || 0 != memcmp(data + stun->message_integrity_offset,
+                           hmac_out, 20u)) {
         return -1;
     }
 

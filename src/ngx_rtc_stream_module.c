@@ -191,7 +191,7 @@ ngx_rtc_stream_create_srv_conf(ngx_conf_t *cf)
     ngx_rtc_stream_srv_conf_t *conf;
 
     conf = ngx_pcalloc(cf->pool, sizeof(ngx_rtc_stream_srv_conf_t));
-    if (conf == NULL) {
+    if (NULL == conf) {
         return NULL;
     }
 
@@ -265,13 +265,13 @@ ngx_rtc_stream_reap_interval(void)
 static ngx_int_t
 ngx_rtc_stream_init_module(ngx_cycle_t *cycle)
 {
-    if (ngx_rtc_dtls_global_init() != 0) {
+    if (0 != ngx_rtc_dtls_global_init()) {
         ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
                       "ngx_rtc_stream: DTLS init failed");
         return NGX_ERROR;
     }
 
-    if (ngx_rtc_srtp_global_init() != 0) {
+    if (0 != ngx_rtc_srtp_global_init()) {
         ngx_log_error(NGX_LOG_ERR, cycle->log, 0,
                       "ngx_rtc_stream: SRTP init failed");
         return NGX_ERROR;
@@ -308,7 +308,7 @@ ngx_rtc_stream_init_process(ngx_cycle_t *cycle)
 
         if (NULL != ccf && NULL != ccf->sh) {
             fd = ccf->sh->notify_fd[ngx_worker];
-            if (fd != -1) {
+            if (-1 != fd) {
                 ngx_memzero(&ngx_rtc_stream_notify_event,
                             sizeof(ngx_rtc_stream_notify_event));
                 ngx_memzero(&ngx_rtc_stream_notify_write_event,
@@ -335,8 +335,8 @@ ngx_rtc_stream_init_process(ngx_cycle_t *cycle)
                         &ngx_rtc_stream_notify_write_event;
                 ngx_rtc_stream_notify_conn.log = cycle->log;
 
-                if (ngx_add_event(&ngx_rtc_stream_notify_event,
-                                  NGX_READ_EVENT, 0) == NGX_ERROR) {
+                if (NGX_ERROR == ngx_add_event(&ngx_rtc_stream_notify_event,
+                                               NGX_READ_EVENT, 0)) {
                     ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
                                   "ngx_rtc_stream: cannot register eventfd");
                     return NGX_ERROR;
@@ -572,10 +572,10 @@ ngx_rtc_stream_on_stun(ngx_stream_session_t *s, u_char *data, size_t len)
     }
 
     {
-        int rc = ngx_rtc_stun_verify_request(&stun, data, len, sess->ice_pwd);
+        ngx_int_t rc = ngx_rtc_stun_verify_request(&stun, data, len, sess->ice_pwd);
         if (0 != rc) {
             ngx_log_error(NGX_LOG_WARN, c->log, 0,
-                          "ngx_rtc_stream: STUN integrity check failed rc=%d ufrag=\"%s\"",
+                          "ngx_rtc_stream: STUN integrity check failed rc=%i ufrag=\"%s\"",
                           rc, sess->ice_ufrag);
             return;
         }
@@ -664,8 +664,8 @@ ngx_rtc_stream_on_dtls(ngx_stream_session_t *s, ngx_rtc_session_t *sess,
 
         sess->conn = c;
 
-        if (ngx_rtc_dtls_create(&sess->dtls,
-                ngx_rtc_stream_dtls_send, ngx_rtc_stream_dtls_done, sess) != 0) {
+        if (0 != ngx_rtc_dtls_create(&sess->dtls,
+                ngx_rtc_stream_dtls_send, ngx_rtc_stream_dtls_done, sess)) {
             ngx_log_error(NGX_LOG_ERR, c->log, 0,
                           "ngx_rtc_stream: DTLS create failed");
             ngx_rtc_stream_session_close(sess, NGX_RTC_SESSION_EVT_CLOSE);
@@ -677,7 +677,7 @@ ngx_rtc_stream_on_dtls(ngx_stream_session_t *s, ngx_rtc_session_t *sess,
 
     sess->last_active = ngx_current_msec;
 
-    if (ngx_rtc_dtls_on_data(&sess->dtls, data, len) != 0) {
+    if (0 != ngx_rtc_dtls_on_data(&sess->dtls, data, len)) {
         ngx_log_error(NGX_LOG_ERR, c->log, 0,
                       "ngx_rtc_stream: DTLS processing failed");
         ngx_rtc_stream_session_close(sess, NGX_RTC_SESSION_EVT_CLOSE);
@@ -719,7 +719,7 @@ ngx_rtc_stream_on_rtcp(ngx_stream_session_t *s, u_char *data, size_t len)
     sess->last_active = ngx_current_msec;
 
     n = (int)len;
-    if (ngx_rtc_srtp_unprotect_rtcp(&sess->srtp, data, &n) != 0) {
+    if (0 != ngx_rtc_srtp_unprotect_rtcp(&sess->srtp, data, &n)) {
         return;
     }
 
@@ -862,7 +862,7 @@ ngx_rtc_stream_on_srtp(ngx_stream_session_t *s, ngx_rtc_session_t *sess,
     }
 
     n = (int) len;
-    if (ngx_rtc_srtp_unprotect_rtp(&sess->srtp, data, &n) != 0) {
+    if (0 != ngx_rtc_srtp_unprotect_rtp(&sess->srtp, data, &n)) {
         return;
     }
     if (n < (int) NGX_RTC_RTP_HEADER_SIZE) {
@@ -875,7 +875,7 @@ ngx_rtc_stream_on_srtp(ngx_stream_session_t *s, ngx_rtc_session_t *sess,
      * must be gone before the payload offset, the STAP-A keyframe check and
      * the GOP cache all assume the 12-byte fixed-header form. */
     rtp_len = (uint32_t) n;
-    if (ngx_rtc_rtp_strip_header_ext(data, &rtp_len) != NGX_RTC_OK) {
+    if (NGX_RTC_OK != ngx_rtc_rtp_strip_header_ext(data, &rtp_len)) {
         return; /* malformed header: drop the packet */
     }
 
@@ -992,7 +992,7 @@ ngx_rtc_stream_rtcp_cb(const ngx_rtc_rtcp_pkt_t *pkt, void *opaque)
     if (NGX_RTC_RTCP_RTPFB == pkt->type && NGX_RTC_RTCP_FMT_NACK == pkt->fmt) {
         if (pkt->media_ssrc == sess->source->video_ssrc) {
             n = 0;
-            if (ngx_rtc_rtcp_nack_expand(pkt, seqs, 512, &n) == NGX_RTC_OK) {
+            if (NGX_RTC_OK == ngx_rtc_rtcp_nack_expand(pkt, seqs, 512, &n)) {
                 ngx_msec_t now = ngx_current_msec;
 
                 /* Roll the backoff-adjusted response window when it elapses; a
@@ -1174,7 +1174,7 @@ ngx_rtc_stream_dtls_timer(ngx_event_t *ev)
         return;
     }
 
-    if (ngx_rtc_dtls_handle_timeout(&sess->dtls) != 0) {
+    if (0 != ngx_rtc_dtls_handle_timeout(&sess->dtls)) {
         ngx_log_error(NGX_LOG_ERR, ev->log, 0,
                       "ngx_rtc_stream: DTLS timeout handling failed, "
                       "closing session=%s", sess->ice_ufrag);
@@ -1206,7 +1206,7 @@ ngx_rtc_stream_dtls_done(void *user)
     uint8_t            recv_key[NGX_RTC_SRTP_KEY_LEN + NGX_RTC_SRTP_SALT_LEN];
     uint8_t            send_key[NGX_RTC_SRTP_KEY_LEN + NGX_RTC_SRTP_SALT_LEN];
 
-    if (ngx_rtc_dtls_get_srtp_key(&sess->dtls, recv_key, send_key) != 0) {
+    if (0 != ngx_rtc_dtls_get_srtp_key(&sess->dtls, recv_key, send_key)) {
         /* Flag, do not close: this callback runs synchronously inside
          * ngx_rtc_dtls_on_data()/ngx_rtc_dtls_handle_timeout(), and both of
          * those callers use `sess` again after the call returns. Closing here
@@ -1217,7 +1217,7 @@ ngx_rtc_stream_dtls_done(void *user)
         return;
     }
 
-    if (ngx_rtc_srtp_create(&sess->srtp, recv_key, send_key) != 0) {
+    if (0 != ngx_rtc_srtp_create(&sess->srtp, recv_key, send_key)) {
         sess->close_pending = 1;
         return;
     }
@@ -1412,7 +1412,7 @@ ngx_rtc_stream_drain_ring(void)
         return;
     }
 
-    while (ngx_rtc_shm_ring_dequeue(ring, &entry) == NGX_OK) {
+    while (NGX_OK == ngx_rtc_shm_ring_dequeue(ring, &entry)) {
         for (i = 0; i < entry.nsess; i++) {
             sess = ngx_rtc_session_find_by_id(entry.sess[i]);
             if (NULL != sess) {
@@ -1479,9 +1479,9 @@ ngx_rtc_stream_retransmit(ngx_rtc_session_t *sess, uint16_t seq)
         return NGX_RTC_ERR_PARSE;
     }
 
-    if (ngx_rtc_shm_retransmit_get(ccf->sh, (u_char *) sess->source->name,
+    if (NGX_OK != ngx_rtc_shm_retransmit_get(ccf->sh, (u_char *) sess->source->name,
             ngx_strlen(sess->source->name), seq,
-            scratch, sizeof(scratch), &out_len) != NGX_OK) {
+            scratch, sizeof(scratch), &out_len)) {
         return NGX_RTC_ERR_PARSE;
     }
 

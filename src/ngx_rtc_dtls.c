@@ -126,9 +126,9 @@ ngx_rtc_dtls_build_ctx(void)
     }
 
     /* WebRTC requires DTLS 1.2 (RFC 5764 / RFC 6347). */
-    if (SSL_CTX_set_min_proto_version(ngx_rtc_dtls_ctx, DTLS1_2_VERSION) != 1
-            || SSL_CTX_set_max_proto_version(ngx_rtc_dtls_ctx,
-                                             DTLS1_2_VERSION) != 1) {
+    if (1 != SSL_CTX_set_min_proto_version(ngx_rtc_dtls_ctx, DTLS1_2_VERSION)
+            || 1 != SSL_CTX_set_max_proto_version(ngx_rtc_dtls_ctx,
+                                                  DTLS1_2_VERSION)) {
         return -1;
     }
 
@@ -143,7 +143,7 @@ ngx_rtc_dtls_build_ctx(void)
     SSL_CTX_set_read_ahead(ngx_rtc_dtls_ctx, 1);
 
     /* RFC 5764: negotiate SRTP_AES128_CM_SHA1_80. */
-    if (SSL_CTX_set_tlsext_use_srtp(ngx_rtc_dtls_ctx, "SRTP_AES128_CM_SHA1_80") != 0) {
+    if (0 != SSL_CTX_set_tlsext_use_srtp(ngx_rtc_dtls_ctx, "SRTP_AES128_CM_SHA1_80")) {
         return -1;
     }
 
@@ -157,11 +157,11 @@ ngx_rtc_dtls_global_init(void)
         return 0;
     }
 
-    if (ngx_rtc_dtls_gen_certificate() != 0) {
+    if (0 != ngx_rtc_dtls_gen_certificate()) {
         return -1;
     }
 
-    if (ngx_rtc_dtls_build_ctx() != 0) {
+    if (0 != ngx_rtc_dtls_build_ctx()) {
         return -1;
     }
 
@@ -267,7 +267,7 @@ ngx_rtc_dtls_next_timeout_ms(const ngx_rtc_dtls_t *dtls)
         return 0;
     }
 
-    if (DTLSv1_get_timeout(dtls->ssl, &tv) == 0) {
+    if (0 == DTLSv1_get_timeout(dtls->ssl, &tv)) {
         return 0;
     }
 
@@ -287,7 +287,7 @@ ngx_rtc_dtls_handle_timeout(ngx_rtc_dtls_t *dtls)
     if (rc < 0) {
         return -1;
     }
-    if (rc == 0) {
+    if (0 == rc) {
         return 0;
     }
 
@@ -313,8 +313,8 @@ ngx_rtc_dtls_get_srtp_key(ngx_rtc_dtls_t *dtls, uint8_t *recv_key, uint8_t *send
         return -1;
     }
 
-    if (SSL_export_keying_material(dtls->ssl, material, sizeof(material),
-            label, sizeof(label) - 1, NULL, 0, 0) != 1) {
+    if (1 != SSL_export_keying_material(dtls->ssl, material, sizeof(material),
+            label, sizeof(label) - 1, NULL, 0, 0)) {
         return -1;
     }
 

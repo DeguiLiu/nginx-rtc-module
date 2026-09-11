@@ -379,13 +379,13 @@ ngx_rtc_core_init_module(ngx_cycle_t *cycle)
          * own descriptor table entries and stay attached to the old open file
          * description until they exit, which is what the graceful handover
          * needs. */
-        if (ccf->sh->notify_fd[w] != -1) {
+        if (-1 != ccf->sh->notify_fd[w]) {
             (void) close(ccf->sh->notify_fd[w]);
             ccf->sh->notify_fd[w] = -1;
         }
 
         fd = eventfd(0, EFD_NONBLOCK);
-        if (fd == -1) {
+        if (-1 == fd) {
             ngx_log_error(NGX_LOG_EMERG, cycle->log, ngx_errno,
                           "ngx_rtc: eventfd() failed for worker %ui", w);
             return NGX_ERROR;
@@ -488,7 +488,7 @@ ngx_rtc_bt_init_process(ngx_cycle_t *cycle)
     sigemptyset(&sa.sa_mask);
 
     for (i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
-        if (sigaction(sigs[i], &sa, NULL) == -1) {
+        if (-1 == sigaction(sigs[i], &sa, NULL)) {
             ngx_log_error(NGX_LOG_WARN, cycle->log, ngx_errno,
                           "ngx_rtc_backtrace: sigaction(%d) failed", sigs[i]);
         }
