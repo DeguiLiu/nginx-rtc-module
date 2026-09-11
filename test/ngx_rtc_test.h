@@ -31,6 +31,17 @@ void ngx_rtc_test_register(const char *name, void (*fn)(void));
 /* Run all registered tests, print the summary, return 0 when all passed. */
 int ngx_rtc_test_run_all(void);
 
+/*
+ * Drain ngx_posted_events once, the way ngx_event_process_posted() does.
+ *
+ * nginx_stub.c defines it for both header worlds -- nginx's own event objects
+ * under the real headers, the include/ stubs otherwise -- because the tests
+ * that watch the close path's posted finalize have no event loop and must not
+ * have to know which world they were compiled in. Declared here so that no
+ * test TU calls it implicitly.
+ */
+void ngx_rtc_host_drain_posted(void);
+
 /* Record a failed assertion and mark the running test as failed. */
 void ngx_rtc_test_fail_bool(const char *file, int line, const char *cond);
 void ngx_rtc_test_fail_i64(const char *file, int line,

@@ -28,6 +28,7 @@
 #include "ngx_rtc_shm.h"
 #include "ngx_rtc_srtp.h"
 #include "ngx_rtc_core.h"
+#include "ngx_rtc_test.h"
 
 volatile ngx_msec_t ngx_current_msec = 0;
 
