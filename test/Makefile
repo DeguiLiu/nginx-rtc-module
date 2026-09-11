@@ -49,6 +49,25 @@ NGX_INC :=
 NGX_REAL :=
 endif
 
+# Which world this run compiles in is the difference between "the tests prove
+# nginx's own types and layouts" and "the tests prove include/ does", so say it
+# on every run rather than leave it to be inferred from a warning line the run
+# may or may not print.
+#
+# The probe above is relative to this directory, so a worktree that does not sit
+# next to the deploy repo -- the /home/ci/... one, for instance -- comes up empty
+# and lands in the stub world silently: exactly the fallback the driver scripts
+# go to some trouble to avoid for their own paths. Only a caller that set
+# NGX_SRC itself asked for its world; everyone else gets told which one the
+# probe picked.
+ifeq ($(origin NGX_SRC),command line)
+$(info header world: $(if $(NGX_SRC),real ($(NGX_SRC)),stub) [NGX_SRC set by the caller])
+else ifeq ($(NGX_SRC),)
+$(warning header world: stub -- the NGX_SRC probe found no configured nginx tree under $(CURDIR)/../../nginx-rtc-example/build/src/openresty-*/build/nginx-*, so only the include/ stubs are compiled. Pass NGX_SRC=<abs path to an nginx tree with objs/ngx_auto_config.h> to build the real-header world.)
+else
+$(info header world: real ($(NGX_SRC)))
+endif
+
 # -Iinclude is LAST so that, in an NGX_SRC build, the real nginx headers win the
 # lookup and include/ only serves srtp2/srtp.h, which nginx does not ship.
 #
