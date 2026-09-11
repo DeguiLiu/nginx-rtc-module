@@ -31,6 +31,23 @@ extern int ngx_http_lua_ffi_shdict_store(ngx_shm_zone_t *zone, int op,
 #define NGX_RTC_SHDICT_TSTRING  4
 #define NGX_RTC_STATS_MIRROR_MS 1000
 
+/* Headroom every slprintf in ngx_rtc_http_render_stats() must leave unwritten
+ * before it starts one more source or one more session. ngx_slprintf() stops at
+ * `end` rather than overflowing, so this is not a memory-safety bound -- it is
+ * what keeps the document valid. Without it a long session list eats the budget
+ * mid-array, the closing brackets and the totals object are silently dropped,
+ * and every Lua consumer of /rtc/v1/stats goes dark at once with no error
+ * anywhere. Sized for one source's fixed tail plus the whole totals tail at
+ * worst-case %ui widths. */
+#define NGX_RTC_STATS_RESERVE   2048u
+
+/* Upper bound on the SDP offer buffered out of a /rtc/v1/play/ body. The SDP
+ * parser is length-driven and bounds every field it copies, so this is purely
+ * a memory cap -- but it must be enforced, because the body is otherwise only
+ * limited by client_max_body_size. 16 KB covers a browser offer with inline
+ * ICE candidates; the same constant guards the WHIP body copy. */
+#define NGX_RTC_MAX_SDP_LEN     16384u
+
 /* ngx_lua wraps each lua_shared_dict: the zone registered in
  * cycle->shared_memory is only a wrapper whose ->data points to a
  * ngx_http_lua_shm_zone_ctx_t { log, lmcf, cycle, zone }.  The real shdict
@@ -221,11 +238,22 @@ ngx_rtc_http_render_stats(u_char *p, u_char *end)
     ngx_uint_t              total_send_failed;
     ngx_uint_t              total_send_eagain;
     ngx_uint_t              total_retransmit_alloc_failed;
+    ngx_uint_t              total_retx_append_locked;
+    ngx_uint_t              total_retx_append_us;
+    ngx_uint_t              total_retx_replay_count;
+    ngx_uint_t              total_retx_replay_slots;
+    ngx_uint_t              total_retx_replay_us;
+    ngx_uint_t              session_states[NGX_RTC_SESSION_STATE_CLOSED + 1];
+    ngx_uint_t              st;
+    ngx_queue_t            *ssq;
 
     ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
     if (NULL == ccf || NULL == ccf->sh) {
         return ngx_slprintf(p, end, "{\"code\":0,\"streams\":[],"
-                            "\"total_streams\":0,\"total_clients\":0}");
+                            "\"total_streams\":0,\"total_clients\":0,"
+                            "\"session_states\":{\"UNKNOWN\":0,\"NEW\":0,"
+                            "\"ICE_BOUND\":0,\"DTLS_HANDSHAKE\":0,"
+                            "\"SRTP_READY\":0}}");
     }
     sh = ccf->sh;
 
@@ -238,13 +266,43 @@ ngx_rtc_http_render_stats(u_char *p, u_char *end)
     total_send_failed = 0;
     total_send_eagain = 0;
     total_retransmit_alloc_failed = 0;
+    total_retx_append_locked = 0;
+    total_retx_append_us = 0;
+    total_retx_replay_count = 0;
+    total_retx_replay_slots = 0;
+    total_retx_replay_us = 0;
+    ngx_memzero(session_states, sizeof(session_states));
 
     ngx_shmtx_lock(&sh->pool->mutex);
+
+    /* Count every skeleton, not just the subscribed ones. A session wedged in
+     * NEW or mid-handshake has not subscribed yet -- and a WHIP publisher never
+     * will, because activate() deliberately keeps it out of its own subscriber
+     * list -- so counting from the per-source arrays below would report zero
+     * for exactly the states worth alerting on. Walking session_list also
+     * reaches a session whose source was reaped underneath it, which no
+     * per-source view can see. */
+    for (ssq = ngx_queue_head(&sh->session_list);
+         ssq != ngx_queue_sentinel(&sh->session_list);
+         ssq = ngx_queue_next(ssq)) {
+        shm_sess = ngx_queue_data(ssq, ngx_rtc_shm_session_t, queue);
+        st = shm_sess->state;
+        if (st > NGX_RTC_SESSION_STATE_CLOSED) {
+            st = NGX_RTC_SESSION_STATE_UNKNOWN;
+        }
+        session_states[st]++;
+    }
 
     for (q = ngx_queue_head(&sh->source_list);
          q != ngx_queue_sentinel(&sh->source_list);
          q = ngx_queue_next(q)) {
         shm_src = ngx_queue_data(q, ngx_rtc_shm_source_t, queue);
+
+        /* Never start a source that cannot be finished: this entry's fixed tail
+         * and the whole closing totals still have to fit after it. */
+        if (p >= end - NGX_RTC_STATS_RESERVE) {
+            break;
+        }
 
         nsub = 0;
         cross = 0;
@@ -269,29 +327,63 @@ ngx_rtc_http_render_stats(u_char *p, u_char *end)
                 (ngx_uint_t)shm_src->send_failed,
                 (ngx_uint_t)shm_src->send_eagain);
 
+        /* Every skeleton of this source, not only its subscribers -- see the
+         * counting pass above. Every session is created against a source
+         * (session_add refuses a name that is not registered), so this set is
+         * complete, and it is the only view in which a session that has not
+         * finished its handshake appears at all. */
         first_sess = 1;
-        for (sq = ngx_queue_head(&shm_src->subscribers);
-             sq != ngx_queue_sentinel(&shm_src->subscribers);
-             sq = ngx_queue_next(sq)) {
-            shm_sess = ngx_queue_data(sq, ngx_rtc_shm_session_t, sub_queue);
+        for (ssq = ngx_queue_head(&sh->session_list);
+             ssq != ngx_queue_sentinel(&sh->session_list);
+             ssq = ngx_queue_next(ssq)) {
+            shm_sess = ngx_queue_data(ssq, ngx_rtc_shm_session_t, queue);
+            if (shm_sess->source != shm_src) {
+                continue;
+            }
+            if (p >= end - NGX_RTC_STATS_RESERVE) {
+                break;
+            }
+
+            /* Clamped rather than trusted: the byte may have been written by a
+             * binary with a different enum, and an out-of-range value would
+             * otherwise index the state table or print an arbitrary name. */
+            st = shm_sess->state;
+            if (st > NGX_RTC_SESSION_STATE_CLOSED) {
+                st = NGX_RTC_SESSION_STATE_UNKNOWN;
+            }
+
             p = ngx_slprintf(p, end,
-                    "%s{\"id\":%ui,\"ufrag\":\"%s\",\"twcc_lost\":%ui,"
-                    "\"twcc_received\":%ui}",
+                    "%s{\"id\":%ui,\"ufrag\":\"%s\",\"state\":\"%s\","
+                    "\"twcc_lost\":%ui,\"twcc_received\":%ui,\"pacer_bps\":%ui,"
+                    "\"drop_pacer\":%ui,\"drop_gop\":%ui}",
                     first_sess ? "" : ",", (ngx_uint_t) shm_sess->id,
-                    shm_sess->ice_ufrag, (ngx_uint_t) shm_sess->twcc_lost,
-                    (ngx_uint_t) shm_sess->twcc_received);
+                    shm_sess->ice_ufrag,
+                    ngx_rtc_session_fsm_state_name(
+                            (ngx_rtc_session_state_t) st),
+                    (ngx_uint_t) shm_sess->twcc_lost,
+                    (ngx_uint_t) shm_sess->twcc_received,
+                    (ngx_uint_t) shm_sess->pacer_bps,
+                    (ngx_uint_t) shm_sess->drop_pacer,
+                    (ngx_uint_t) shm_sess->drop_gop);
             first_sess = 0;
         }
 
         p = ngx_slprintf(p, end,
                 "],\"video\":{\"ssrc\":%ui,\"pt\":%ui,\"packets\":%ui,\"octets\":%ui},"
                 "\"audio\":{\"ssrc\":%ui,\"pt\":%ui,\"packets\":%ui,\"octets\":%ui},"
-                "\"retransmit_alloc_failed\":%ui}",
+                "\"retransmit_alloc_failed\":%ui,"
+                "\"retx_lock\":{\"append_locked\":%ui,\"append_us\":%ui,"
+                "\"replay_count\":%ui,\"replay_slots\":%ui,\"replay_us\":%ui}}",
                 (ngx_uint_t)shm_src->video_ssrc, (ngx_uint_t)shm_src->video_pt,
                 (ngx_uint_t)shm_src->video_pkts, (ngx_uint_t)shm_src->video_octets,
                 (ngx_uint_t)shm_src->audio_ssrc, (ngx_uint_t)shm_src->audio_pt,
                 (ngx_uint_t)shm_src->audio_pkts, (ngx_uint_t)shm_src->audio_octets,
-                (ngx_uint_t)shm_src->retransmit_alloc_failed);
+                (ngx_uint_t)shm_src->retransmit_alloc_failed,
+                (ngx_uint_t)shm_src->retx_append_locked,
+                (ngx_uint_t)shm_src->retx_append_us,
+                (ngx_uint_t)shm_src->retx_replay_count,
+                (ngx_uint_t)shm_src->retx_replay_slots,
+                (ngx_uint_t)shm_src->retx_replay_us);
         first = 0;
 
         total_streams++;
@@ -301,22 +393,41 @@ ngx_rtc_http_render_stats(u_char *p, u_char *end)
         total_send_failed += shm_src->send_failed;
         total_send_eagain += shm_src->send_eagain;
         total_retransmit_alloc_failed += shm_src->retransmit_alloc_failed;
-
-        if (p >= end - 64) {
-            break;
-        }
+        total_retx_append_locked += shm_src->retx_append_locked;
+        total_retx_append_us += shm_src->retx_append_us;
+        total_retx_replay_count += shm_src->retx_replay_count;
+        total_retx_replay_slots += shm_src->retx_replay_slots;
+        total_retx_replay_us += shm_src->retx_replay_us;
     }
 
     ngx_shmtx_unlock(&sh->pool->mutex);
 
+    /* CLOSED is deliberately absent. A closed skeleton is unlinked and freed
+     * outright (ngx_rtc_shm_expire_locked / session_remove_if_owner), so the
+     * counter could only ever read zero, and a series that is zero by
+     * construction is worse than no series: it reads as "nothing is closing".
+     * The observable form of "closed" is that the session left session_list. */
     return ngx_slprintf(p, end, "],\"total_streams\":%ui,\"total_clients\":%ui,"
                         "\"total_video_octets\":%ui,\"total_audio_octets\":%ui,"
                         "\"total_send_failed\":%ui,\"total_send_eagain\":%ui,"
-                        "\"total_retransmit_alloc_failed\":%ui}",
+                        "\"total_retransmit_alloc_failed\":%ui,"
+                        "\"total_retx_lock\":{\"append_locked\":%ui,\"append_us\":%ui,"
+                        "\"replay_count\":%ui,\"replay_slots\":%ui,\"replay_us\":%ui},"
+                        "\"session_states\":{\"UNKNOWN\":%ui,\"NEW\":%ui,"
+                        "\"ICE_BOUND\":%ui,\"DTLS_HANDSHAKE\":%ui,"
+                        "\"SRTP_READY\":%ui}}",
                         total_streams, total_clients,
                         total_video_octets, total_audio_octets,
                         total_send_failed, total_send_eagain,
-                        total_retransmit_alloc_failed);
+                        total_retransmit_alloc_failed,
+                        total_retx_append_locked, total_retx_append_us,
+                        total_retx_replay_count, total_retx_replay_slots,
+                        total_retx_replay_us,
+                        session_states[NGX_RTC_SESSION_STATE_UNKNOWN],
+                        session_states[NGX_RTC_SESSION_STATE_NEW],
+                        session_states[NGX_RTC_SESSION_STATE_ICE_BOUND],
+                        session_states[NGX_RTC_SESSION_STATE_DTLS_HANDSHAKE],
+                        session_states[NGX_RTC_SESSION_STATE_SRTP_READY]);
 }
 
 
@@ -481,8 +592,6 @@ ngx_rtc_http_play_handler(ngx_http_request_t *r)
     }
 
     rc = ngx_http_read_client_request_body(r, ngx_rtc_http_body_handler);
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                  "rtc_play: read_client_body rc=%d", (int)rc);
     if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
         return rc;
     }
@@ -495,17 +604,18 @@ static void
 ngx_rtc_http_body_handler(ngx_http_request_t *r)
 {
     ngx_rtc_chain_reader_t rd;
-    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                  "rtc_play: body_handler called, request_body=%p bufs=%p",
-                  r->request_body,
-                  (r->request_body ? r->request_body->bufs : NULL));
-    char                sdp[8192];
+    char               *sdp;
     size_t              sdp_len;
+    size_t              body_len;
+    ngx_chain_t        *cl;
     char                streamurl[256];
     size_t              su_len;
+    size_t              app_len;
+    size_t              stream_len;
+    u_char             *su_end;
     char               *app;
     char               *stream;
-    char                name[160];
+    char                name[NGX_RTC_SOURCE_NAME_MAX];
     ngx_rtc_sdp_offer_t offer;
     ngx_rtc_sdp_answer_t cfg;
     ngx_rtc_source_t   *src;
@@ -513,12 +623,20 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
     char                ans_buf[4096];
     uint32_t            ans_len;
     ngx_str_t           resp;
-    u_char              resp_buf[8192];
+    u_char             *p;
+    size_t              esc_len;
     size_t              resp_len;
     ngx_int_t           i;
     ngx_rtc_http_loc_conf_t *rcf;
     char                candidate_ip[NGX_RTC_SDP_STR_LEN];
     char                video_fmtp_buf[128];
+
+    /* Diagnostic only: NGX_LOG_ERR here printed a pointer pair on every play
+     * request. Level-gated so a production build pays one branch. */
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "rtc_play: body_handler request_body=%p bufs=%p",
+                   r->request_body,
+                   (r->request_body ? r->request_body->bufs : NULL));
 
     if (NULL == r->request_body || NULL == r->request_body->bufs) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
@@ -527,16 +645,41 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
         return;
     }
 
-    /* Parse straight from the request-body chain: no 8KB stack copy. The
+    /* The offer is client-controlled, so it goes on the request pool instead
+     * of a fixed stack frame, and the cap is applied before the allocation:
+     * the body itself is only bounded by client_max_body_size. */
+    body_len = 0;
+    for (cl = r->request_body->bufs; NULL != cl; cl = cl->next) {
+        if (NULL != cl->buf) {
+            body_len += (size_t) (cl->buf->last - cl->buf->pos);
+        }
+    }
+    if (body_len > NGX_RTC_MAX_SDP_LEN) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "rtc_play: request body too large, len=%uz", body_len);
+        ngx_http_finalize_request(r, NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
+        return;
+    }
+    sdp = ngx_pnalloc(r->pool, body_len + 1);
+    if (NULL == sdp) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "rtc_play: cannot allocate %uz bytes for the offer",
+                      body_len + 1);
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+
+    /* Parse straight from the request-body chain: no copy of the body. The
      * reader walks across buf boundaries, so an SDP offer split between two
      * bufs is still extracted whole. Re-init per field because JSON field
      * order is not guaranteed. */
     sdp_len = 0;
     ngx_rtc_chain_reader_init(&rd, r->request_body->bufs);
     if (ngx_rtc_http_json_string(&rd, "sdp",
-            sdp, sizeof(sdp), &sdp_len) != NGX_OK) {
+            sdp, body_len + 1, &sdp_len) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "rtc_play: sdp field not found in body");
+                      "rtc_play: no usable sdp field in the body "
+                      "(missing, or the body ended inside the value)");
         ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
         return;
     }
@@ -546,13 +689,18 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
     if (ngx_rtc_http_json_string(&rd, "streamurl",
             streamurl, sizeof(streamurl), &su_len) != NGX_OK) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "rtc_play: streamurl field not found in body");
+                      "rtc_play: no usable streamurl field in the body "
+                      "(missing, unterminated, or over %uz bytes)",
+                      sizeof(streamurl) - 1);
         ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
         return;
     }
 
-    /* streamurl: webrtc://host/app/stream -> "app/stream". */
-    app = strstr(streamurl, "://");
+    /* streamurl: webrtc://host/app/stream -> "app/stream". Bounded searches:
+     * su_len is the extracted field length, so the walk can never run past the
+     * JSON string even if it is not NUL terminated where we expect. */
+    su_end = (u_char *) streamurl + su_len;
+    app = (char *) ngx_strnstr((u_char *) streamurl, "://", su_len);
     if (NULL == app) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "rtc_play: streamurl has no :// -> '%s'", streamurl);
@@ -560,7 +708,7 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
         return;
     }
     app += 3;
-    app = strchr(app, '/');
+    app = (char *) ngx_strlchr((u_char *) app, su_end, '/');
     if (NULL == app) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "rtc_play: streamurl has no app sep -> '%s'", streamurl);
@@ -568,7 +716,7 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
         return;
     }
     app += 1;
-    stream = strchr(app, '/');
+    stream = (char *) ngx_strlchr((u_char *) app, su_end, '/');
     if (NULL == stream) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "rtc_play: streamurl has no stream sep -> '%s'", streamurl);
@@ -578,7 +726,21 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
     *stream = '\0';
     stream += 1;
 
-    snprintf(name, sizeof(name), "%s/%s", app, stream);
+    /* Same limit the registry applies, enforced one step earlier so a bad
+     * streamurl is a 400 instead of a 500. ngx_snprintf truncates silently,
+     * and a clipped "app/stream" names a *different* source rather than a
+     * visibly broken one. */
+    app_len = ngx_strlen(app);
+    stream_len = ngx_strlen(stream);
+    if (0 == app_len || 0 == stream_len
+            || app_len + stream_len + 2 > sizeof(name)) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "rtc_play: bad streamurl '%s'", streamurl);
+        ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
+        return;
+    }
+
+    ngx_snprintf((u_char *) name, sizeof(name) - 1, "%s/%s%Z", app, stream);
 
     ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
                   "rtc_play: streamurl='%s' name='%s'", streamurl, name);
@@ -608,7 +770,7 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
         ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
         if (NULL != ccf && NULL != ccf->sh) {
             shm_src = ngx_rtc_shm_source_get(ccf->sh, (u_char *) name,
-                                             strlen(name));
+                                             ngx_strlen(name));
             if (NULL != shm_src) {
                 src->video_ssrc = shm_src->video_ssrc;
                 src->audio_ssrc = shm_src->audio_ssrc;
@@ -617,7 +779,7 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
                 src->audio_pt = (0 != offer.audio_pt) ? offer.audio_pt
                                                       : shm_src->audio_pt;
                 ngx_rtc_shm_source_set_pt(ccf->sh, (u_char *) name,
-                                          strlen(name), offer.video_pt,
+                                          ngx_strlen(name), offer.video_pt,
                                           offer.audio_pt);
             }
         }
@@ -625,12 +787,11 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
 
     /* Session outlives the HTTP request (it is bound to the UDP DTLS/SRTP
      * connection), so allocate from process memory, not the request pool. */
-    sess = ngx_alloc(sizeof(ngx_rtc_session_t), r->connection->log);
+    sess = ngx_calloc(sizeof(ngx_rtc_session_t), r->connection->log);
     if (NULL == sess) {
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
-    ngx_memzero(sess, sizeof(*sess));
 
     /* Self-link the nginx queue nodes so ngx_queue_remove() is a safe no-op
      * when a session that never subscribed (or was never added) is closed. */
@@ -640,6 +801,8 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
     /* Initialize the session lifecycle state machine (NEW). */
     ngx_rtc_session_fsm_init(&sess->fsm, sess->fsm_path,
                              NGX_RTC_SESSION_FSM_MAX_DEPTH, sess);
+    ngx_rtc_session_fsm_set_reporter(&sess->fsm,
+                                     ngx_rtc_session_fsm_report_unhandled);
     sess->last_active = ngx_current_msec;
 
     sess->source = src;
@@ -654,11 +817,16 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
     sess->twcc_video_ext = offer.video_twcc_ext; /* 0 = not offered */
     sess->twcc_audio_ext = offer.audio_twcc_ext;
 
-    snprintf(sess->ice_ufrag, sizeof(sess->ice_ufrag), "%08xu",
-            (unsigned)ngx_random());
-    snprintf(sess->ice_pwd, sizeof(sess->ice_pwd), "%08x%08x%08x",
-            (unsigned)ngx_random(), (unsigned)ngx_random(),
-            (unsigned)ngx_random());
+    /* %08uxD: nginx prints hex via the x flag plus the D (32-bit unsigned)
+     * conversion - a bare "%08x" has no conversion character and writes
+     * nothing. The trailing %c keeps the historical (accidental) 'u' suffix
+     * that ice_ufrag has always carried; drop it and this becomes
+     * "%08uxD%Z". */
+    ngx_snprintf((u_char *) sess->ice_ufrag, sizeof(sess->ice_ufrag) - 1,
+                 "%08uxD%c%Z", (uint32_t) ngx_random(), 'u');
+    ngx_snprintf((u_char *) sess->ice_pwd, sizeof(sess->ice_pwd) - 1,
+                 "%08uxD%08uxD%08uxD%Z", (uint32_t) ngx_random(),
+                 (uint32_t) ngx_random(), (uint32_t) ngx_random());
     ngx_rtc_session_add(sess);
 
     ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
@@ -674,9 +842,9 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
         ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
         if (NULL != ccf && NULL != ccf->sh) {
             shm_sess = ngx_rtc_shm_session_add(ccf->sh,
-                    (u_char *)sess->ice_ufrag, strlen(sess->ice_ufrag),
-                    (u_char *)sess->ice_pwd, strlen(sess->ice_pwd),
-                    (u_char *)name, strlen(name),
+                    (u_char *)sess->ice_ufrag, ngx_strlen(sess->ice_ufrag),
+                    (u_char *)sess->ice_pwd, ngx_strlen(sess->ice_pwd),
+                    (u_char *)name, ngx_strlen(name),
                     sess->video_pt, sess->audio_pt,
                     sess->twcc_video_ext, sess->twcc_audio_ext,
                     sess->publishing);
@@ -731,8 +899,10 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
 
     /* Echo the real stream profile-level-id from the SPS instead of the
      * hardcoded default: a mismatch makes Chrome's hardware decoder render
-     * garbage (green/blocky image). ngx_snprintf does not zero-pad %x, so the
-     * 6 hex chars are written by hand. */
+     * garbage (green/blocky image). The 6 hex chars are written by hand because
+     * nginx spells zero-padded hex "%02uxD" (the x flag plus the D 32-bit
+     * conversion) - a bare "%02x" has no conversion character and writes
+     * nothing at all. */
     if (src->sps_profile_level_id_valid)
     {
         static const char hex_digits[] = "0123456789abcdef";
@@ -758,37 +928,42 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
         return;
     }
 
-    /* {"code":0,"sdp":"<escaped sdp>"} */
-    resp_len = 0;
-    resp_buf[resp_len++] = '{';
-    memcpy(resp_buf + resp_len, "\"code\":0,\"sdp\":\"", 16);
-    resp_len += 16;
-    for (i = 0; i < (ngx_int_t)ans_len; i++) {
-        if (resp_len + 2 >= sizeof(resp_buf)) {
-            break;
-        }
-        if ('\n' == ans_buf[i]) {
-            resp_buf[resp_len++] = '\\';
-            resp_buf[resp_len++] = 'n';
-        } else if ('\r' == ans_buf[i]) {
-            resp_buf[resp_len++] = '\\';
-            resp_buf[resp_len++] = 'r';
-        } else if ('"' == ans_buf[i]) {
-            resp_buf[resp_len++] = '\\';
-            resp_buf[resp_len++] = '"';
-        } else {
-            resp_buf[resp_len++] = (u_char)ans_buf[i];
-        }
-    }
-    memcpy(resp_buf + resp_len, "\"}", 2);
-    resp_len += 2;
+    /* {"code":0,"sdp":"<escaped sdp>"}
+     *
+     * ngx_escape_json is nginx's own JSON escaper. The hand-rolled loop that
+     * used to be here covered only \n \r and ", so an answer carrying a
+     * backslash, a tab or any other control character was emitted as invalid
+     * JSON.
+     *
+     * With dst == NULL it returns the number of *extra* bytes escaping adds,
+     * not the escaped length -- nginx's own callers write `len + escape(..)`
+     * (ngx_http_log_module.c:1085). Sizing the buffer from esc_len alone made
+     * it short by the whole answer: ngx_escape_json ran past the end, and the
+     * pool allocations that followed (the ngx_buf_t for the body among them)
+     * landed inside the overlap, so the response carried raw pool pointers and
+     * a copy of its own HTTP header. The player's JSON.parse then rejected a
+     * body that was not even valid UTF-8. */
+    esc_len = (size_t) ngx_escape_json(NULL, (u_char *) ans_buf, ans_len);
+    resp_len = ans_len + esc_len + (sizeof("{\"code\":0,\"sdp\":\"\"}") - 1);
 
-    resp.data = resp_buf;
-    resp.len = resp_len;
+    p = ngx_pnalloc(r->pool, resp_len + 1);
+    if (NULL == p) {
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        return;
+    }
+    resp.data = p;
+
+    *p++ = '{';
+    p = ngx_cpymem(p, "\"code\":0,\"sdp\":\"",
+                   sizeof("\"code\":0,\"sdp\":\"") - 1);
+    p = (u_char *) ngx_escape_json(p, (u_char *) ans_buf, ans_len);
+    *p++ = '"';
+    *p++ = '}';
+
+    resp.len = (size_t) (p - resp.data);
 
     r->headers_out.status = NGX_HTTP_OK;
-    r->headers_out.content_type.len = sizeof("application/json") - 1;
-    r->headers_out.content_type.data = (u_char *)"application/json";
+    ngx_str_set(&r->headers_out.content_type, "application/json");
     r->headers_out.content_length_n = (off_t)resp.len;
 
     ngx_http_send_header(r);
@@ -851,7 +1026,8 @@ ngx_rtc_chain_reader_get(ngx_rtc_chain_reader_t *rd, u_char *out)
 /*
  * Extract a JSON string field ("key":"value") into out. Unescapes \" \\ \n \r
  * \t. Returns NGX_OK / NGX_ERROR. out is NUL-terminated; *out_len excludes the
- * NUL. The reader is advanced past the matched value; a failed key match only
+ * NUL. A value that does not fit out_cap is NGX_ERROR, never a truncation.
+ * The reader is advanced past the matched value; a failed key match only
  * consumes the opening quote so overlapping matches are not skipped.
  */
 static ngx_int_t
@@ -864,7 +1040,7 @@ ngx_rtc_http_json_string(ngx_rtc_chain_reader_t *rd, const char *key,
     ngx_rtc_chain_reader_t mark;
     u_char                 ch;
 
-    key_len = strlen(key);
+    key_len = ngx_strlen(key);
 
     for (;;) {
         /* Skip to the next quote that may open the field. */
@@ -922,19 +1098,26 @@ ngx_rtc_http_json_string(ngx_rtc_chain_reader_t *rd, const char *key,
             return NGX_ERROR;
         }
 
-        /* Read and unescape the value string. */
+        /* Read and unescape the value string. Both exits used to land on the
+         * same `break`, so a value that did not fit out_cap -- or one whose
+         * body ended mid-string -- came back as NGX_OK holding a clipped
+         * result. A clipped SDP offer still parses, it just describes fewer
+         * media sections, and a clipped streamurl silently addresses a
+         * different source; both are refused rather than guessed at. */
         olen = 0;
         for (;;) {
-            if (ngx_rtc_chain_reader_get(rd, &ch) != NGX_OK || '"' == ch) {
+            if (ngx_rtc_chain_reader_get(rd, &ch) != NGX_OK) {
+                return NGX_ERROR;
+            }
+            if ('"' == ch) {
                 break;
             }
             if (olen + 1 >= out_cap) {
-                break;
+                return NGX_ERROR;
             }
             if ('\\' == ch) {
                 if (ngx_rtc_chain_reader_get(rd, &ch) != NGX_OK) {
-                    out[olen++] = '\\';
-                    break;
+                    return NGX_ERROR;
                 }
                 if ('n' == ch) {
                     out[olen++] = '\n';
@@ -1128,12 +1311,19 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
     }
 
     /* Copy the raw SDP offer out of the request-body chain (it may span
-     * several chunk buffers). */
+     * several chunk buffers). Body size is client-controlled, so it is capped
+     * before the pool allocation. */
     sdp_len = 0;
     for (cl = r->request_body->bufs; NULL != cl; cl = cl->next) {
         if (NULL != cl->buf) {
             sdp_len += (size_t)(cl->buf->last - cl->buf->pos);
         }
+    }
+    if (sdp_len > NGX_RTC_MAX_SDP_LEN) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "rtc_whip: request body too large, len=%uz", sdp_len);
+        ngx_http_finalize_request(r, NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
+        return;
     }
 
     p = ngx_pnalloc(r->pool, sdp_len + 1);
@@ -1166,37 +1356,65 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
-    src->publishing = 1;
 
-    /* SSRC/PT authority lives in shm, shared with any playback worker. */
-    ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
-    if (NULL != ccf && NULL != ccf->sh) {
-        shm_src = ngx_rtc_shm_source_get(ccf->sh, (u_char *) name,
-                                         strlen(name));
-        if (NULL != shm_src) {
-            ngx_rtc_shm_source_set_publishing(ccf->sh, (u_char *) name,
-                                              strlen(name), 1);
-            src->video_ssrc = shm_src->video_ssrc;
-            src->audio_ssrc = shm_src->audio_ssrc;
-            src->video_pt = (0 != offer.video_pt) ? offer.video_pt
-                                                  : shm_src->video_pt;
-            src->audio_pt = (0 != offer.audio_pt) ? offer.audio_pt
-                                                  : shm_src->audio_pt;
-            ngx_rtc_shm_source_set_pt(ccf->sh, (u_char *) name, strlen(name),
-                                      offer.video_pt, offer.audio_pt);
-        }
+    /* Process-local ownership (a single-worker deployment has no shm to
+     * arbitrate): reject an RTMP-owned source before touching the shm. */
+    if (NGX_RTC_PUBLISHER_RTMP == src->publisher_kind) {
+        ngx_http_finalize_request(r, NGX_HTTP_CONFLICT);
+        return;
     }
 
-    sess = ngx_alloc(sizeof(ngx_rtc_session_t), r->connection->log);
+    if (NGX_BUSY == ngx_rtc_publish_claim(src, NGX_RTC_PUBLISHER_WHIP)) {
+        /* Already published by RTMP on this name: refuse the cross-protocol
+         * duplicate instead of sharing the source. */
+        ngx_http_finalize_request(r, NGX_HTTP_CONFLICT);
+        return;
+    }
+
+    /* SSRC/PT authority lives in shm, shared with any playback worker. A NULL
+     * shm_src here means no rtc_zone (single worker) or a source that vanished
+     * mid-claim: the local publish still proceeds, it just has no cross-worker
+     * mirror. */
+    ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
+    if (NULL != ccf && NULL != ccf->sh && NULL != src->shm_src) {
+        /* src->shm_src is void * (ngx_rtc_core.h cannot name the shm type);
+         * the cached pointer is fresh because claim() just stamped
+         * shm_sync_ms, so the media plane can mirror video into the retransmit
+         * ring without a per-packet rbtree lookup. */
+        shm_src = (ngx_rtc_shm_source_t *) src->shm_src;
+
+        src->video_ssrc = shm_src->video_ssrc;
+        src->audio_ssrc = shm_src->audio_ssrc;
+        src->video_pt = (0 != offer.video_pt) ? offer.video_pt
+                                              : shm_src->video_pt;
+        src->audio_pt = (0 != offer.audio_pt) ? offer.audio_pt
+                                              : shm_src->audio_pt;
+        ngx_rtc_shm_source_set_pt(ccf->sh, (u_char *) name, ngx_strlen(name),
+                                  offer.video_pt, offer.audio_pt);
+    }
+    /* A fresh WHIP publish (or republish) starts a new RTP sequence space:
+     * clear the uplink reorder buffer so stale packets from the previous
+     * generation cannot leak out or be mistaken for the new stream. */
+    ngx_rtc_jitter_reset(&src->jitter);
+    src->jitter.gap_timeout_ms = ngx_rtc_core_tunables()->jitter_timeout_ms;
+
+    sess = ngx_calloc(sizeof(ngx_rtc_session_t), r->connection->log);
     if (NULL == sess) {
+        /* The claim above already took the publish right. Dropping it here is
+         * what lets a later RTMP publish on this name proceed: without it the
+         * shm source stays publishing=1 forever, try_publish() sees a foreign
+         * publisher, and every later publish on the name is refused until a
+         * WHIP publish on it happens to succeed. */
+        ngx_rtc_publish_release(src);
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
         return;
     }
-    ngx_memzero(sess, sizeof(*sess));
     ngx_queue_init(&sess->queue);
     ngx_queue_init(&sess->sub_queue);
     ngx_rtc_session_fsm_init(&sess->fsm, sess->fsm_path,
                              NGX_RTC_SESSION_FSM_MAX_DEPTH, sess);
+    ngx_rtc_session_fsm_set_reporter(&sess->fsm,
+                                     ngx_rtc_session_fsm_report_unhandled);
     sess->last_active = ngx_current_msec;
     sess->source = src;
     sess->publishing = 1; /* WHIP: this session sends media, does not receive */
@@ -1204,23 +1422,25 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
     sess->audio_pt = (0 != offer.audio_pt) ? offer.audio_pt : src->audio_pt;
     sess->twcc_video_ext = offer.video_twcc_ext;
     sess->twcc_audio_ext = offer.audio_twcc_ext;
-    snprintf(sess->ice_ufrag, sizeof(sess->ice_ufrag), "%08xu",
-             (unsigned) ngx_random());
-    snprintf(sess->ice_pwd, sizeof(sess->ice_pwd), "%08x%08x%08x",
-             (unsigned) ngx_random(), (unsigned) ngx_random(),
-             (unsigned) ngx_random());
+    /* See the play path above for why the format is %08uxD and why the
+     * historical 'u' suffix is preserved. */
+    ngx_snprintf((u_char *) sess->ice_ufrag, sizeof(sess->ice_ufrag) - 1,
+                 "%08uxD%c%Z", (uint32_t) ngx_random(), 'u');
+    ngx_snprintf((u_char *) sess->ice_pwd, sizeof(sess->ice_pwd) - 1,
+                 "%08uxD%08uxD%08uxD%Z", (uint32_t) ngx_random(),
+                 (uint32_t) ngx_random(), (uint32_t) ngx_random());
     ngx_rtc_session_add(sess);
 
     if (NULL != ccf && NULL != ccf->sh) {
         shm_src = ngx_rtc_shm_source_get(ccf->sh, (u_char *) name,
-                                         strlen(name));
+                                         ngx_strlen(name));
         if (NULL != shm_src) {
             ngx_rtc_shm_session_t *shm_sess;
 
             shm_sess = ngx_rtc_shm_session_add(ccf->sh,
-                    (u_char *) sess->ice_ufrag, strlen(sess->ice_ufrag),
-                    (u_char *) sess->ice_pwd, strlen(sess->ice_pwd),
-                    (u_char *) name, strlen(name),
+                    (u_char *) sess->ice_ufrag, ngx_strlen(sess->ice_ufrag),
+                    (u_char *) sess->ice_pwd, ngx_strlen(sess->ice_pwd),
+                    (u_char *) name, ngx_strlen(name),
                     sess->video_pt, sess->audio_pt,
                     sess->twcc_video_ext, sess->twcc_audio_ext,
                     sess->publishing);
@@ -1263,6 +1483,7 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
 
     if (ngx_rtc_sdp_generate_answer(&cfg, ans_buf, sizeof(ans_buf), &ans_len)
             != NGX_RTC_OK) {
+        ngx_rtc_publish_release(sess->source);
         ngx_rtc_session_remove(sess);
         ngx_free(sess);
         ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
@@ -1274,8 +1495,7 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
                   name, sess->ice_ufrag);
 
     r->headers_out.status = NGX_HTTP_CREATED;
-    r->headers_out.content_type.len = sizeof("application/sdp") - 1;
-    r->headers_out.content_type.data = (u_char *) "application/sdp";
+    ngx_str_set(&r->headers_out.content_type, "application/sdp");
     r->headers_out.content_length_n = (off_t) ans_len;
 
     ngx_http_send_header(r);
@@ -1286,6 +1506,7 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
 
         outb = ngx_create_temp_buf(r->pool, ans_len);
         if (NULL == outb) {
+            ngx_rtc_publish_release(sess->source);
             ngx_rtc_session_remove(sess);
             ngx_free(sess);
             ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);

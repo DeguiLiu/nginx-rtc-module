@@ -33,6 +33,7 @@ typedef struct {
     ngx_flag_t  rtc;
     ngx_msec_t  handshake_timeout;
     ngx_msec_t  ready_timeout;
+    ngx_msec_t  reap_interval;
 } ngx_rtc_stream_srv_conf_t;
 
 /* One server{} in this MVP; the reaper timer needs these values without a
@@ -140,6 +141,14 @@ static ngx_command_t ngx_rtc_stream_commands[] = {
       offsetof(ngx_rtc_stream_srv_conf_t, ready_timeout),
       NULL },
 
+    /* Idle/half-open session reaper cadence. */
+    { ngx_string("rtc_reap_interval"),
+      NGX_STREAM_SRV_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_msec_slot,
+      NGX_STREAM_SRV_CONF_OFFSET,
+      offsetof(ngx_rtc_stream_srv_conf_t, reap_interval),
+      NULL },
+
       ngx_null_command
 };
 
@@ -183,6 +192,7 @@ ngx_rtc_stream_create_srv_conf(ngx_conf_t *cf)
     conf->rtc = NGX_CONF_UNSET;
     conf->handshake_timeout = NGX_CONF_UNSET_MSEC;
     conf->ready_timeout = NGX_CONF_UNSET_MSEC;
+    conf->reap_interval = NGX_CONF_UNSET_MSEC;
     return conf;
 }
 
@@ -212,11 +222,32 @@ ngx_rtc_stream_merge_srv_conf(ngx_conf_t *cf, void *prev, void *conf)
                               pscf->handshake_timeout, 10000);
     ngx_conf_merge_msec_value(scf->ready_timeout,
                               pscf->ready_timeout, 30000);
+    ngx_conf_merge_msec_value(scf->reap_interval,
+                              pscf->reap_interval, NGX_RTC_SESSION_REAP_INTERVAL_MS);
     ngx_conf_merge_value(scf->rtc, pscf->rtc, 0);
 
     ngx_rtc_stream_srv_conf = scf;
 
     return NGX_CONF_OK;
+}
+
+
+/* Reaper cadence, falling back to the compile-time default when the directive
+ * was never set (no rtc server, or a prev cycle that left NGX_CONF_UNSET).
+ * Mirrors ngx_rtc_rtcp_sr_interval() in the bridge. */
+static ngx_msec_t
+ngx_rtc_stream_reap_interval(void)
+{
+    ngx_msec_t  v;
+
+    if (NULL == ngx_rtc_stream_srv_conf) {
+        return NGX_RTC_SESSION_REAP_INTERVAL_MS;
+    }
+
+    v = ngx_rtc_stream_srv_conf->reap_interval;
+
+    return (NGX_CONF_UNSET_MSEC == v || 0 == v)
+           ? NGX_RTC_SESSION_REAP_INTERVAL_MS : v;
 }
 
 
@@ -259,7 +290,8 @@ ngx_rtc_stream_init_process(ngx_cycle_t *cycle)
     ngx_rtc_stream_reap_timer_ev.handler = ngx_rtc_stream_reap_timer;
     ngx_rtc_stream_reap_timer_ev.log = cycle->log;
     ngx_rtc_stream_reap_timer_ev.data = NULL;
-    ngx_add_timer(&ngx_rtc_stream_reap_timer_ev, NGX_RTC_SESSION_REAP_INTERVAL_MS);
+    ngx_add_timer(&ngx_rtc_stream_reap_timer_ev,
+                  ngx_rtc_stream_reap_interval());
 
     /* Register this worker's eventfd read side. The bridge writes one byte after
      * enqueueing, so the ring is drained immediately (event-driven) instead of
@@ -381,11 +413,10 @@ ngx_rtc_stream_attach_from_shm(ngx_connection_t *c, const char *ufrag)
 
     /* Allocate the process session before binding so a failed allocation
      * cannot leave the skeleton bound to this worker with no session. */
-    sess = ngx_alloc(sizeof(ngx_rtc_session_t), c->log);
+    sess = ngx_calloc(sizeof(ngx_rtc_session_t), c->log);
     if (NULL == sess) {
         return NULL;
     }
-    ngx_memzero(sess, sizeof(*sess));
 
     /* Bind before reading: the snapshot is copied under the pool mutex, so the
      * skeleton cannot be freed by a concurrent half-open reap between the
@@ -401,6 +432,20 @@ ngx_rtc_stream_attach_from_shm(ngx_connection_t *c, const char *ufrag)
     ngx_queue_init(&sess->sub_queue);
     ngx_rtc_session_fsm_init(&sess->fsm, sess->fsm_path,
                              NGX_RTC_SESSION_FSM_MAX_DEPTH, sess);
+    ngx_rtc_session_fsm_set_reporter(&sess->fsm,
+                                     ngx_rtc_session_fsm_report_unhandled);
+
+    /* The owning worker already finished DTLS/SRTP; this one never will, because
+     * handshake packets only reach the worker that owns the UDP session. Adopt
+     * the state from the shm skeleton, or is_ready() stays false here: the send
+     * gate in ngx_rtc_core.c drops every packet, RTCP is ignored in
+     * ngx_rtc_stream_on_rtcp, and the reaper uses handshake_timeout instead of
+     * ready_timeout, tearing down a session that is in fact live. */
+    if (0 != snap.srtp_ready) {
+        (void) ngx_rtc_session_fsm_restore(&sess->fsm,
+                                           NGX_RTC_SESSION_STATE_SRTP_READY);
+    }
+
     sess->last_active = ngx_current_msec;
 
     sess->id = snap.id;
@@ -422,6 +467,32 @@ ngx_rtc_stream_attach_from_shm(ngx_connection_t *c, const char *ufrag)
             src->video_pt = snap.source_video_pt;
             src->audio_pt = snap.source_audio_pt;
             sess->source = src;
+            if (0 != snap.publishing) {
+                /* WHIP publisher: cache the shm source pointer (already created
+                 * and marked publishing by the signaling worker) so the media
+                 * plane mirrors video without a per-packet rbtree lookup. */
+                src->shm_src = ngx_rtc_shm_source_get(
+                        ccf->sh, snap.source_name,
+                        ngx_strlen(snap.source_name));
+                src->shm_sync_ms = ngx_current_msec;
+
+                /* Tag process-local ownership too: this media worker is the one
+                 * that closes the session, so its release must see the WHIP
+                 * kind or the shm source stays publishing (leak). Adopt rather
+                 * than claim -- the signaling worker already holds the right,
+                 * and claiming here would make this process a second claimant.
+                 * This also mirrors publishing=1, which the shm snapshot
+                 * asserts: leaving it 0 let the local source be reaped while
+                 * the shm claim was still live. */
+                ngx_rtc_publish_mirror(src, NGX_RTC_PUBLISHER_WHIP);
+
+                /* New (or republished) stream: clear the uplink reorder buffer
+                 * on this media worker too. The HTTP worker only resets its own
+                 * per-process copy, which never carries SRTP media. */
+                ngx_rtc_jitter_reset(&src->jitter);
+                src->jitter.gap_timeout_ms =
+                    ngx_rtc_core_tunables()->jitter_timeout_ms;
+            }
         }
     }
 
@@ -431,6 +502,33 @@ ngx_rtc_stream_attach_from_shm(ngx_connection_t *c, const char *ufrag)
                   "ngx_rtc_stream: cross-worker attach ufrag=%s", ufrag);
 
     return sess;
+}
+
+
+/*
+ * Publish this session's lifecycle state into its shm skeleton, where the stats
+ * renderer picks it up for Lua. Called only from the UDP handlers below, which
+ * run solely on the worker that owns the session: the signaling worker holds a
+ * second, process-local copy of the same session whose machine stays in NEW for
+ * its whole life, and letting that one write would mark every live session NEW.
+ *
+ * There is deliberately no call on any close path. A closed skeleton is freed
+ * outright rather than kept around as CLOSED, so there is nothing to publish --
+ * and the close paths are exactly the ones reachable from the signaling worker,
+ * where the local state is stale.
+ */
+static void
+ngx_rtc_stream_publish_state(ngx_rtc_session_t *sess)
+{
+    ngx_rtc_core_conf_t *ccf;
+
+    ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
+    if (NULL != ccf && NULL != ccf->sh) {
+        ngx_rtc_shm_session_set_state(ccf->sh,
+                (u_char *) sess->ice_ufrag, ngx_strlen(sess->ice_ufrag),
+                (ngx_uint_t) ngx_worker,
+                (uint8_t) ngx_rtc_session_fsm_get_state(&sess->fsm));
+    }
 }
 
 
@@ -483,9 +581,24 @@ ngx_rtc_stream_on_stun(ngx_stream_session_t *s, u_char *data, size_t len)
     sess->peer_len = c->socklen;
     sess->last_active = ngx_current_msec;
 
-    /* NEW -> ICE_BOUND (idempotent for a repeated STUN binding). */
-    (void)ngx_rtc_session_fsm_dispatch(&sess->fsm,
-                                       NGX_RTC_SESSION_EVT_STUN_BINDING);
+    {
+        ngx_rtc_session_fsm_ctx_t fctx;
+
+        fctx.conn = c;
+        fctx.data = NULL;
+        fctx.len = 0;
+
+        /* NEW -> ICE_BOUND, and a no-op for the binding retransmits and ICE
+         * consent checks that keep arriving for the life of the session. The
+         * transition guard checks the connection carried in fctx. */
+        (void)ngx_rtc_session_fsm_dispatch_ctx(&sess->fsm,
+                                               NGX_RTC_SESSION_EVT_STUN_BINDING,
+                                               &fctx);
+    }
+
+    /* ICE_BOUND when this was the transition, unchanged (and re-published) for
+     * the binding retransmits and consent checks that follow. */
+    ngx_rtc_stream_publish_state(sess);
 
     ngx_stream_set_ctx(s, sess, ngx_rtc_stream_module);
 
@@ -521,9 +634,30 @@ ngx_rtc_stream_on_dtls(ngx_stream_session_t *s, ngx_rtc_session_t *sess,
     }
 
     /* The first DTLS record after ICE binding creates the DTLS context and
-     * moves ICE_BOUND -> DTLS_HANDSHAKE. Later records are fed through. */
-    if (ngx_rtc_session_fsm_get_state(&sess->fsm)
-            < NGX_RTC_SESSION_STATE_DTLS_HANDSHAKE) {
+     * moves ICE_BOUND -> DTLS_HANDSHAKE. Later records are fed through: the
+     * state no longer says "pending". Only a record the transition guard
+     * accepts may start the handshake, so a datagram that merely looked like
+     * DTLS in the UDP dispatch never gets a context built from it. */
+    if (ngx_rtc_session_fsm_dtls_pending(&sess->fsm)) {
+        ngx_rtc_session_fsm_ctx_t fctx;
+
+        fctx.conn = c;
+        fctx.data = data;
+        fctx.len = len;
+
+        if (false == ngx_rtc_session_fsm_dispatch_ctx(
+                &sess->fsm, NGX_RTC_SESSION_EVT_DTLS_PACKET, &fctx)) {
+            return;
+        }
+
+        /* Past the guard means the transition was accepted, so the machine is
+         * now in DTLS_HANDSHAKE. Published here rather than in the DTLS-done
+         * path because this is the state a viewer wedged mid-handshake is stuck
+         * in, and it is the reason this state is exported at all. */
+        ngx_rtc_stream_publish_state(sess);
+
+        sess->conn = c;
+
         if (ngx_rtc_dtls_create(&sess->dtls,
                 ngx_rtc_stream_dtls_send, ngx_rtc_stream_dtls_done, sess) != 0) {
             ngx_log_error(NGX_LOG_ERR, c->log, 0,
@@ -531,9 +665,7 @@ ngx_rtc_stream_on_dtls(ngx_stream_session_t *s, ngx_rtc_session_t *sess,
             ngx_rtc_stream_session_close(sess, NGX_RTC_SESSION_EVT_CLOSE);
             return;
         }
-        sess->conn = c;
-        (void)ngx_rtc_session_fsm_dispatch(&sess->fsm,
-                                           NGX_RTC_SESSION_EVT_DTLS_PACKET);
+
         ngx_rtc_stream_dtls_schedule(sess);
     }
 
@@ -542,6 +674,14 @@ ngx_rtc_stream_on_dtls(ngx_stream_session_t *s, ngx_rtc_session_t *sess,
     if (ngx_rtc_dtls_on_data(&sess->dtls, data, len) != 0) {
         ngx_log_error(NGX_LOG_ERR, c->log, 0,
                       "ngx_rtc_stream: DTLS processing failed");
+        ngx_rtc_stream_session_close(sess, NGX_RTC_SESSION_EVT_CLOSE);
+        return;
+    }
+
+    /* The completion callback runs inside on_data(); when it cannot finish the
+     * handshake it flags instead of closing, so the teardown happens here
+     * rather than under this frame. */
+    if (0 != sess->close_pending) {
         ngx_rtc_stream_session_close(sess, NGX_RTC_SESSION_EVT_CLOSE);
         return;
     }
@@ -566,7 +706,7 @@ ngx_rtc_stream_on_rtcp(ngx_stream_session_t *s, u_char *data, size_t len)
     if (NULL == sess || NULL == sess->conn) {
         return;
     }
-    if (!ngx_rtc_session_fsm_is_ready(&sess->fsm)) {
+    if (0 == ngx_rtc_session_fsm_is_ready(&sess->fsm)) {
         return;
     }
 
@@ -590,18 +730,128 @@ ngx_rtc_stream_on_rtcp(ngx_stream_session_t *s, u_char *data, size_t len)
 }
 
 
+/* Resolve the shm source this publisher mirrors into, re-checking it at most
+ * once per NGX_RTC_SHM_SYNC_MS. The pointer is used lock-free on every media
+ * packet, and a release on another worker (the signaling worker's stale-session
+ * reaper, or this worker's own close) can make the shm source reapable while
+ * media still flows, so it must not be trusted for a whole publish.
+ *
+ * Never create the shm source here. ngx_rtc_shm_source_get() allocates on miss,
+ * and this runs once per media packet: after a teardown removed the source
+ * (RTMP release, or the reaper once a WHIP session expired) the next buffered
+ * or in-flight packet would resurrect it and re-claim publishing=1, leaving a
+ * name that no protocol can ever reclaim. The claim is only ever renewed for a
+ * source this worker reached through a real attach (attach_from_shm) or a WHIP
+ * publish, both of which cache shm_src up front. */
+static ngx_rtc_shm_source_t *
+ngx_rtc_stream_shm_source(ngx_rtc_source_t *src)
+{
+    ngx_rtc_core_conf_t  *ccf;
+    ngx_msec_t            now;
+
+    if (NULL == src || NULL == src->shm_src) {
+        return NULL;
+    }
+
+    now = ngx_current_msec;
+    if ((ngx_msec_int_t) (now - src->shm_sync_ms)
+            < (ngx_msec_int_t) NGX_RTC_SHM_SYNC_MS) {
+        return (ngx_rtc_shm_source_t *) src->shm_src;
+    }
+
+    ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
+    if (NULL == ccf || NULL == ccf->sh) {
+        return NULL;
+    }
+
+    if (NGX_OK != ngx_rtc_shm_source_try_publish(ccf->sh,
+                                                 (u_char *) src->name,
+                                                 ngx_strlen(src->name),
+                                                 NGX_RTC_PUBLISHER_WHIP)) {
+        /* The source is gone (reaped) or another protocol owns the name: stop
+         * mirroring and drop the stale pointer so the next packet re-checks. */
+        src->shm_src = NULL;
+        src->shm_sync_ms = now;
+        return NULL;
+    }
+
+    src->shm_sync_ms = now;
+
+    return (ngx_rtc_shm_source_t *) src->shm_src;
+}
+
+
+/* Mirror the per-process counters into the resolved shm source without taking
+ * the slab pool mutex: the source is kept alive by the claim above and the
+ * counter words are naturally aligned, so a cross-worker reader never tears
+ * one. The name-keyed setter this replaces locked the pool on every media
+ * packet, on the same mutex the cross-worker media paths contend for. */
+static void
+ngx_rtc_stream_shm_stats(ngx_rtc_source_t *src, ngx_rtc_shm_source_t *shm_src)
+{
+    if (NULL == shm_src) {
+        return;
+    }
+
+    shm_src->video_pkts = src->video_pkts;
+    shm_src->video_octets = src->video_octets;
+    shm_src->audio_pkts = src->audio_pkts;
+    shm_src->audio_octets = src->audio_octets;
+}
+
+
+/* WHIP uplink reorder emit: called by ngx_rtc_jitter_push once video RTP
+ * packets are in sequence. Mirrors the pre-jitter path so counters, GOP cache
+ * and shm retransmit are updated exactly once per emitted packet. */
+static int32_t
+ngx_rtc_stream_whip_emit(void *opaque, const uint8_t *rtp, uint32_t len,
+                         uint8_t is_gop_start)
+{
+    ngx_rtc_session_t    *sess = opaque;
+    ngx_rtc_core_conf_t  *ccf;
+    ngx_rtc_shm_source_t *shm_src;
+    uint32_t              octets;
+
+    if (NULL == sess || NULL == sess->source) {
+        return NGX_RTC_ERR_INVALID;
+    }
+
+    ngx_rtc_broadcast_rtp(sess->source, rtp, len, 1 /* video */, is_gop_start);
+
+    octets = (len > NGX_RTC_RTP_HEADER_SIZE)
+             ? (len - NGX_RTC_RTP_HEADER_SIZE) : len;
+    sess->source->video_pkts++;
+    sess->source->video_octets += octets;
+
+    shm_src = ngx_rtc_stream_shm_source(sess->source);
+    ngx_rtc_stream_shm_stats(sess->source, shm_src);
+
+    if (NULL != shm_src) {
+        ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
+        if (NULL != ccf && NULL != ccf->sh) {
+            ngx_rtc_shm_retransmit_append(ccf->sh, shm_src, rtp, len,
+                                          is_gop_start);
+        }
+    }
+
+    ngx_rtc_rtp_ring_push(&sess->source->gop, rtp, len, is_gop_start);
+
+    return NGX_RTC_OK;
+}
+
 static void
 ngx_rtc_stream_on_srtp(ngx_stream_session_t *s, ngx_rtc_session_t *sess,
                        u_char *data, size_t len)
 {
     ngx_rtc_core_conf_t *ccf;
+    uint32_t             rtp_len;
     int                  n;
     uint8_t              pt;
     uint8_t              is_video;
     uint8_t              is_gop_start;
 
     if (NULL == sess || 0 == sess->publishing || NULL == sess->source
-            || !ngx_rtc_session_fsm_is_ready(&sess->fsm)) {
+            || 0 == ngx_rtc_session_fsm_is_ready(&sess->fsm)) {
         return; /* only a ready WHIP publisher sends SRTP media */
     }
 
@@ -611,6 +861,16 @@ ngx_rtc_stream_on_srtp(ngx_stream_session_t *s, ngx_rtc_session_t *sess,
     }
     if (n < (int) NGX_RTC_RTP_HEADER_SIZE) {
         return;
+    }
+
+    /* Normalize the publisher's RTP header. The downlink re-stamps its own
+     * transport-wide-cc extension at offset 12, so CSRCs and per-hop
+     * extensions (a browser adds them whenever the answer echoed its extmap)
+     * must be gone before the payload offset, the STAP-A keyframe check and
+     * the GOP cache all assume the 12-byte fixed-header form. */
+    rtp_len = (uint32_t) n;
+    if (ngx_rtc_rtp_strip_header_ext(data, &rtp_len) != NGX_RTC_OK) {
+        return; /* malformed header: drop the packet */
     }
 
     sess->last_active = ngx_current_msec;
@@ -645,55 +905,57 @@ ngx_rtc_stream_on_srtp(ngx_stream_session_t *s, ngx_rtc_session_t *sess,
         }
     }
 
-    /* A H264 STAP-A (SPS/PPS) opens the keyframe access unit for the shm
-     * snapshot. FU-A fragments carry their own NAL header and are not treated
-     * as a new GOP start. */
-    is_gop_start = 0;
-    if (0 != is_video && (uint32_t) n > NGX_RTC_RTP_HEADER_SIZE
-            && 24u == data[NGX_RTC_RTP_HEADER_SIZE]) {
-        is_gop_start = 1;
+    /* Video goes through the reorder buffer so a lossy WAN cannot deliver H264
+     * out of sequence; the emit callback handles broadcast, counters, GOP cache
+     * and shm retransmit. Audio is gapless and bypasses the buffer entirely. */
+    if (0 != is_video) {
+        uint16_t seq;
+
+        /* A H264 STAP-A (SPS/PPS) opens the keyframe access unit. The NALU
+         * header byte carries forbidden-bit + NRI + the 5-bit type, and NRI is
+         * normally 3 for a parameter set, so the byte is 0x78 rather than 0x18:
+         * comparing the whole byte against the bare type missed every real
+         * STAP-A. Mask the type field instead. */
+        is_gop_start = 0;
+        if (rtp_len > NGX_RTC_RTP_HEADER_SIZE
+                && NGX_RTC_H264_STAP_A
+                       == (data[NGX_RTC_RTP_HEADER_SIZE] & 0x1Fu)) {
+            is_gop_start = 1;
+        }
+
+        seq = (uint16_t)(((uint16_t) data[2] << 8) | (uint16_t) data[3]);
+        (void) ngx_rtc_jitter_push(&sess->source->jitter, data, rtp_len,
+                                   seq, is_gop_start,
+                                   (uint32_t) ngx_current_msec,
+                                   ngx_rtc_stream_whip_emit, sess);
+
+        /* Reorder-buffer counters, visible only in a --with-debug build: a
+         * sustained n_skipped/n_stale rate is what turns into visible mosaic,
+         * so keep them reachable without paying for a log line in production. */
+        ngx_log_debug5(NGX_LOG_DEBUG_EVENT, s->connection->log, 0,
+                       "ngx_rtc_stream: whip jitter pending=%ui skipped=%ui "
+                       "stale=%ui reanchor=%ui next=%ui",
+                       (ngx_uint_t) sess->source->jitter.pending,
+                       (ngx_uint_t) sess->source->jitter.n_skipped,
+                       (ngx_uint_t) sess->source->jitter.n_stale,
+                       (ngx_uint_t) sess->source->jitter.n_reanchor,
+                       (ngx_uint_t) sess->source->jitter.next_seq);
+        return;
     }
 
-    ngx_rtc_broadcast_rtp(sess->source, data, (uint32_t) n,
-                          is_video, is_gop_start);
+    /* Audio: broadcast and accumulate counters directly (never reordered). */
+    ngx_rtc_broadcast_rtp(sess->source, data, rtp_len, 0, 0);
 
-    /* Accumulate and mirror packet/octet counters for the WHIP producer. */
     {
         uint32_t octets;
 
-        octets = ((uint32_t) n > NGX_RTC_RTP_HEADER_SIZE)
-                 ? ((uint32_t) n - NGX_RTC_RTP_HEADER_SIZE) : (uint32_t) n;
-        if (0 != is_video) {
-            sess->source->video_pkts++;
-            sess->source->video_octets += octets;
-        } else {
-            sess->source->audio_pkts++;
-            sess->source->audio_octets += octets;
-        }
+        octets = (rtp_len > NGX_RTC_RTP_HEADER_SIZE)
+                 ? (rtp_len - NGX_RTC_RTP_HEADER_SIZE) : rtp_len;
+        sess->source->audio_pkts++;
+        sess->source->audio_octets += octets;
 
-        ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
-        if (NULL != ccf && NULL != ccf->sh) {
-            ngx_rtc_shm_source_set_media_stats(ccf->sh,
-                    (u_char *) sess->source->name,
-                    ngx_strlen(sess->source->name),
-                    sess->source->video_pkts, sess->source->video_octets,
-                    sess->source->audio_pkts, sess->source->audio_octets);
-        }
-    }
-
-    /* Cache the plaintext video packet in the source GOP ring (same-worker
-     * fast-start/NACK) and the shm retransmit ring (cross-worker), mirroring
-     * the RTMP bridge emit path so NACK/PLI answer uniformly. */
-    if (0 != is_video) {
-        ngx_rtc_rtp_ring_push(&sess->source->gop, data, (uint32_t) n,
-                              is_gop_start);
-        ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
-        if (NULL != ccf && NULL != ccf->sh) {
-            ngx_rtc_shm_retransmit_append(ccf->sh,
-                    (u_char *) sess->source->name,
-                    ngx_strlen(sess->source->name), data, (uint32_t) n,
-                    is_gop_start);
-        }
+        ngx_rtc_stream_shm_stats(sess->source,
+                                 ngx_rtc_stream_shm_source(sess->source));
     }
 }
 
@@ -703,6 +965,8 @@ ngx_rtc_stream_rtcp_cb(const ngx_rtc_rtcp_pkt_t *pkt, void *opaque)
 {
     ngx_rtc_stream_rtcp_ctx_t *ctx = opaque;
     ngx_rtc_session_t         *sess;
+    ngx_log_t                 *log;
+    uint64_t                   target_before;
     uint16_t                   seqs[512];
     uint16_t                   n;
     uint16_t                   i;
@@ -711,6 +975,9 @@ ngx_rtc_stream_rtcp_cb(const ngx_rtc_rtcp_pkt_t *pkt, void *opaque)
     if (NULL == sess || NULL == sess->source) {
         return NGX_RTC_OK;
     }
+
+    log = (NULL != sess->conn) ? ((ngx_connection_t *) sess->conn)->log
+                               : ngx_cycle->log;
 
     /* NACK/PLI feedback only ever concerns the video track. The GOP ring caches
      * video RTP only (audio seq is an independent counter), so answering an
@@ -722,25 +989,26 @@ ngx_rtc_stream_rtcp_cb(const ngx_rtc_rtcp_pkt_t *pkt, void *opaque)
             if (ngx_rtc_rtcp_nack_expand(pkt, seqs, 512, &n) == NGX_RTC_OK) {
                 ngx_msec_t now = ngx_current_msec;
 
-                if (now - sess->nack_window_start >= NGX_RTC_NACK_WINDOW_MS) {
-                    sess->nack_window_start = now;
-                    sess->nack_retransmitted = 0;
-                    /* New window: clear the dedup set so a packet answered in
-                     * a previous window may be sent again. */
+                /* Roll the backoff-adjusted response window when it elapses; a
+                 * rolled window also clears the dedup set so a packet answered
+                 * in a previous window may be sent again. */
+                if (0 != ngx_rtc_session_nack_window_step(sess, now)) {
                     ngx_rtc_session_nack_reset(sess);
                 }
 
                 for (i = 0; i < n; i++) {
-                    /* Cap retransmissions per window so a NACK storm cannot
-                     * burst the socket; the client re-NACKs the rest. */
-                    if (sess->nack_retransmitted >= NGX_RTC_NACK_BUDGET) {
+                    /* Cap attempts per window so a NACK storm cannot burst the
+                     * socket; the client re-NACKs the rest. An attempt counts
+                     * against the budget whether or not it is delivered: when
+                     * the pacer refuses every retransmit, a success-counted
+                     * budget would never advance, this loop would never break,
+                     * and one NACK could offer all 512 expanded sequences to
+                     * the pacer. The window backoff reads the same counter. */
+                    if (0 == ngx_rtc_session_nack_budget_take(sess)) {
                         break;
                     }
 
-                    if (ngx_rtc_stream_retransmit(sess, seqs[i])
-                            == NGX_RTC_OK) {
-                        sess->nack_retransmitted++;
-                    }
+                    (void)ngx_rtc_stream_retransmit(sess, seqs[i]);
                 }
             }
         }
@@ -749,13 +1017,32 @@ ngx_rtc_stream_rtcp_cb(const ngx_rtc_rtcp_pkt_t *pkt, void *opaque)
         if (pkt->media_ssrc == sess->source->video_ssrc) {
             /* Re-send the most recent keyframe from the shared cache: the
              * source GOP ring same-worker, the shm retransmit ring cross-worker. */
+            ngx_log_error(NGX_LOG_DEBUG, log, 0,
+                          "ngx_rtc: pli ufrag=\"%s\" target=%uL drop_pacer=%ui "
+                          "drop_gop=%ui twcc_seq=%ui",
+                          (u_char *) sess->ice_ufrag,
+                          sess->pacer_target_bps, sess->drop_pacer,
+                          sess->drop_gop, (ngx_uint_t) sess->twcc_seq);
             ngx_rtc_stream_replay_gop(sess);
         }
     } else if (NGX_RTC_RTCP_RTPFB == pkt->type
                && NGX_RTC_RTCP_FMT_TWCC == pkt->fmt) {
         /* Transport-wide CC feedback: feed the loss-based rate controller.
          * on_twcc accumulates both the cumulative counters (twcc_lost/received,
-         * mirrored below) and the AIMD window, and adjusts pacer_target_bps. */
+         * mirrored below) and the AIMD window, and adjusts pacer_target_bps.
+         * The raw fields are logged because the symbols alone cannot be trusted:
+         * if the feedback's range starts far from our own transport sequence,
+         * every symbol in it describes a packet this sender never stamped, and
+         * the loss it reports is not loss. */
+        ngx_log_error(NGX_LOG_DEBUG, log, 0,
+                      "ngx_rtc: twccfb ufrag=\"%s\" base=%ui count=%ui "
+                      "lost=%uD recv=%uD our_seq=%ui",
+                      (u_char *) sess->ice_ufrag,
+                      (ngx_uint_t) pkt->twcc_base_seq,
+                      (ngx_uint_t) pkt->twcc_pkt_count,
+                      pkt->twcc_lost, pkt->twcc_received,
+                      (ngx_uint_t) sess->twcc_seq);
+
         ngx_rtc_session_on_twcc(sess, pkt->twcc_lost, pkt->twcc_received,
                                 (uint64_t) ngx_current_msec);
 
@@ -764,17 +1051,31 @@ ngx_rtc_stream_rtcp_cb(const ngx_rtc_rtcp_pkt_t *pkt, void *opaque)
 
             ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
             if (NULL != ccf && NULL != ccf->sh) {
-                ngx_rtc_shm_session_set_twcc(ccf->sh,
+                ngx_rtc_shm_session_set_stats(ccf->sh,
                         (u_char *) sess->ice_ufrag,
                         ngx_strlen(sess->ice_ufrag),
-                        sess->twcc_lost, sess->twcc_received);
+                        sess->twcc_lost, sess->twcc_received,
+                        (ngx_uint_t) sess->pacer_target_bps,
+                        (ngx_uint_t) sess->drop_pacer,
+                        (ngx_uint_t) sess->drop_gop);
             }
         }
     } else if (pkt->has_remb) {
-        /* Receiver Estimated Maximum Bitrate: absolute cap hint from the
-         * viewer. Set the pacer target directly (clamped to [64k, 8M]); the
-         * loss-based controller keeps adjusting around it. */
-        ngx_rtc_session_pacer_set_target(sess, (uint64_t) pkt->remb_bitrate_bps);
+        /* Receiver Estimated Maximum Bitrate: an upper bound on what the viewer
+         * believes the path can carry, so it may lower the pacer target but
+         * never raise it. Applying it as the absolute target discarded the
+         * loss controller's state on every report, and since the estimate is
+         * derived from what the viewer received -- which the pacer's own drops
+         * reduce -- the two drove each other to the floor and stayed there.
+         * The loss-based controller owns pacer_target_bps; REMB only caps it. */
+        target_before = sess->pacer_target_bps;
+        ngx_rtc_session_pacer_cap(sess, (uint64_t) pkt->remb_bitrate_bps);
+        ngx_log_error(NGX_LOG_DEBUG, log, 0,
+                      "ngx_rtc: remb ufrag=\"%s\" remb=%uD target=%uL->%uL "
+                      "drop_pacer=%ui",
+                      (u_char *) sess->ice_ufrag, pkt->remb_bitrate_bps,
+                      target_before, sess->pacer_target_bps,
+                      sess->drop_pacer);
     } else if (NGX_RTC_RTCP_BYE == pkt->type) {
         ctx->bye = 1;
     }
@@ -875,6 +1176,14 @@ ngx_rtc_stream_dtls_timer(ngx_event_t *ev)
         return;
     }
 
+    /* The completion callback runs inside handle_timeout() and, when it cannot
+     * finish the handshake, flags rather than closes -- closing there would
+     * free `sess` before ngx_rtc_dtls_is_done() below reads it. */
+    if (0 != sess->close_pending) {
+        ngx_rtc_stream_session_close(sess, NGX_RTC_SESSION_EVT_CLOSE);
+        return;
+    }
+
     if (ngx_rtc_dtls_is_done(&sess->dtls)) {
         ngx_rtc_stream_dtls_cancel(sess);
         return;
@@ -892,12 +1201,18 @@ ngx_rtc_stream_dtls_done(void *user)
     uint8_t            send_key[NGX_RTC_SRTP_KEY_LEN + NGX_RTC_SRTP_SALT_LEN];
 
     if (ngx_rtc_dtls_get_srtp_key(&sess->dtls, recv_key, send_key) != 0) {
-        ngx_rtc_stream_session_close(sess, NGX_RTC_SESSION_EVT_CLOSE);
+        /* Flag, do not close: this callback runs synchronously inside
+         * ngx_rtc_dtls_on_data()/ngx_rtc_dtls_handle_timeout(), and both of
+         * those callers use `sess` again after the call returns. Closing here
+         * freed the session under them (use-after-free, then a possible
+         * double free on the second teardown path). They close it instead, as
+         * soon as they regain control. */
+        sess->close_pending = 1;
         return;
     }
 
     if (ngx_rtc_srtp_create(&sess->srtp, recv_key, send_key) != 0) {
-        ngx_rtc_stream_session_close(sess, NGX_RTC_SESSION_EVT_CLOSE);
+        sess->close_pending = 1;
         return;
     }
 
@@ -989,9 +1304,8 @@ ngx_rtc_stream_session_close(ngx_rtc_session_t *sess,
              * finalize must not run on this stack (see close_ev comment), so it
              * is posted; the event is heap-allocated because it outlives both
              * the session struct and (until finalize) the connection pool. */
-            close_ev = ngx_alloc(sizeof(ngx_rtc_stream_close_ev_t), c->log);
+            close_ev = ngx_calloc(sizeof(ngx_rtc_stream_close_ev_t), c->log);
             if (NULL != close_ev) {
-                ngx_memzero(close_ev, sizeof(*close_ev));
                 close_ev->s = s;
                 close_ev->ev.handler = ngx_rtc_stream_close_ev_handler;
                 close_ev->ev.log = c->log;
@@ -1004,8 +1318,27 @@ ngx_rtc_stream_session_close(ngx_rtc_session_t *sess,
         }
     }
 
-    /* Drive the state machine to CLOSED, then unsubscribe + release. */
+    /* Drive the state machine to CLOSED, then release the publisher and drop
+     * the session. The release must run BEFORE unsubscribe: once the source is
+     * no longer publishing, unsubscribe may reap it, and unsubscribe itself
+     * clears sess->source.
+     *
+     * The gate is the ownership tag alone, not sess->publishing: this worker
+     * reaches here both for the WHIP publisher's own session and for the
+     * media-worker mirror built by attach_from_shm, and only the latter carries
+     * publishing. Requiring it would leave the tag set and the shm source
+     * claimed, so a later RTMP publish on the same name would be refused as a
+     * cross-protocol conflict until the shm grace expired. */
     (void)ngx_rtc_session_fsm_dispatch(&sess->fsm, ev);
+
+    if (NULL != sess->source
+            && NGX_RTC_PUBLISHER_WHIP == sess->source->publisher_kind) {
+        /* Clears the local mirror first, then releases the shm claim and hands
+         * the shm source back if nothing else needs it. Gated on the WHIP kind
+         * on purpose: an RTMP-published name is released by its own ingest
+         * worker, and this worker mirroring that tag must not steal the flag. */
+        ngx_rtc_publish_release(sess->source);
+    }
 
     if (NULL != sess->source) {
         ngx_rtc_source_unsubscribe(sess->source, sess);
@@ -1079,7 +1412,8 @@ ngx_rtc_stream_drain_ring(void)
             if (NULL != sess) {
                 /* No per-session cache: NACK/PLI for this session is answered
                  * from the shm retransmit ring (cross-worker). */
-                (void) ngx_rtc_session_send_rtp(sess, entry.rtp, entry.len);
+                (void) ngx_rtc_session_send_rtp(sess, entry.rtp, entry.len,
+                                                (uint8_t) entry.gop);
             }
         }
     }
@@ -1112,9 +1446,7 @@ ngx_rtc_stream_shm_gop_send(void *opaque, const uint8_t *rtp, uint32_t len,
 {
     ngx_rtc_session_t *sess = opaque;
 
-    (void) is_gop_start;
-
-    if (0 == ngx_rtc_session_send_rtp(sess, rtp, len)) {
+    if (0 == ngx_rtc_session_send_rtp(sess, rtp, len, is_gop_start)) {
         return NGX_ERROR; /* socket full: stop the replay burst */
     }
 
@@ -1219,5 +1551,5 @@ ngx_rtc_stream_reap_timer(ngx_event_t *ev)
         }
     }
 
-    ngx_add_timer(ev, NGX_RTC_SESSION_REAP_INTERVAL_MS);
+    ngx_add_timer(ev, ngx_rtc_stream_reap_interval());
 }

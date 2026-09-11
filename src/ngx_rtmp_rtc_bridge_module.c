@@ -35,8 +35,9 @@
 
 static ngx_int_t  ngx_rtmp_rtc_av(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
                       ngx_chain_t *in);
-static ngx_int_t  ngx_rtmp_rtc_close_stream(ngx_rtmp_session_t *s,
-                      ngx_rtmp_close_stream_t *v);
+static ngx_int_t  ngx_rtmp_rtc_disconnect(ngx_rtmp_session_t *s,
+                      ngx_rtmp_header_t *h, ngx_chain_t *in);
+static void       ngx_rtmp_rtc_release_publish(ngx_rtmp_session_t *s);
 static ngx_int_t  ngx_rtmp_rtc_postconfiguration(ngx_conf_t *cf);
 static ngx_int_t  ngx_rtmp_rtc_init_process(ngx_cycle_t *cycle);
 static void       ngx_rtmp_rtc_rtcp_timer(ngx_event_t *ev);
@@ -76,10 +77,19 @@ typedef struct {
     ngx_msec_t  rtcp_sr_interval;   /* sender-report interval in ms */
 } ngx_rtmp_rtc_main_conf_t;
 
-/* RTMP close_stream chain hook used to mark the source stopped and release it
- * when the publisher leaves. */
-static ngx_rtmp_close_stream_pt ngx_rtmp_rtc_next_close_stream;
+/* Publisher teardown runs from the AMF_CMD event, not a close_stream hook: the
+ * close_stream pointer is assigned outright by the cmd and live modules, which
+ * postconfigure after this one, so a hook installed here never fires. */
 static ngx_rtmp_rtc_main_conf_t *ngx_rtmp_rtc_main_conf;
+
+/* One-shot per worker. A raw AAC frame arriving with no transcoder handle means
+ * the AAC sequence header was never accepted (missing, over-long, or arriving
+ * after this frame), and the stream then carries no audio until the next
+ * republish. That failure was silent: the only symptoms were audio RTP packet
+ * count 0 and askew=0 in the avsync line, with nothing in error.log -- see the
+ * 2026-09-10 investigation in docs/. Warn once so the next occurrence names the
+ * stream immediately instead of being reconstructed from counters. */
+static ngx_uint_t ngx_rtmp_rtc_audio_noctx_warned;
 
 
 static ngx_command_t ngx_rtmp_rtc_commands[] = {
@@ -178,59 +188,104 @@ ngx_rtmp_rtc_postconfiguration(ngx_conf_t *cf)
     h = ngx_array_push(&cmcf->events[NGX_RTMP_MSG_AUDIO]);
     *h = ngx_rtmp_rtc_av;
 
-    ngx_rtmp_rtc_next_close_stream = ngx_rtmp_close_stream;
-    ngx_rtmp_close_stream = ngx_rtmp_rtc_close_stream;
+    /*
+     * Publisher teardown hangs off the disconnect event, not the
+     * ngx_rtmp_close_stream pointer. That pointer is assigned outright with no
+     * next-save by ngx_rtmp_cmd_module and ngx_rtmp_live_module, both of which
+     * postconfigure after this module, so a hook installed here would be
+     * overwritten and never fire; the events[] arrays are appended to, so a
+     * handler registered here always runs.
+     *
+     * DISCONNECT rather than the AMF command handlers: ngx_rtmp_cmd_module
+     * registers those in cmcf->amf (a separate table keyed by command name) and
+     * routes a disconnect through deleteStream, so every publish teardown --
+     * clean deleteStream, a client that just drops the socket -- reaches this
+     * one handler.
+     */
+    h = ngx_array_push(&cmcf->events[NGX_RTMP_DISCONNECT]);
+    *h = ngx_rtmp_rtc_disconnect;
 
     return NGX_OK;
 }
 
 
 static ngx_int_t
-ngx_rtmp_rtc_close_stream(ngx_rtmp_session_t *s, ngx_rtmp_close_stream_t *v)
+ngx_rtmp_rtc_disconnect(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h,
+                        ngx_chain_t *in)
 {
-    ngx_rtmp_live_ctx_t *ctx;
-    ngx_rtc_source_t    *src;
-    char                 name[160];
-    ngx_int_t            publishing;
-
-    ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_live_module);
-    publishing = (NULL != ctx && ctx->publishing) ? 1 : 0;
-
-    if (publishing && s->app.len > 0 && s->stream.len > 0) {
-        snprintf(name, sizeof(name), "%.*s/%.*s",
-                 (int)s->app.len, s->app.data,
-                 (int)s->stream.len, s->stream.data);
-
-        src = ngx_rtc_source_find(name);
-        if (NULL != src) {
-            src->publishing = 0;
-            if (NULL != src->audio_ctx) {
-                ngx_rtc_audio_worker_destroy((ngx_rtc_audio_worker_t *)src->audio_ctx);
-                src->audio_ctx = NULL;
-            }
-            ngx_rtc_source_remove(name);
-
-            /* Phase 1: mark the shm source stopped and release it once it has
-             * no viewers (mirrors the per-process cleanup above). */
-            {
-                ngx_rtc_core_conf_t *ccf;
-
-                ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
-                if (NULL != ccf && NULL != ccf->sh) {
-                    ngx_rtc_shm_source_set_publishing(ccf->sh, (u_char *) name,
-                                                      strlen(name), 0);
-                    ngx_rtc_shm_source_remove(ccf->sh, (u_char *) name,
-                                              strlen(name));
-                }
-            }
-        }
-    }
-
-    if (NULL != ngx_rtmp_rtc_next_close_stream) {
-        return ngx_rtmp_rtc_next_close_stream(s, v);
-    }
+    ngx_rtmp_rtc_release_publish(s);
 
     return NGX_OK;
+}
+
+
+/*
+ * Build this session's "app/stream" name for the process-local source
+ * registry. NGX_ERROR means the name cannot be represented: either of the two
+ * halves is empty, or "app/stream" does not fit cap. ngx_snprintf truncates
+ * rather than failing, and a clipped name addresses a *different* source, so
+ * the overflow has to be caught here -- the callers treat NGX_ERROR the same
+ * as "no such source", which is exactly what a nameless stream is.
+ * cap is normally NGX_RTC_SOURCE_NAME_MAX, the same limit ngx_rtc_source_get()
+ * enforces, so anything this accepts is a name the registry can hold.
+ */
+static ngx_int_t
+ngx_rtmp_rtc_source_name(ngx_rtmp_session_t *s, char *out, size_t cap)
+{
+    if (0 == s->app.len || 0 == s->stream.len
+            || s->app.len + s->stream.len + 2 > cap) {
+        return NGX_ERROR;
+    }
+
+    ngx_snprintf((u_char *) out, cap - 1, "%*s/%*s%Z",
+                 s->app.len, s->app.data, s->stream.len, s->stream.data);
+
+    return NGX_OK;
+}
+
+
+/*
+ * Release the RTMP publish claim for the session's stream. Idempotent and a
+ * no-op unless this worker actually owns the RTMP kind, so it is safe to call
+ * from every deleteStream/closeStream and again on disconnect.
+ */
+static void
+ngx_rtmp_rtc_release_publish(ngx_rtmp_session_t *s)
+{
+    ngx_rtc_source_t    *src;
+    char                 name[NGX_RTC_SOURCE_NAME_MAX];
+
+    if (0 != s->auto_pushed
+            || NGX_OK != ngx_rtmp_rtc_source_name(s, name, sizeof(name))) {
+        return;
+    }
+
+    src = ngx_rtc_source_find(name);
+    if (NULL == src) {
+        return;
+    }
+
+    /* The AAC->Opus transcode context is owned by this local source and must
+     * not outlive the publisher, whatever the ownership tag says. Destroying
+     * it only past the publisher_kind gate below left it behind on any
+     * teardown that found the tag already cleared, stranding the transcoder
+     * thread and its queues with no owner left to stop them. */
+    if (NULL != src->audio_ctx) {
+        ngx_rtc_audio_worker_destroy((ngx_rtc_audio_worker_t *) src->audio_ctx);
+        src->audio_ctx = NULL;
+    }
+
+    if (NGX_RTC_PUBLISHER_RTMP != src->publisher_kind) {
+        return;
+    }
+
+    /* Clears the local mirror, releases the shm claim, and hands the shm source
+     * back if nothing else needs it. This must run before the local remove
+     * below: that one frees the source once it is neither publishing nor
+     * subscribed, so it cannot be the first step. */
+    ngx_rtc_publish_release(src);
+
+    ngx_rtc_source_remove(name);
 }
 
 
@@ -253,7 +308,7 @@ ngx_rtmp_rtc_send_sr_sdes(ngx_rtc_session_t *sess, ngx_rtc_source_t *src)
 
     out_len = 0;
 
-    memset(&sr, 0, sizeof(sr));
+    ngx_memzero(&sr, sizeof(sr));
     sr.ssrc = src->video_ssrc;
     sr.rtp_ts = src->video_ts;
     sr.packet_count = src->video_pkts;
@@ -298,21 +353,52 @@ ngx_rtmp_rtc_send_sr_sdes(ngx_rtc_session_t *sess, ngx_rtc_source_t *src)
 static void
 ngx_rtmp_rtc_rtcp_timer(ngx_event_t *ev)
 {
-    ngx_rtc_source_t  *src;
-    ngx_rtc_session_t *sess;
+    ngx_rtc_source_t     *src;
+    ngx_rtc_source_t     *next_src;
+    ngx_rtc_session_t    *sess;
+    ngx_rtc_core_conf_t  *ccf;
 
-    for (src = ngx_rtc_source_first(); NULL != src;
-         src = ngx_rtc_source_next(src)) {
+    ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
+
+    /* Capture the successor before the body, for the same reason as the inner
+     * subscriber loop: send_sr_sdes can close a session, and the resulting
+     * unsubscribe frees the source once it has no subscribers left. Reading
+     * ngx_rtc_source_next(src) after the body would dereference the freed node
+     * (observed as SIGSEGV in the backtrace handler from a reaper-driven close
+     * that raced this timer). */
+    for (src = ngx_rtc_source_first(); NULL != src; src = next_src) {
+        next_src = ngx_rtc_source_next(src);
+
         if (0 == src->video_ssrc) {
             continue;
         }
-        for (sess = ngx_rtc_source_first_subscriber(src); NULL != sess;
-             sess = ngx_rtc_source_next_subscriber(src, sess)) {
-            if (NULL == sess->conn
-                    || !ngx_rtc_session_fsm_is_ready(&sess->fsm)) {
-                continue;
+        /* Capture the successor before the callback: send_sr_sdes may close
+         * and free the session (send failure / fsm transition), which unlinks
+         * it from the subscriber queue and would leave the loop's own
+         * ngx_queue_next(&sess->sub_queue) walking a freed node. */
+        for (sess = ngx_rtc_source_first_subscriber(src); NULL != sess;) {
+            ngx_rtc_session_t *next = ngx_rtc_source_next_subscriber(src, sess);
+
+            if (NULL != sess->conn
+                    && ngx_rtc_session_fsm_is_ready(&sess->fsm)) {
+                ngx_rtmp_rtc_send_sr_sdes(sess, src);
+
+                /* Mirror the egress counters on the SR interval as well. The
+                 * TWCC path only fires for a client that negotiated
+                 * transport-cc, so a session without it would read as
+                 * pacer_bps 0 in /rtc/v1/stats even though its pacer is armed
+                 * and may be dropping. */
+                if (NULL != ccf && NULL != ccf->sh) {
+                    ngx_rtc_shm_session_set_stats(ccf->sh,
+                            (u_char *) sess->ice_ufrag,
+                            ngx_strlen(sess->ice_ufrag),
+                            sess->twcc_lost, sess->twcc_received,
+                            (ngx_uint_t) sess->pacer_target_bps,
+                            (ngx_uint_t) sess->drop_pacer,
+                            (ngx_uint_t) sess->drop_gop);
+                }
             }
-            ngx_rtmp_rtc_send_sr_sdes(sess, src);
+            sess = next;
         }
 
         /* A/V-skew observability (avsync Phase 1). Video ts is re-derived from
@@ -451,24 +537,80 @@ ngx_rtmp_rtc_chain_copy(ngx_chain_t *in, u_char *dst, size_t cap)
  * publisher arrives first (no viewer yet) it allocates the SSRC/PT into shm so a
  * later play reuses them.
  */
+/* Mirror the per-process counters into the claimed shm source. Lock-free by
+ * design: the shm source stays alive while its publisher runs (publishing == 1
+ * keeps both the reaper and remove away) and the counter words are naturally
+ * aligned, so a cross-worker reader never tears one. Called per media packet,
+ * so it must not take the pool mutex. */
 static void
-ngx_rtmp_rtc_sync_shm(ngx_rtc_source_t *src, const char *name)
+ngx_rtmp_rtc_shm_stats(ngx_rtc_source_t *src)
 {
-    ngx_rtc_core_conf_t  *ccf;
-    ngx_rtc_shm_source_t *shm_src;
+    ngx_rtc_shm_source_t *shm_src = (ngx_rtc_shm_source_t *) src->shm_src;
 
-    ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
-    if (NULL == ccf || NULL == ccf->sh) {
-        return;
-    }
-
-    shm_src = ngx_rtc_shm_source_get(ccf->sh, (u_char *) name, ngx_strlen(name));
     if (NULL == shm_src) {
         return;
     }
-    src->shm_src = shm_src; /* lock-free subscriber-version reads in broadcast */
-    ngx_rtc_shm_source_set_publishing(ccf->sh, (u_char *) name,
-                                      ngx_strlen(name), 1);
+
+    shm_src->video_pkts = src->video_pkts;
+    shm_src->video_octets = src->video_octets;
+    shm_src->audio_pkts = src->audio_pkts;
+    shm_src->audio_octets = src->audio_octets;
+
+    /* Heartbeat. This is the only shm write on the per-packet publish path, so
+     * it carries the liveness signal: the reaper reclaims a publishing source
+     * once this stops advancing, which is the only way to collect one whose
+     * worker died without running ngx_rtc_publish_release(). */
+    shm_src->publisher_seen_ms = (ngx_atomic_t) ngx_current_msec;
+}
+
+
+static ngx_int_t
+ngx_rtmp_rtc_sync_shm(ngx_rtc_source_t *src)
+{
+    ngx_rtc_core_conf_t  *ccf;
+    ngx_rtc_shm_source_t *shm_src;
+    ngx_msec_t            now;
+
+    ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
+    if (NULL == ccf || NULL == ccf->sh) {
+        return NGX_OK; /* no cross-worker shm: single-worker mode */
+    }
+
+    /* Fast path: this process already claimed RTMP for this name and resolved
+     * the shm source within the last interval, so the per-packet media path
+     * skips the pool-mutex rbtree lookup, the ownership re-claim and the
+     * SSRC/PT re-read (the SSRC/PT recorded at creation are reused). The
+     * interval bounds how long a pointer that another worker's release made
+     * reapable is still trusted.
+     *
+     * The kind check is load-bearing: src->shm_src can also be set by
+     * attach_from_shm() for a WHIP-published name that this same worker happens
+     * to serve. Without it, the cache would short-circuit the ownership
+     * arbitration and let an RTMP ingest run alongside a live WHIP publisher.
+     * Anything that is not already ours falls through to the claim below. */
+    now = ngx_current_msec;
+    if (NGX_RTC_PUBLISHER_RTMP == src->publisher_kind
+            && NULL != src->shm_src
+            && (ngx_msec_int_t) (now - src->shm_sync_ms)
+                   < (ngx_msec_int_t) NGX_RTC_SHM_SYNC_MS) {
+        ngx_rtmp_rtc_shm_stats(src);
+        return NGX_OK;
+    }
+
+    /* Claim (or renew) publish ownership. NGX_BUSY means another protocol
+     * already publishes this name: reject the ingest. On success src->shm_src
+     * may still be NULL -- no rtc_zone, or the source vanished mid-claim --
+     * which degrades to "no shm mirror" rather than rejecting. The claim also
+     * clears any stale local tag, so a dead WHIP name never blocks the
+     * takeover this call is trying to perform. */
+    if (NGX_BUSY == ngx_rtc_publish_claim(src, NGX_RTC_PUBLISHER_RTMP)) {
+        return NGX_BUSY;
+    }
+
+    shm_src = src->shm_src;
+    if (NULL == shm_src) {
+        return NGX_OK;
+    }
 
     src->video_ssrc = shm_src->video_ssrc;
     src->audio_ssrc = shm_src->audio_ssrc;
@@ -476,16 +618,13 @@ ngx_rtmp_rtc_sync_shm(ngx_rtc_source_t *src, const char *name)
     src->audio_pt = shm_src->audio_pt;
 
     /* Stats authority lives in shm so /rtc/v1/stats on any worker sees the
-     * whole registry. Reflect the per-process counters (best-effort snapshot,
-     * one-frame lag; the uint32 fields are word-aligned so the reader never
-     * tears a value across workers). sync_shm only runs on the RTMP ingest
-     * worker, so this is where the publisher's slot is recorded for the
-     * cross-worker check in /rtc/v1/stats. */
+     * whole registry. sync_shm only runs on the RTMP ingest worker, so this is
+     * where the publisher's slot is recorded for the cross-worker check in
+     * /rtc/v1/stats. */
     shm_src->publisher_slot = (ngx_int_t) ngx_worker;
-    shm_src->video_pkts = src->video_pkts;
-    shm_src->video_octets = src->video_octets;
-    shm_src->audio_pkts = src->audio_pkts;
-    shm_src->audio_octets = src->audio_octets;
+    ngx_rtmp_rtc_shm_stats(src);
+
+    return NGX_OK;
 }
 
 
@@ -496,7 +635,7 @@ ngx_rtmp_rtc_av(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h, ngx_chain_t *in)
     ngx_rtc_source_t    *src;
     u_char              *pos;
     u_char              *last;
-    char                 name[160];
+    char                 name[NGX_RTC_SOURCE_NAME_MAX];
     ssize_t              body_len;
 
     if (NULL == in || NULL == in->buf) {
@@ -505,6 +644,19 @@ ngx_rtmp_rtc_av(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h, ngx_chain_t *in)
 
     ctx = ngx_rtmp_get_module_ctx(s, ngx_rtmp_live_module);
     if (NULL == ctx || 0 == ctx->publishing) {
+        return NGX_OK;
+    }
+
+    /*
+     * Skip auto_push relay copies. With `rtmp_auto_push on`, the worker that
+     * accepted the publish relays it over a unix socket to every sibling,
+     * which re-runs this handler for the same app/stream. Those copies carry
+     * no real publisher: they reconnect about every 100 ms while the peer's
+     * source is gone, and each pass calls sync_shm, whose try_publish re-arms
+     * publishing=1 in the shm source. The name then never becomes reapable, so
+     * after the real publisher leaves no protocol can reclaim it. Only the
+     * accepting worker (auto_pushed == 0) owns the publish right. */
+    if (0 != s->auto_pushed) {
         return NGX_OK;
     }
 
@@ -527,15 +679,30 @@ ngx_rtmp_rtc_av(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h, ngx_chain_t *in)
         return NGX_OK;
     }
 
-    snprintf(name, sizeof(name), "%.*s/%.*s",
-            (int)s->app.len, s->app.data, (int)s->stream.len, s->stream.data);
+    if (NGX_OK != ngx_rtmp_rtc_source_name(s, name, sizeof(name))) {
+        return NGX_OK;
+    }
 
     src = ngx_rtc_source_get(name);
     if (NULL == src) {
         return NGX_OK;
     }
-    src->publishing = 1;
-    ngx_rtmp_rtc_sync_shm(src, name);
+    /*
+     * Ownership is arbitrated by the shm source, not by this process-local tag.
+     * The tag is a per-worker cache: a WHIP publish is claimed by the HTTP
+     * worker and mirrored by the media worker through attach_from_shm, so a
+     * close on one worker can leave the other holding a stale WHIP tag after
+     * the shm claim is already released. Trusting the tag alone made a name
+     * unpublishable over RTMP until the whole process was restarted.
+     *
+     * sync_shm re-claims in shm and reports NGX_BUSY only while another
+     * protocol really holds the name, so it is the deciding call. The claim
+     * inside it also rewrites the local tag, so no pre-clearing is needed here.
+     */
+    if (ngx_rtmp_rtc_sync_shm(src) != NGX_OK) {
+        /* Another protocol publishes this name (WHIP): reject the RTMP ingest. */
+        return NGX_ERROR;
+    }
 
     /* pos[0]=codec, pos[1]=AVCPacketType, pos[2..4]=CTS, then AVCC NALUs. */
     if (0 == pos[1]) {
@@ -745,7 +912,7 @@ static ngx_int_t
 ngx_rtmp_rtc_audio(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h, ngx_chain_t *in)
 {
     ngx_rtc_source_t *src;
-    char              name[160];
+    char              name[NGX_RTC_SOURCE_NAME_MAX];
     uint8_t           sound_format;
     uint8_t           aac_packet_type;
     uint32_t          asc_len;
@@ -766,15 +933,20 @@ ngx_rtmp_rtc_audio(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h, ngx_chain_t *in)
         return NGX_OK;
     }
 
-    snprintf(name, sizeof(name), "%.*s/%.*s",
-            (int)s->app.len, s->app.data, (int)s->stream.len, s->stream.data);
+    if (NGX_OK != ngx_rtmp_rtc_source_name(s, name, sizeof(name))) {
+        return NGX_OK;
+    }
 
     src = ngx_rtc_source_get(name);
     if (NULL == src) {
         return NGX_OK;
     }
-    src->publishing = 1;
-    ngx_rtmp_rtc_sync_shm(src, name);
+    /* See ngx_rtmp_rtc_av: the shm source arbitrates ownership, and the claim
+     * inside sync_shm rewrites the local tag, so no pre-clearing is needed. */
+    if (ngx_rtmp_rtc_sync_shm(src) != NGX_OK) {
+        /* Another protocol publishes this name (WHIP): reject the RTMP ingest. */
+        return NGX_ERROR;
+    }
 
     /* The tag body may span several chain buffers; concatenate it before
      * reading the FLV audio header + raw AAC frame (otherwise large tags
@@ -792,6 +964,13 @@ ngx_rtmp_rtc_audio(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h, ngx_chain_t *in)
         /* Sequence header: AudioSpecificConfig is the raw-AAC extradata. */
         asc_len = (uint32_t)(body_len - 2);
         if (asc_len < 2 || asc_len > sizeof(src->audio_asc)) {
+            /* Silent before: this leaves audio_ctx NULL, so every later raw
+             * frame is skipped and the stream has no audio at all. */
+            ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
+                          "ngx_rtmp_rtc: AAC sequence header rejected, "
+                          "stream=%s asc_len=%uD body_len=%uz asc_cap=%uz; "
+                          "stream will have no audio", name, asc_len,
+                          (size_t) body_len, sizeof(src->audio_asc));
             return NGX_OK;
         }
 
@@ -828,6 +1007,16 @@ ngx_rtmp_rtc_audio(ngx_rtmp_session_t *s, ngx_rtmp_header_t *h, ngx_chain_t *in)
     }
 
     if (NULL == src->audio_ctx) {
+        /* Every raw frame lands here for the rest of the publish, so warn
+         * once per worker rather than per frame. */
+        if (0 == ngx_rtmp_rtc_audio_noctx_warned) {
+            ngx_rtmp_rtc_audio_noctx_warned = 1;
+            ngx_log_error(NGX_LOG_ERR, s->connection->log, 0,
+                          "ngx_rtmp_rtc: raw AAC frame with no transcoder "
+                          "handle, stream=%s; the AAC sequence header was "
+                          "never accepted, so this stream has no audio until "
+                          "the next republish", name);
+        }
         return NGX_OK;
     }
 
@@ -898,7 +1087,7 @@ ngx_rtc_broadcast_rtp(ngx_rtc_source_t *src, const uint8_t *rtp,
     ngx_uint_t             i;
     ngx_uint_t             w;
     ngx_uint_t             nsess;
-    ngx_rtc_ring_entry_t   entry;
+    ngx_uint_t             sess_ids[NGX_RTC_RING_MAX_SESSIONS];
     ngx_rtc_session_t     *sess;
 
     if (len > NGX_RTC_RING_RTP_MAX) {
@@ -940,7 +1129,7 @@ ngx_rtc_broadcast_rtp(ngx_rtc_source_t *src, const uint8_t *rtp,
             continue;
         }
         /* No per-session copy: same-worker NACK/PLI reads src->gop directly. */
-        (void) ngx_rtc_session_send_rtp(sess, rtp, len);
+        (void) ngx_rtc_session_send_rtp(sess, rtp, len, is_gop_start);
     }
 
     /* One entry per target worker; carry its ready session ids. */
@@ -949,15 +1138,10 @@ ngx_rtc_broadcast_rtp(ngx_rtc_source_t *src, const uint8_t *rtp,
             continue; /* already sent directly above */
         }
         nsess = 0;
-        ngx_memzero(&entry, sizeof(entry));
-        entry.media = (uint8_t) (is_video ? 0 : 1);
-        entry.gop = (uint8_t) (0 != is_gop_start ? 1 : 0);
-        entry.len = (uint16_t) len;
-
         for (i = 0; i < n; i++) {
             if (src->snap_slots[i] == (ngx_int_t) w
                     && nsess < NGX_RTC_RING_MAX_SESSIONS) {
-                entry.sess[nsess++] = src->snap_ids[i];
+                sess_ids[nsess++] = src->snap_ids[i];
             }
         }
 
@@ -965,11 +1149,12 @@ ngx_rtc_broadcast_rtp(ngx_rtc_source_t *src, const uint8_t *rtp,
             continue;
         }
 
-        entry.nsess = (uint16_t) nsess;
-        ngx_memcpy(entry.rtp, rtp, len);
-
-        if (ngx_rtc_shm_ring_enqueue(shm->rings[w], &entry)
-                == NGX_OK) {
+        /* The plaintext RTP is written into the shm slot once by enqueue; no
+         * stack staging entry is built here. */
+        if (ngx_rtc_shm_ring_enqueue(shm->rings[w],
+                (uint8_t) (is_video ? 0 : 1),
+                (uint8_t) (0 != is_gop_start ? 1 : 0),
+                rtp, (uint16_t) len, sess_ids, nsess) == NGX_OK) {
             uint64_t one;
             ssize_t  rc;
             one = 1;
@@ -1006,7 +1191,7 @@ ngx_rtmp_rtc_emit(void *opaque, const uint8_t *rtp, uint32_t len)
             ccf = ngx_rtc_core_get_conf((ngx_cycle_t *) ngx_cycle);
             if (NULL != ccf && NULL != ccf->sh) {
                 ngx_rtc_shm_retransmit_append(ccf->sh,
-                        (u_char *) src->name, ngx_strlen(src->name),
+                        (ngx_rtc_shm_source_t *) src->shm_src,
                         rtp, len, ctx->is_gop_start);
             }
         }
