@@ -50,6 +50,43 @@ static ngx_rbtree_t        ngx_rtc_session_tree = {
 };
 
 
+/*
+ * Compile-time defaults for the runtime tunables (see ngx_rtc_core.h). The
+ * nginx side replaces this snapshot from the rtc_* directives in
+ * ngx_rtc_core_init_conf() before the workers fork; the host unit tests never
+ * install one, so they keep seeing exactly these values.
+ */
+static const ngx_rtc_tunables_t  ngx_rtc_default_tunables = {
+    NGX_RTC_JITTER_TIMEOUT_MS,
+    NGX_RTC_NACK_WINDOW_MS,
+    NGX_RTC_NACK_WINDOW_MAX_MS,
+    NGX_RTC_EAGAIN_STREAK_MAX,
+    NGX_RTC_GOP_RING_CAP
+};
+
+static const ngx_rtc_tunables_t *ngx_rtc_tunables = &ngx_rtc_default_tunables;
+
+static ngx_log_t *ngx_rtc_session_log(const ngx_rtc_session_t *sess);
+
+
+void
+ngx_rtc_core_set_tunables(const ngx_rtc_tunables_t *t)
+{
+    /* NULL restores the compile-time defaults; the tests rely on that to undo
+     * an override. The caller owns the storage for a non-NULL snapshot
+     * (config-time, cycle lifetime), which is why this must not be called
+     * after the workers fork. */
+    ngx_rtc_tunables = (NULL != t) ? t : &ngx_rtc_default_tunables;
+}
+
+
+const ngx_rtc_tunables_t *
+ngx_rtc_core_tunables(void)
+{
+    return ngx_rtc_tunables;
+}
+
+
 /* Recover the owning source from an rbtree node embedded via ngx_str_node_t. */
 static ngx_rtc_source_t *
 ngx_rtc_source_from_node(ngx_rbtree_node_t *node)
@@ -70,7 +107,7 @@ ngx_rtc_source_lookup(const char *name)
         return NULL;
     }
 
-    len = strlen(name);
+    len = ngx_strlen(name);
     if (0 == len || len >= NGX_RTC_SOURCE_NAME_MAX) {
         return NULL;
     }
@@ -105,7 +142,7 @@ ngx_rtc_source_get(const char *name)
         return NULL;
     }
 
-    len = strlen(name);
+    len = ngx_strlen(name);
     if (0 == len || len >= NGX_RTC_SOURCE_NAME_MAX) {
         return NULL;
     }
@@ -117,7 +154,7 @@ ngx_rtc_source_get(const char *name)
 
     hash = ngx_crc32_long((u_char *) name, len);
 
-    src = calloc(1, sizeof(*src));
+    src = ngx_calloc(sizeof(*src), ngx_cycle->log);
     if (NULL == src) {
         return NULL;
     }
@@ -159,18 +196,49 @@ ngx_rtc_source_remove(const char *name)
     /* Subscribers hold a source pointer for the lifetime of their session, so
      * a source with viewers cannot be freed yet. The last unsubscribe will
      * retry removal when the queue is empty. */
-    if (!ngx_queue_empty(&src->subscribers)) {
+    if (0 == ngx_queue_empty(&src->subscribers)) {
+        return;
+    }
+
+    /* A live publisher holds a session->source pointer that would dangle; never
+     * free a source that is still publishing. The publisher's teardown clears
+     * publishing before removal (defense-in-depth against a stale close). */
+    if (0 != src->publishing) {
+        return;
+    }
+
+    /* Any session still pointing here keeps the struct alive, whether or not it
+     * is in the subscriber queue. A WHIP publisher assigns sess->source
+     * directly, and the reaper closes sessions one at a time: without this
+     * check the first close frees the source and the next close in the same
+     * pass dereferences sess->source (SIGSEGV in ngx_rtc_stream_session_close).
+     * Checked here rather than at each caller so no path can bypass it. */
+    if (0 != ngx_rtc_source_has_holder(src)) {
+        return;
+    }
+
+    /* A live AAC->Opus transcode context belongs to the bridge module, which
+     * destroys it on publisher teardown (ngx_rtmp_rtc_release_publish). Freeing
+     * the source with one still attached would strand the transcoder thread and
+     * its queues with no owner left to stop them, so refuse and say so. This is
+     * unreachable while that teardown stays unconditional; it exists so a later
+     * path that frees a source cannot quietly reintroduce the leak.
+     * ngx_log_stderr, not ngx_log_error: this unit owns no ngx_log_t (and is
+     * also linked into the host unit tests, which stub the logging out). */
+    if (NULL != src->audio_ctx) {
+        ngx_log_stderr(0, "ngx_rtc_core: source=%s still owns an audio worker, "
+                          "refusing to free it", src->name);
         return;
     }
 
     ngx_rbtree_delete(&ngx_rtc_source_tree, &src->sn.node);
 
     if (NULL != src->gop.slots) {
-        free(src->gop.slots);
+        ngx_free(src->gop.slots);
         src->gop.slots = NULL;
     }
 
-    free(src);
+    ngx_free(src);
 }
 
 ngx_rtc_source_t *
@@ -276,6 +344,24 @@ ngx_rtc_session_find_by_id(ngx_uint_t id)
 }
 
 void
+ngx_rtc_session_fsm_report_unhandled(ngx_rtc_hsm_t *sm,
+                                     const ngx_rtc_hsm_event_t *event)
+{
+    /* Both are unused in a build without NGX_DEBUG: ngx_log_debug2 compiles
+     * away, so keep the parameters explicitly consumed for -Wunused-parameter. */
+    (void) sm;
+    (void) event;
+
+    /* Debug level: an unhandled event is usually benign (a keepalive class the
+     * state deliberately ignores), but a silent no-op hides the ones that are
+     * not, and a stalled session is exactly what this traces. */
+    ngx_log_debug2(NGX_LOG_DEBUG_EVENT, ngx_cycle->log, 0,
+                   "ngx_rtc: unhandled session event id=%ui state=%s",
+                   (ngx_uint_t) event->id,
+                   ngx_rtc_session_fsm_get_state_name(sm));
+}
+
+void
 ngx_rtc_session_add(ngx_rtc_session_t *sess)
 {
     size_t  len;
@@ -323,6 +409,32 @@ ngx_rtc_source_subscribe(ngx_rtc_source_t *src, ngx_rtc_session_t *sess)
     ngx_queue_insert_head(&src->subscribers, &sess->sub_queue);
 }
 
+/*
+ * Does any session still point at this source? Sessions reach a source two
+ * ways: ngx_rtc_source_subscribe links them into src->subscribers, and a
+ * publisher assignment (sess->source = src, e.g. a WHIP session) does not.
+ * The second kind is invisible to the subscriber queue, so freeing on "queue
+ * empty" alone strands it. Returns 1 when a holder exists.
+ */
+ngx_uint_t
+ngx_rtc_source_has_holder(const ngx_rtc_source_t *src)
+{
+    ngx_rtc_session_t *sess;
+
+    if (NULL == src) {
+        return 0;
+    }
+
+    for (sess = ngx_rtc_session_first(); NULL != sess;
+         sess = ngx_rtc_session_next(sess)) {
+        if (sess->source == src) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
 void
 ngx_rtc_source_unsubscribe(ngx_rtc_source_t *src, ngx_rtc_session_t *sess)
 {
@@ -333,10 +445,41 @@ ngx_rtc_source_unsubscribe(ngx_rtc_source_t *src, ngx_rtc_session_t *sess)
         return;
     }
 
-    ngx_queue_remove(&sess->sub_queue);
+    /*
+     * Idempotent unlink. Two teardown paths can reach here for one session
+     * (the reaper's close and the RTCP timer's subscriber walk), and
+     * ngx_queue_remove only rewires the neighbours: in a release build
+     * (NGX_DEBUG off) it leaves the removed node's own next/prev dangling, so
+     * a second remove dereferences stale memory and faults. A self-linked
+     * sub_queue means "not on any list"; restore that after unlinking so the
+     * operation can be repeated safely. The same guard covers a session that
+     * was never subscribed (e.g. a WHIP publisher, which sets sess->source
+     * without calling subscribe).
+     *
+     * The NULL test is not redundant. Every session construction path today
+     * calls ngx_queue_init straight after ngx_calloc, so a zeroed link does not
+     * reach here -- but "self-linked" is a claim about an initialised link, and
+     * a zeroed one is neither self-linked nor enqueued. The comparison against
+     * &sess->sub_queue accepts it and ngx_queue_remove then dereferences its
+     * NULL next on the first statement.
+     */
+    if (NULL != sess->sub_queue.next
+            && sess->sub_queue.next != &sess->sub_queue) {
+        ngx_queue_remove(&sess->sub_queue);
+    }
+    ngx_queue_init(&sess->sub_queue);
     sess->source = NULL;
 
-    if (ngx_queue_empty(&src->subscribers) && 0 == src->publishing) {
+    /*
+     * Only the empty subscriber queue is not enough to free: a session that
+     * never subscribed still holds ->source (a WHIP publisher sets it directly)
+     * and would read the freed struct on its own close. The reaper walks
+     * sessions and closes them one by one, so the first close can free the
+     * source out from under a later one in the same pass. Scan for any other
+     * holder and let the last one out do the free.
+     */
+    if (ngx_queue_empty(&src->subscribers) && 0 == src->publishing
+            && 0 == ngx_rtc_source_has_holder(src)) {
         ngx_rtc_source_remove(src->name);
     }
 }
@@ -370,21 +513,64 @@ ngx_rtc_source_next_subscriber(ngx_rtc_source_t *src, ngx_rtc_session_t *sess)
 }
 
 int
-ngx_rtc_session_send_rtp(ngx_rtc_session_t *sess, const uint8_t *rtp, uint32_t len)
+ngx_rtc_session_send_rtp(ngx_rtc_session_t *sess, const uint8_t *rtp, uint32_t len,
+                         uint8_t is_gop_start)
 {
     ngx_connection_t *c;
     uint32_t          ssrc;
+    uint8_t           is_video;
+    uint8_t           is_gop_idr;
+    uint8_t           is_keyframe;
     uint8_t           session_pt;
+    uint8_t           twcc_ext_id;
+    uint16_t          tseq;
+    uint8_t           twcc_stamped;
+    int32_t           admit_rc;
     int               n;
     ssize_t           sent;
 
     if (NULL == sess || NULL == sess->conn) {
         return 0;
     }
-    if (!ngx_rtc_session_fsm_is_ready(&sess->fsm)) {
+    if (0 == ngx_rtc_session_fsm_is_ready(&sess->fsm)) {
         return 0;
     }
     if (0 == len || len > NGX_RTC_MAX_RTP_PKT) {
+        return 0;
+    }
+
+    /* Classify video by SSRC. Video-only backpressure must never drop audio:
+     * the AAC->Opus transcoder needs a gapless input, so a slow audio consumer
+     * is left to the vring byte-capacity backpressure instead of this flag. */
+    is_video = 0;
+    if (NGX_RTC_RTP_HEADER_SIZE <= len && NULL != sess->source) {
+        ssrc = ((uint32_t)rtp[8] << 24) | ((uint32_t)rtp[9] << 16)
+             | ((uint32_t)rtp[10] << 8) | (uint32_t)rtp[11];
+        if (ssrc == sess->source->video_ssrc) {
+            is_video = 1;
+        }
+    }
+    is_gop_idr = (0 != is_video && 0 != is_gop_start) ? 1 : 0;
+
+    /* A keyframe access unit is exempt from the pacer as a whole. is_gop_start
+     * marks only the SPS/PPS packet that opens it, so exempting that packet
+     * alone still lets the pacer refuse the IDR fragments carrying the picture
+     * -- a parameter set with no image, the one state the viewer cannot leave on
+     * its own. The RTP marker bit closes the unit; the packet cap bounds a
+     * source that never sets one. */
+    is_keyframe = is_gop_idr;
+    if (0 == is_keyframe && 0 != is_video && 0 != sess->keyframe_open
+            && sess->keyframe_pkts < NGX_RTC_KEYFRAME_MAX_PKTS) {
+        is_keyframe = 1;
+    }
+
+    /* Video backpressure: after a socket send failure, drop video packets until
+     * the next IDR access unit so a slow client recovers to a clean keyframe
+     * instead of decoding a torn GOP. The flag is cleared only once a GOP start
+     * is actually sent (not merely attempted), so a keyframe paced out of a full
+     * socket cannot resume the stream mid-GOP. */
+    if (is_video && sess->drop_until_gop && 0 == is_gop_start) {
+        sess->drop_gop++;
         return 0;
     }
 
@@ -393,38 +579,46 @@ ngx_rtc_session_send_rtp(ngx_rtc_session_t *sess, const uint8_t *rtp, uint32_t l
      * opposite of a low-latency live stream). Live, replay, and RTX sends all
      * funnel through here and spend the same link budget. pacer_target_bps == 0
      * means the pacer was never armed (pacer_init not called), so pass through
-     * unpaced — this keeps host tests that drive the send path working. */
-    if (0 != sess->pacer_target_bps
-            && ngx_rtc_session_pacer_admit(sess, len, (uint64_t) ngx_current_msec)
-                    != NGX_RTC_OK) {
-        return 0;
+     * unpaced — this keeps host tests that drive the send path working.
+     *
+     * A keyframe access unit is admitted even when the budget is spent. The
+     * encoder is an external RTMP source that cannot be told to slow down, so
+     * refusing packets never relieves congestion — it only decides what the
+     * viewer loses. A refused keyframe is the one loss the viewer cannot
+     * recover from on its own: it decodes nothing until a later IDR, asks for
+     * one with a PLI, and that reply is refused too. The unit is bounded by
+     * NGX_RTC_KEYFRAME_MAX_PKTS, so a weak link is not handed an unbounded
+     * burst; when the bucket covers it the packet is charged normally. */
+    if (0 != sess->pacer_target_bps) {
+        admit_rc = ngx_rtc_session_pacer_admit(sess, len,
+                                               (uint64_t) ngx_current_msec);
+        if (NGX_RTC_OK != admit_rc && 0 == is_keyframe) {
+            sess->drop_pacer++;
+            return 0;
+        }
     }
 
     c = (ngx_connection_t *)sess->conn;
-    ngx_memcpy(sess->cipher, rtp, len);
 
-    /* Rewrite the RTP payload-type byte to the PT this session negotiated in
-     * its offer (RFC 3264). The source broadcasts one plaintext stream tagged
-     * with the first viewer's PT; applying each session's PT here, right before
-     * SRTP, lets heterogeneous viewers negotiate their own PT (the 1-byte
-     * equivalent of SRS rebuild_packet). SSRC is left as the source SSRC, which
-     * is what RTCP feedback / sender reports key on. */
+    /* Resolve the session PT and the transport-cc extension id up front so the
+     * plaintext is copied straight to its final offset: with a TWCC extension
+     * the RTP header (12 B) stays at 0, the 8-byte extension lands at 12 and the
+     * payload moves to 20. This replaces the old copy-then-shift, which rewrote
+     * the whole payload byte by byte on every packet. SSRC is left as the source
+     * SSRC (RTCP feedback / sender reports key on it). */
+    session_pt = 0;
+    twcc_ext_id = 0;
+    twcc_stamped = 0;
     if (NGX_RTC_RTP_HEADER_SIZE <= len && NULL != sess->source) {
-        ssrc = ((uint32_t)sess->cipher[8] << 24)
-             | ((uint32_t)sess->cipher[9] << 16)
-             | ((uint32_t)sess->cipher[10] << 8)
-             | (uint32_t)sess->cipher[11];
+        ssrc = ((uint32_t)rtp[8] << 24) | ((uint32_t)rtp[9] << 16)
+             | ((uint32_t)rtp[10] << 8) | (uint32_t)rtp[11];
 
-        session_pt = 0;
         if (ssrc == sess->source->video_ssrc) {
             session_pt = sess->video_pt;
+            twcc_ext_id = sess->twcc_video_ext;
         } else if (ssrc == sess->source->audio_ssrc) {
             session_pt = sess->audio_pt;
-        }
-
-        if (0 != session_pt) {
-            sess->cipher[1] = (uint8_t)((sess->cipher[1] & 0x80u)
-                                        | (session_pt & 0x7fu));
+            twcc_ext_id = sess->twcc_audio_ext;
         }
     }
 
@@ -433,69 +627,128 @@ ngx_rtc_session_send_rtp(ngx_rtc_session_t *sess, const uint8_t *rtp, uint32_t l
      * session negotiated - retransmissions too, since each carries its own
      * fresh transport sequence (the RTP seq in bytes 2..3 is untouched). The
      * peer enables transport-cc only when the answer echoed the extmap id. */
-    if ((NULL != sess->source) && (NGX_RTC_RTP_HEADER_SIZE <= len)) {
-        uint32_t ssrc2 = ((uint32_t)sess->cipher[8] << 24)
-                       | ((uint32_t)sess->cipher[9] << 16)
-                       | ((uint32_t)sess->cipher[10] << 8)
-                       | (uint32_t)sess->cipher[11];
-        uint8_t  ext_id = 0;
-        uint32_t idx;
-        uint16_t tseq;
+    if (0 != twcc_ext_id
+            && (uint32_t)len + 8u + NGX_RTC_SRTP_TAG_LEN > NGX_RTC_CIPHER_CAP) {
+        twcc_ext_id = 0; /* no room for the extension: fall back to a plain copy */
+    }
 
-        if (ssrc2 == sess->source->video_ssrc) {
-            ext_id = sess->twcc_video_ext;
-        } else if (ssrc2 == sess->source->audio_ssrc) {
-            ext_id = sess->twcc_audio_ext;
-        }
+    if (0 != twcc_ext_id) {
+        ngx_memcpy(sess->cipher, rtp, NGX_RTC_RTP_HEADER_SIZE);
+        ngx_memcpy(sess->cipher + NGX_RTC_RTP_HEADER_SIZE + 8u,
+                   rtp + NGX_RTC_RTP_HEADER_SIZE,
+                   len - NGX_RTC_RTP_HEADER_SIZE);
 
-        if ((0 != ext_id)
-                && ((uint32_t)len + 8u + NGX_RTC_SRTP_TAG_LEN
-                    <= NGX_RTC_CIPHER_CAP)) {
-            tseq = sess->twcc_seq++;
+        tseq = sess->twcc_seq++;
+        twcc_stamped = 1;
+        sess->cipher[0] = (uint8_t)(sess->cipher[0] | 0x10u); /* X = 1 */
+        sess->cipher[12] = 0xBE;
+        sess->cipher[13] = 0xDE;
+        sess->cipher[14] = 0x00;
+        sess->cipher[15] = 0x01;               /* one 32-bit word */
+        sess->cipher[16] = (uint8_t)((uint8_t)(twcc_ext_id << 4) | 0x01u);
+        sess->cipher[17] = (uint8_t)(tseq >> 8);
+        sess->cipher[18] = (uint8_t)(tseq & 0xFFu);
+        sess->cipher[19] = 0x00;               /* pad to 32-bit alignment */
 
-            /* Shift the payload right by 8 (back-to-front so overlap is safe). */
-            for (idx = len; idx > NGX_RTC_RTP_HEADER_SIZE; idx--) {
-                sess->cipher[idx + 7u] = sess->cipher[idx - 1u];
-            }
+        len += 8u;
+    } else {
+        ngx_memcpy(sess->cipher, rtp, len);
+    }
 
-            sess->cipher[0] = (uint8_t)(sess->cipher[0] | 0x10u); /* X = 1 */
-            sess->cipher[12] = 0xBE;
-            sess->cipher[13] = 0xDE;
-            sess->cipher[14] = 0x00;
-            sess->cipher[15] = 0x01;               /* one 32-bit word */
-            sess->cipher[16] = (uint8_t)((uint8_t)(ext_id << 4) | 0x01u);
-            sess->cipher[17] = (uint8_t)(tseq >> 8);
-            sess->cipher[18] = (uint8_t)(tseq & 0xFFu);
-            sess->cipher[19] = 0x00;               /* pad to 32-bit alignment */
-
-            len += 8u;
-        }
+    /* Rewrite the RTP payload-type byte to the PT this session negotiated in
+     * its offer (RFC 3264). The source broadcasts one plaintext stream tagged
+     * with the first viewer's PT; applying each session's PT here, right before
+     * SRTP, lets heterogeneous viewers negotiate their own PT (the 1-byte
+     * equivalent of SRS rebuild_packet). */
+    if (0 != session_pt) {
+        sess->cipher[1] = (uint8_t)((sess->cipher[1] & 0x80u)
+                                    | (session_pt & 0x7fu));
     }
 
     n = (int)len;
     if (ngx_rtc_srtp_protect_rtp(&sess->srtp, sess->cipher, &n) != 0) {
+        /* Nothing reached the socket, so give the transport-wide sequence back
+         * (see the send branch below for why). Counted separately from the
+         * socket failures: this is the one abandon point that used to be silent,
+         * and a silent one here reads to the peer as pure path loss. */
+        sess->srtp_failed++;
+        if (0 != twcc_stamped) {
+            sess->twcc_seq--;
+        }
         return 0;
     }
 
     sent = c->send(c, sess->cipher, (size_t)n);
+    if (sent != (ssize_t)n) {
+        /* The packet was abandoned by this process, not by the path, so it must
+         * not keep the transport-wide sequence it was stamped with. The
+         * receiver would report the resulting gap as loss, and the loss-driven
+         * rate controller would then cut the send rate because of a packet that
+         * never left — the sender reporting its own failures as congestion. */
+        if (0 != twcc_stamped) {
+            sess->twcc_seq--;
+        }
+    }
     if (sent == NGX_ERROR) {
         sess->send_failed++;
+        if (is_video) {
+            sess->drop_until_gop = 1;
+        }
         ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, ngx_socket_errno,
                        "ngx_rtc: RTP send failed");
         return 0;
     } else if (sent == NGX_AGAIN) {
         /* UDP socket send buffer is full: drop the datagram and count it.
          * Queueing real-time media would only add latency and then still have
-         * to drop it, so let the client recover through NACK/PLI. */
+         * to drop it, so let the client recover through NACK/PLI. A single
+         * full buffer is transient, so video only falls back to the next IDR
+         * once the EAGAINs are consecutive and numerous enough to mean the
+         * client is genuinely behind. A run interrupted by an idle gap (a
+         * still picture sends nothing) restarts: it would otherwise be
+         * inherited by a later, unrelated burst. */
         sess->send_eagain++;
+        if (is_video) {
+            if (sess->send_eagain_streak > 0
+                    && (ngx_msec_t) (ngx_current_msec - sess->send_eagain_ms)
+                           >= (ngx_msec_t) NGX_RTC_EAGAIN_STREAK_IDLE_MS) {
+                sess->send_eagain_streak = 0;
+            }
+            sess->send_eagain_ms = ngx_current_msec;
+            if (++sess->send_eagain_streak
+                    >= ngx_rtc_core_tunables()->eagain_streak_max) {
+                sess->send_eagain_streak = 0; /* armed: the next run starts over */
+                sess->drop_until_gop = 1;
+            }
+        }
         ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, ngx_socket_errno,
                        "ngx_rtc: RTP send would block");
         return 0;
     } else if (sent != (ssize_t)n) {
         sess->send_failed++;
+        if (is_video) {
+            sess->drop_until_gop = 1;
+        }
         ngx_log_debug0(NGX_LOG_DEBUG_EVENT, c->log, ngx_socket_errno,
                        "ngx_rtc: RTP send short write");
         return 0;
+    }
+
+    /* A video GOP start that actually reached the socket resumes delivery, and
+     * opens its keyframe access unit; the RTP marker bit closes it. */
+    if (is_video) {
+        sess->send_eagain_streak = 0;
+        if (0 != is_gop_start) {
+            sess->drop_until_gop = 0;
+            sess->keyframe_open = 1;
+            sess->keyframe_pkts = 0;
+        }
+        if (0 != sess->keyframe_open) {
+            sess->keyframe_pkts++;
+            if (NGX_RTC_RTP_HEADER_SIZE <= len
+                    && 0 != (rtp[1] & NGX_RTC_RTP_MARKER)) {
+                sess->keyframe_open = 0;
+            }
+        }
     }
 
     return 1;
@@ -519,7 +772,8 @@ ngx_rtc_rtp_ring_push(ngx_rtc_rtp_ring_t *r, const uint8_t *rtp, uint32_t len,
         return;
     }
 
-    if (0 == ngx_rtc_rtp_ring_reserve(r, NGX_RTC_GOP_RING_CAP)) {
+    if (0 == ngx_rtc_rtp_ring_reserve(r,
+                                      ngx_rtc_core_tunables()->gop_ring_slots)) {
         return; /* cache unavailable; live broadcast still works */
     }
 
@@ -552,7 +806,14 @@ ngx_rtc_rtp_ring_reserve(ngx_rtc_rtp_ring_t *r, uint32_t capacity)
         return 1; /* already sized (capacity stays as first reserved) */
     }
 
-    r->slots = calloc(capacity, sizeof(*r->slots));
+    /* ngx_calloc takes one size, so the element count is folded in here;
+     * keep the overflow check calloc used to do for us. */
+    if (capacity > (uint32_t) (SIZE_MAX / sizeof(*r->slots))) {
+        return 0;
+    }
+
+    r->slots = ngx_calloc((size_t) capacity * sizeof(*r->slots),
+                          ngx_cycle->log);
     if (NULL == r->slots) {
         return 0;
     }
@@ -567,6 +828,7 @@ ngx_rtc_rtp_ring_replay(ngx_rtc_rtp_ring_t *r, ngx_rtc_session_t *sess)
     uint32_t i;
     uint32_t start;
     uint32_t idx;
+    uint32_t sent;
 
     if (NULL == r || NULL == sess || 0 == r->count || NULL == r->slots) {
         return;
@@ -580,17 +842,40 @@ ngx_rtc_rtp_ring_replay(ngx_rtc_rtp_ring_t *r, ngx_rtc_session_t *sess)
     /* Replay synchronously. A paced (timer-driven) replay interleaves old GOP
      * packets with live packets because the bridge keeps broadcasting while the
      * timer ticks, which delivers RTP sequence numbers out of order and corrupts
-     * the decoder (frame_num jump). The GOP is small on a LAN, so the synchronous
-     * burst is acceptable. */
+     * the decoder (frame_num jump).
+     *
+     * Stop once the keyframe access unit has been sent. The ring retains every
+     * frame of the current GOP, but only the keyframe is needed to start
+     * decoding: the live frames that follow carry on from it. Sending the whole
+     * GOP instead is a burst of several hundred packets arriving while a new
+     * viewer's receive path is still warming up, so the packets most likely to
+     * be lost are exactly the ones the first frame needs. The RTP marker bit
+     * closes the access unit. */
+    sent = 0;
     for (i = start; i < r->head; i++) {
         idx = i & (r->capacity - 1u);
-        if (ngx_rtc_session_send_rtp(sess, r->slots[idx].data, r->slots[idx].len) == 0) {
+        if (ngx_rtc_session_send_rtp(sess, r->slots[idx].data,
+                                     r->slots[idx].len,
+                                     r->slots[idx].is_gop_start) == 0) {
             /* Stop bursting into a full socket: the client is not draining fast
-             * enough and the rest of the GOP would just be dropped. The next
-             * NACK/PLI recovers what was lost. */
+             * enough and the rest of the keyframe would just be dropped. The
+             * next NACK/PLI recovers what was lost. */
+            break;
+        }
+        sent++;
+        if (NGX_RTC_RTP_HEADER_SIZE < r->slots[idx].len
+                && 0 != (r->slots[idx].data[1] & NGX_RTC_RTP_MARKER)) {
             break;
         }
     }
+
+    /* The same-worker replay has no counter of its own, so this trace is the
+     * only way to tell whether a late subscriber was handed a keyframe at all,
+     * and how much of the ring it took. Enable with `error_log ... debug;`. */
+    ngx_log_error(NGX_LOG_DEBUG, ngx_rtc_session_log(sess), 0,
+                  "ngx_rtc: replay head=%uD retained=%uD start=%uD sent=%uD "
+                  "gop_start=%uD",
+                  r->head, r->count, start, sent, r->gop_start);
 }
 
 int32_t
@@ -646,6 +931,57 @@ ngx_rtc_session_nack_reset(ngx_rtc_session_t *sess)
     sess->nack_seen_count = 0;
 }
 
+int
+ngx_rtc_session_nack_budget_take(ngx_rtc_session_t *sess)
+{
+    if (NULL == sess) {
+        return 0;
+    }
+
+    if (sess->nack_retransmitted >= NGX_RTC_NACK_BUDGET) {
+        return 0;
+    }
+
+    sess->nack_retransmitted++;
+
+    return 1;
+}
+
+int
+ngx_rtc_session_nack_window_step(ngx_rtc_session_t *sess, ngx_msec_t now)
+{
+    if (NULL == sess) {
+        return 0;
+    }
+
+    /* Lazy-init the backoff-adjusted window on the first NACK. */
+    if (0 == sess->nack_window_ms) {
+        sess->nack_window_ms =
+            (ngx_msec_t) ngx_rtc_core_tunables()->nack_window_ms;
+    }
+
+    if (now - sess->nack_window_start < sess->nack_window_ms) {
+        return 0;
+    }
+
+    /* Sender-side backoff: a saturated window doubles the next one so a NACK
+     * storm retransmits the same budget over a longer span; a quiet window
+     * resets to the base cadence. */
+    if (sess->nack_retransmitted >= NGX_RTC_NACK_BUDGET) {
+        sess->nack_window_ms =
+            ngx_min(sess->nack_window_ms * 2,
+                    (ngx_msec_t) ngx_rtc_core_tunables()->nack_window_max_ms);
+    } else if (0 == sess->nack_retransmitted) {
+        sess->nack_window_ms =
+            (ngx_msec_t) ngx_rtc_core_tunables()->nack_window_ms;
+    }
+
+    sess->nack_window_start = now;
+    sess->nack_retransmitted = 0;
+
+    return 1;
+}
+
 int32_t
 ngx_rtc_session_retransmit_send(ngx_rtc_session_t *sess, uint16_t seq,
                                 const uint8_t *data, uint32_t len)
@@ -663,7 +999,7 @@ ngx_rtc_session_retransmit_send(ngx_rtc_session_t *sess, uint16_t seq,
         }
     }
 
-    if (0 == ngx_rtc_session_send_rtp(sess, data, len)) {
+    if (0 == ngx_rtc_session_send_rtp(sess, data, len, 0)) {
         return NGX_RTC_ERR_PARSE; /* socket not draining; leave the budget */
     }
 
@@ -715,7 +1051,21 @@ ngx_rtc_session_retransmit(ngx_rtc_session_t *sess, uint16_t seq)
 static uint64_t
 ngx_rtc_pacer_bucket_bytes(const ngx_rtc_session_t *sess)
 {
-    return sess->pacer_target_bps * NGX_RTC_PACER_BURST_MS / 8000u;
+    uint64_t bytes;
+
+    bytes = sess->pacer_target_bps * NGX_RTC_PACER_BURST_MS / 8000u;
+
+    /* A bucket smaller than one packet can never admit that packet: the refill
+     * is capped at the bucket size, so once tokens saturate below the packet
+     * length every later admit is refused too. 100 ms of the 64 kbps floor is
+     * 800 B while an H264 RTP packet reaches NGX_RTC_MAX_RTP_PKT (1214 B), so
+     * without this floor a session the controller had driven down would stop
+     * sending video permanently, even after the path cleared. */
+    if (bytes < (uint64_t) NGX_RTC_MAX_RTP_PKT) {
+        bytes = (uint64_t) NGX_RTC_MAX_RTP_PKT;
+    }
+
+    return bytes;
 }
 
 void
@@ -783,8 +1133,10 @@ ngx_rtc_session_pacer_admit(ngx_rtc_session_t *sess, uint32_t pkt_bytes,
 }
 
 void
-ngx_rtc_session_pacer_set_target(ngx_rtc_session_t *sess, uint64_t bps)
+ngx_rtc_session_pacer_cap(ngx_rtc_session_t *sess, uint64_t bps)
 {
+    uint64_t capacity;
+
     if (NULL == sess) {
         return;
     }
@@ -795,7 +1147,30 @@ ngx_rtc_session_pacer_set_target(ngx_rtc_session_t *sess, uint64_t bps)
         bps = NGX_RTC_PACER_MAX_BPS;
     }
 
+    if (bps >= sess->pacer_target_bps) {
+        return; /* an upper bound above the current target changes nothing */
+    }
+
     sess->pacer_target_bps = bps;
+
+    /* A cap lowers the burst the link may absorb with it; keeping a surplus
+     * earned at the higher rate would let the next packets ignore the cap. */
+    capacity = ngx_rtc_pacer_bucket_bytes(sess);
+    if (sess->pacer_tokens > capacity) {
+        sess->pacer_tokens = capacity;
+    }
+}
+
+/* The session owns no ngx_log_t; its UDP connection does. A session without a
+ * connection never reaches the control loop, so there is nothing to log. */
+static ngx_log_t *
+ngx_rtc_session_log(const ngx_rtc_session_t *sess)
+{
+    if (NULL == sess->conn) {
+        return NULL;
+    }
+
+    return ((ngx_connection_t *) sess->conn)->log;
 }
 
 void
@@ -867,6 +1242,18 @@ ngx_rtc_session_on_twcc(ngx_rtc_session_t *sess, uint32_t lost,
     } else if (target > NGX_RTC_PACER_MAX_BPS) {
         target = NGX_RTC_PACER_MAX_BPS;
     }
+
+    /* Control-loop trace. Kept at debug level: it fires once per TWCC window
+     * (twice a second per session) and is only wanted while diagnosing the
+     * rate controller. Enable with `error_log ... debug;`. */
+    ngx_log_error(NGX_LOG_DEBUG, ngx_rtc_session_log(sess), 0,
+                  "ngx_rtc: pacer twcc lost=%uD recv=%uD total=%uL loss=%uLpm "
+                  "target=%uL->%uL drop_pacer=%ui srtp_failed=%ui "
+                  "send_failed=%ui send_eagain=%ui twcc_seq=%ui",
+                  sess->twcc_win_lost, sess->twcc_win_received, total,
+                  loss_permille, sess->pacer_target_bps, target,
+                  sess->drop_pacer, sess->srtp_failed, sess->send_failed,
+                  sess->send_eagain, (ngx_uint_t) sess->twcc_seq);
 
     sess->pacer_target_bps = target;
 

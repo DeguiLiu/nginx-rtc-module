@@ -48,6 +48,9 @@ ngx_rtc_shm_session_locked_lookup(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag,
                                   size_t len);
 static void
 ngx_rtc_shm_expire_locked(ngx_rtc_shm_ctx_t *ctx, ngx_uint_t forced);
+static ngx_uint_t
+ngx_rtc_shm_source_referenced_locked(ngx_rtc_shm_ctx_t *ctx,
+                                     const ngx_rtc_shm_source_t *src);
 
 static ngx_command_t  ngx_rtc_core_commands[] = {
 
@@ -382,6 +385,18 @@ ngx_rtc_shm_source_remove(ngx_rtc_shm_ctx_t *ctx, u_char *name, size_t len)
 
     /* A source with viewers cannot be freed yet; the last unsubscribe retries. */
     if (!ngx_queue_empty(&src->subscribers)) {
+        ngx_shmtx_unlock(&ctx->pool->mutex);
+        return;
+    }
+
+    /* And never one a skeleton still points at. The session keeps sess->source
+     * and writes through it after this returns -- session_free_locked arms
+     * expires through it, session_activate inserts into its subscribers. The
+     * grace in `expires` cannot stand in for this check: publish_release()
+     * calls release_publish() (which arms it) and then this function, on the
+     * very next line. ngx_rtc_shm_expire_locked() applies the same test; it is
+     * the only path that may free. */
+    if (0 != ngx_rtc_shm_source_referenced_locked(ctx, src)) {
         ngx_shmtx_unlock(&ctx->pool->mutex);
         return;
     }
@@ -1262,11 +1277,16 @@ ngx_rtc_shm_ring_init(ngx_slab_pool_t *pool, ngx_uint_t slots)
 
 ngx_int_t
 ngx_rtc_shm_ring_enqueue(ngx_rtc_shm_ring_t *ring,
-                         const ngx_rtc_ring_entry_t *entry)
+                         uint8_t media, uint8_t gop,
+                         const uint8_t *rtp, uint16_t rtp_len,
+                         const ngx_uint_t *sess_ids, ngx_uint_t nsess)
 {
-    ngx_uint_t idx;
+    ngx_rtc_ring_entry_t *slot;
+    ngx_uint_t            idx;
 
-    if (NULL == ring || NULL == entry) {
+    if (NULL == ring || NULL == rtp || NULL == sess_ids
+            || 0 == rtp_len || rtp_len > NGX_RTC_RING_RTP_MAX
+            || 0 == nsess || nsess > NGX_RTC_RING_MAX_SESSIONS) {
         return NGX_ERROR;
     }
 
@@ -1278,8 +1298,14 @@ ngx_rtc_shm_ring_enqueue(ngx_rtc_shm_ring_t *ring,
     }
 
     idx = (ngx_uint_t) (ring->head & ring->mask);
-    ring->entries[idx] = *entry;
-    ring->entries[idx].seq = ring->head;
+    slot = &ring->entries[idx];
+    slot->seq = ring->head;
+    slot->media = media;
+    slot->gop = gop;
+    slot->len = rtp_len;
+    slot->nsess = nsess;
+    ngx_memcpy(slot->sess, sess_ids, nsess * sizeof(ngx_uint_t));
+    ngx_memcpy(slot->rtp, rtp, rtp_len);
     ring->head++;
 
     ngx_shmtx_unlock(&ring->mtx);
