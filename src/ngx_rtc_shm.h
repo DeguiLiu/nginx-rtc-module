@@ -128,8 +128,8 @@ struct ngx_rtc_shm_source_s {
     ngx_uint_t                  retransmit_alloc_failed; /* lazy ring alloc failures */
 
     /* Lock-cost instrumentation for that ring (see
-     * docs/srs-memory-scheduling-optimization.md sections 4.1 and 9). These
-     * exist to answer one question: is the shared slab pool mutex worth
+     * docs/archive/srs-memory-scheduling-optimization.md, sections 4.1 and 9).
+     * These exist to answer one question: is the shared slab pool mutex worth
      * splitting? So the *_us fields measure from just before the lock to just
      * before the unlock -- lock wait plus the work underneath, not the copy
      * alone, because waiting is the cost being argued about.
