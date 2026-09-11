@@ -34,7 +34,7 @@
 static uint8_t hsm_get_state_depth(const ngx_rtc_hsm_state_t *state);
 static const ngx_rtc_hsm_state_t *hsm_find_lca(const ngx_rtc_hsm_state_t *s1,
                                                const ngx_rtc_hsm_state_t *s2);
-static void hsm_perform_transition(ngx_rtc_hsm_t *sm,
+static bool hsm_perform_transition(ngx_rtc_hsm_t *sm,
                                    const ngx_rtc_hsm_state_t *target_state,
                                    const ngx_rtc_hsm_event_t *event);
 static const ngx_rtc_hsm_transition_t *hsm_find_matching_transition(
@@ -86,7 +86,11 @@ void ngx_rtc_hsm_init(ngx_rtc_hsm_t *sm,
         sm->buffer_size = buffer_size;
         sm->current_state = NULL;
 
-        hsm_perform_transition(sm, initial_state, NULL);
+        /* The initial transition has no source, so nothing can fail here: the
+         * LCA is the initial state itself and the entry path is empty (matching
+         * the reference implementation, the initial state's entry action does
+         * not run). Keep the result ignored but explicit. */
+        (void) hsm_perform_transition(sm, initial_state, NULL);
     }
 }
 
@@ -114,7 +118,7 @@ void ngx_rtc_hsm_reset(ngx_rtc_hsm_t *sm)
 
     if (true == valid_parameters)
     {
-        hsm_perform_transition(sm, sm->initial_state, NULL);
+        (void) hsm_perform_transition(sm, sm->initial_state, NULL);
     }
 }
 
@@ -202,72 +206,93 @@ const char *ngx_rtc_hsm_get_current_state_name(const ngx_rtc_hsm_t *sm)
     return name;
 }
 
+bool ngx_rtc_hsm_restore_state(ngx_rtc_hsm_t *sm,
+                               const ngx_rtc_hsm_state_t *state)
+{
+    if ((NULL == sm) || (NULL == state))
+    {
+        return false;
+    }
+
+    /* Assign directly rather than dispatching the events that lead here. This
+     * machine never saw those steps, so their entry/exit actions must not run;
+     * and the table may have no path to `state` at all, which is exactly the
+     * mirror-worker case (nothing leads from the initial state to SRTP_READY,
+     * because only the owning worker performs a DTLS handshake). */
+    sm->current_state = state;
+
+    return true;
+}
+
 /* --- Private helper implementations --- */
 
 /*
  * Perform the state transition logic: exit the source path up to the LCA,
  * then enter the target path from the LCA down to the target.
+ *
+ * The entry path is recorded BEFORE any exit action runs. That buffer is
+ * caller-sized, so it can be too small for the hierarchy; computing it first
+ * makes that failure side-effect free -- no action has run and current_state is
+ * untouched, so the machine is still exactly where it was. Running the exits
+ * first (which this did) left the machine exited-but-not-entered, with
+ * current_state still naming the state it had just left.
+ *
+ * Returns false when the transition could not be performed. The caller is
+ * expected to report that; it is a build-time geometry error (a state deeper
+ * than the caller's buffer_size), not a recoverable runtime condition.
  */
-static void hsm_perform_transition(ngx_rtc_hsm_t *sm,
+static bool hsm_perform_transition(ngx_rtc_hsm_t *sm,
                                    const ngx_rtc_hsm_state_t *target_state,
                                    const ngx_rtc_hsm_event_t *event)
 {
     const ngx_rtc_hsm_state_t *source_state = NULL;
     const ngx_rtc_hsm_state_t *lca = NULL;
-    bool same_state = false;
-    bool valid_parameters = false;
-    bool path_built = false;
+    const ngx_rtc_hsm_state_t *entry_iter = NULL;
+    uint8_t path_length = 0U;
 
-    if ((NULL != sm) && (NULL != target_state))
+    if ((NULL == sm) || (NULL == target_state))
     {
-        valid_parameters = true;
-        source_state = sm->current_state;
-        same_state = (source_state == target_state);
+        return false;
     }
 
-    if (true == valid_parameters)
+    source_state = sm->current_state;
+
+    if (source_state == target_state)
     {
-        if (true == same_state)
+        /* External self-transition: exit then re-enter the same state. */
+        if ((NULL != source_state) && (NULL != source_state->exit_action))
         {
-            /* External self-transition: exit then re-enter the same state. */
-            if ((NULL != source_state) && (NULL != source_state->exit_action))
-            {
-                source_state->exit_action(sm, event);
-            }
-            if (NULL != target_state->entry_action)
-            {
-                target_state->entry_action(sm, event);
-            }
+            source_state->exit_action(sm, event);
         }
-        else
+        if (NULL != target_state->entry_action)
         {
-            lca = hsm_find_lca(source_state, target_state);
-            hsm_execute_exit_actions(sm, source_state, lca, event);
-
-            path_built = hsm_build_entry_path(sm, target_state, lca);
-
-            if (true == path_built)
-            {
-                uint8_t path_length = 0U;
-                const ngx_rtc_hsm_state_t *entry_iter = target_state;
-
-                while ((NULL != entry_iter) && (entry_iter != lca))
-                {
-                    path_length++;
-                    entry_iter = entry_iter->parent;
-                }
-
-                sm->current_state = target_state;
-
-                hsm_execute_entry_actions(sm, path_length, event);
-            }
-            else
-            {
-                /* Entry path buffer is too small for this hierarchy depth. */
-                NGX_RTC_HSM_ASSERT(0);
-            }
+            target_state->entry_action(sm, event);
         }
+
+        return true;
     }
+
+    lca = hsm_find_lca(source_state, target_state);
+
+    if (false == hsm_build_entry_path(sm, target_state, lca))
+    {
+        return false;
+    }
+
+    entry_iter = target_state;
+    while ((NULL != entry_iter) && (entry_iter != lca))
+    {
+        path_length++;
+        entry_iter = entry_iter->parent;
+    }
+
+    hsm_execute_exit_actions(sm, source_state, lca, event);
+
+    sm->current_state = target_state;
+
+    hsm_execute_entry_actions(sm, path_length, event);
+
+    return true;
 }
 
 static uint8_t hsm_get_state_depth(const ngx_rtc_hsm_state_t *state)
@@ -402,7 +427,11 @@ static const ngx_rtc_hsm_transition_t *hsm_find_matching_transition(
 
 /*
  * Execute a matched transition: run its action, then change state for
- * external transitions.
+ * external transitions. Returns false when an external transition could not be
+ * performed (the entry path buffer is too small), so the event is reported as
+ * unhandled instead of appearing to have been consumed. Note the action has
+ * already run at that point: it sits between the exit and entry actions per UML
+ * ordering, and the only failure mode is a fixed geometry error, not data.
  */
 static bool hsm_execute_transition(ngx_rtc_hsm_t *sm,
                                    const ngx_rtc_hsm_transition_t *transition,
@@ -418,22 +447,20 @@ static bool hsm_execute_transition(ngx_rtc_hsm_t *sm,
 
     if (true == valid_parameters)
     {
+        if (NULL != transition->action)
+        {
+            transition->action(sm, event);
+        }
+
         if (NGX_RTC_HSM_TRANSITION_INTERNAL == transition->type)
         {
-            if (NULL != transition->action)
-            {
-                transition->action(sm, event);
-            }
+            /* Internal: the action is the whole transition. */
+            executed = true;
         }
         else
         {
-            if (NULL != transition->action)
-            {
-                transition->action(sm, event);
-            }
-            hsm_perform_transition(sm, transition->target, event);
+            executed = hsm_perform_transition(sm, transition->target, event);
         }
-        executed = true;
     }
 
     return executed;
@@ -539,24 +566,30 @@ static void hsm_execute_entry_actions(ngx_rtc_hsm_t *sm,
                                       uint8_t path_length,
                                       const ngx_rtc_hsm_event_t *event)
 {
-    int8_t entry_idx = (int8_t)path_length - 1;
     bool valid_parameters = false;
 
-    if ((NULL != sm) && (0U < path_length))
+    if ((NULL != sm) && (NULL != sm->entry_path_buffer) && (0U < path_length))
     {
         valid_parameters = true;
     }
 
     if (true == valid_parameters)
     {
-        while (entry_idx >= 0)
+        /*
+         * Count down an unsigned: the original `(int8_t) path_length - 1` went
+         * negative for a hierarchy deeper than 127 and skipped every entry
+         * action without a word. path_length is bounded by buffer_size (uint8_t),
+         * so the only cost is walking the parents instead of being wrong.
+         */
+        while (0U < path_length)
         {
-            if ((NULL != sm->entry_path_buffer[entry_idx]) &&
-                (NULL != sm->entry_path_buffer[entry_idx]->entry_action))
+            path_length--;
+
+            if ((NULL != sm->entry_path_buffer[path_length]) &&
+                (NULL != sm->entry_path_buffer[path_length]->entry_action))
             {
-                sm->entry_path_buffer[entry_idx]->entry_action(sm, event);
+                sm->entry_path_buffer[path_length]->entry_action(sm, event);
             }
-            entry_idx--;
         }
     }
 }

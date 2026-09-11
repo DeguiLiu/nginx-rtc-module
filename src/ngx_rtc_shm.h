@@ -1,10 +1,12 @@
 /*
  * ngx_rtc_shm.h - shared-memory skeleton for cross-worker RTC metadata.
  *
- * Phase 0 of docs/multi-worker-shm-design.md: a `rtc_zone` directive plus a
- * slab-backed source / session registry. Only value types and pointers to other
- * shm allocations live in this zone; DTLS/SRTP/connection/audio handles stay in
- * per-worker process memory and are attached by the later phases.
+ * Phase 0 of multi-worker-shm-design.md, which lives in the deploy repo at
+ * nginx-rtc-example/docs/ -- this repo has no docs/ of its own. A `rtc_zone`
+ * directive plus a slab-backed source / session registry. Only value types and
+ * pointers to other shm allocations live in this zone; DTLS/SRTP/connection/
+ * audio handles stay in per-worker process memory and are attached by the later
+ * phases.
  *
  * The pure-C protocol core (rtp/sdp/stun/dtls/srtp) remains nginx-free; this
  * header is nginx-only and is not compiled into the host unit tests.
@@ -25,14 +27,36 @@
 #define NGX_RTC_SHM_SESSION_EXPIRE_MS 30000u /* half-open session reap */
 #define NGX_RTC_SHM_SOURCE_EXPIRE_MS  10000u /* empty non-publishing source reap */
 
+/* How long a publishing source may go without a heartbeat before the reaper
+ * treats its publisher as gone. The publishing worker refreshes
+ * publisher_seen_ms on every packet (ngx_rtmp_rtc_shm_stats), so a live stream
+ * keeps it current; a worker that dies without releasing leaves it frozen, and
+ * without this the source plus its retransmit ring would be pinned for the
+ * life of the zone. Deliberately far larger than any plausible packet gap on a
+ * live stream, so a stalled-but-alive publisher is not mistaken for a dead
+ * one -- a false positive costs a re-claim, not correctness. */
+#define NGX_RTC_SHM_PUBLISH_GRACE_MS  10000u
+
+/* Publisher ownership tag for a source: which ingest protocol currently owns
+ * the "publishing" flag. A source may have exactly one publisher at a time; a
+ * second publisher of a different protocol is rejected rather than sharing the
+ * source (which would let one protocol's close free the other's cached shm_src). */
+#define NGX_RTC_PUBLISHER_NONE 0u
+#define NGX_RTC_PUBLISHER_RTMP 1u
+#define NGX_RTC_PUBLISHER_WHIP 2u
+
 typedef struct ngx_rtc_shm_source_s  ngx_rtc_shm_source_t;
 typedef struct ngx_rtc_shm_session_s ngx_rtc_shm_session_t;
 
+/* Process-local mirror of the publish ownership (defined in ngx_rtc_core.h,
+ * which this header must not include: it is compiled into the host tests). */
+typedef struct ngx_rtc_source_s ngx_rtc_source_t;
+
 /* Cross-worker retransmit ring: a per-source fixed-window cache of the recent
  * plaintext RTP video packets, indexed by RTP sequence number. The publisher
- * appends every video packet; any worker answers NACK/PLI from it. The ring
- * owns an ngx_shmtx_t so the retransmit path never contends on the slab pool
- * mutex (mirrors the media ring). */
+ * appends every video packet while a cross-worker viewer is subscribed; any
+ * worker answers NACK/PLI from it. All slots are read/written under the slab
+ * pool mutex, so a ring is never read after its source is freed. */
 #define NGX_RTC_SHM_RETX_RING_CAP 1024u
 #define NGX_RTC_RING_MAX_SESSIONS 64u
 #define NGX_RTC_RING_RTP_MAX      1500u
@@ -45,12 +69,10 @@ typedef struct {
 } ngx_rtc_shm_retransmit_slot_t;
 
 typedef struct {
-    ngx_uint_t  head;      /* next absolute write index (guarded by mtx) */
+    ngx_uint_t  head;      /* next absolute write index (guarded by pool mutex) */
     ngx_uint_t  count;     /* valid entries in [head-count, head) */
     ngx_uint_t  gop_start; /* absolute index of the latest GOP start */
     ngx_uint_t  cap;       /* power of two slot count */
-    ngx_shmtx_t mtx;       /* per-ring lock (points at mtx_sh) */
-    ngx_shmtx_sh_t mtx_sh; /* the lock word itself, in shm */
     ngx_rtc_shm_retransmit_slot_t slots[1]; /* allocated as cap slots */
 } ngx_rtc_shm_retransmit_t;
 
@@ -61,7 +83,14 @@ struct ngx_rtc_shm_source_s {
     ngx_queue_t            queue;      /* source_list link (GC / stats) */
     u_char                 name[NGX_RTC_SHM_SOURCE_NAME_MAX];
     ngx_uint_t             publishing;
+    ngx_uint_t             publisher_kind; /* NGX_RTC_PUBLISHER_* ownership tag */
     ngx_atomic_t           expires;    /* msec absolute, 0 = no expire (empty source reap) */
+    /* Last heartbeat from the publishing worker, msec absolute (0 = never
+     * published). Written lock-free per packet by ngx_rtmp_rtc_shm_stats() and
+     * read by the reaper: it is the only evidence that distinguishes a dead
+     * publisher (a worker crash never runs ngx_rtc_publish_release) from one
+     * that is simply idle. */
+    ngx_atomic_t           publisher_seen_ms;
     ngx_int_t              publisher_slot;   /* RTMP ingest worker (-1 unknown);
                                               * stats uses it to flag cross-worker
                                               * viewers (owner_slot != this) */
@@ -91,11 +120,27 @@ struct ngx_rtc_shm_source_s {
     ngx_uint_t             audio_asc_len;
     ngx_atomic_t           subscribers_version; /* bumped on subscriber add/remove */
     ngx_queue_t            subscribers; /* subscriber skeleton list head */
+    ngx_atomic_t           remote_subscribers; /* viewers on a worker != publisher_slot */
 
     /* Cross-worker retransmit ring (video): lazily allocated on first video
-     * packet; any worker answers NACK/PLI from it (per-ring lock). */
+     * packet; any worker answers NACK/PLI from it under the pool mutex. */
     ngx_rtc_shm_retransmit_t   *retransmit;
     ngx_uint_t                  retransmit_alloc_failed; /* lazy ring alloc failures */
+
+    /* Lock-cost instrumentation for that ring (see
+     * docs/srs-memory-scheduling-optimization.md sections 4.1 and 9). These
+     * exist to answer one question: is the shared slab pool mutex worth
+     * splitting? So the *_us fields measure from just before the lock to just
+     * before the unlock -- lock wait plus the work underneath, not the copy
+     * alone, because waiting is the cost being argued about.
+     *
+     * Written only while holding that mutex and read under it, so plain fields
+     * and no atomics. Counts are exact; the microsecond sums are wall clock. */
+    ngx_uint_t                  retx_append_locked;  /* appends that took the mutex */
+    ngx_uint_t                  retx_append_us;      /* us lost to it, append path */
+    ngx_uint_t                  retx_replay_count;   /* GOP replays served */
+    ngx_uint_t                  retx_replay_slots;   /* slots copied, all replays */
+    ngx_uint_t                  retx_replay_us;      /* us lost to it, replay path */
 };
 
 /* Cross-worker session skeleton. DTLS/SRTP/connection state is attached by the
@@ -118,6 +163,24 @@ struct ngx_rtc_shm_session_s {
     ngx_atomic_t           expires;    /* msec absolute, 0 = no expire (half-open reap) */
     ngx_atomic_t           twcc_lost; /* cumulative transport-cc loss */
     ngx_atomic_t           twcc_received; /* cumulative transport-cc received */
+
+    /* Where this session's egress actually goes. A pacer drop keeps the RTP
+     * sequence number the source assigned, so the viewer scores it as loss and
+     * a loss-based controller can mistake its own drops for congestion; these
+     * three make that visible from /rtc/v1/stats (and therefore from Lua). */
+    ngx_atomic_t           pacer_bps;  /* AIMD send-rate target, bits/s */
+    ngx_atomic_t           drop_pacer; /* media refused by the token bucket */
+    ngx_atomic_t           drop_gop;   /* video held off until the next IDR */
+
+    /* Lifecycle state (ngx_rtc_session_state_t), written only by the worker
+     * that owns the UDP session and read by the stats renderer under the pool
+     * mutex. Appended last so every field above keeps its offset. Unlike
+     * srtp_ready this is exhaustive, which is the point: a session wedged in
+     * ICE_BOUND or DTLS_HANDSHAKE is diagnosable from Lua, and neither state is
+     * visible from any other field here. CLOSED is never written -- a closed
+     * skeleton is freed outright (ngx_rtc_shm_expire_locked), so the state that
+     * is observable is "gone from session_list", not a byte. */
+    uint8_t                state;
 };
 
 /* Immutable session fields copied out under the pool mutex so the STUN attach
@@ -132,6 +195,10 @@ typedef struct {
     uint8_t     twcc_video_ext;   /* transport-cc ext id (0 = none) */
     uint8_t     twcc_audio_ext;
     uint8_t     publishing;       /* 1 = WHIP publisher, 0 = player */
+    /* Mirrors the skeleton's srtp_ready. A worker rebuilding this session
+     * (attach_from_shm) never performed the DTLS handshake, so it must adopt
+     * this state rather than sit in NEW -- see ngx_rtc_session_fsm_restore(). */
+    uint8_t     srtp_ready;
     u_char      source_name[NGX_RTC_SHM_SOURCE_NAME_MAX];
     uint32_t    source_video_ssrc;
     uint32_t    source_audio_ssrc;
@@ -167,6 +234,14 @@ typedef struct {
     ngx_rtc_ring_entry_t  entries[1]; /* allocated as size slots */
 } ngx_rtc_shm_ring_t;
 
+/* Bumped whenever the layout of anything reachable from ngx_rtc_shm_ctx_t
+ * changes. A zone outlives both a reload and a master restart (see the reuse
+ * branches of ngx_rtc_core_init_zone), and neither path can know that the
+ * binary now expects different offsets -- a struct that grew would have the new
+ * code read slab metadata as fields, silently. The tag turns that into a
+ * refused start. */
+#define NGX_RTC_SHM_LAYOUT  3u
+
 /* Root table kept in shpool->data. source_tree is keyed by "app/stream" name;
  * sessions are a small linear list keyed by ICE ufrag. */
 typedef struct {
@@ -180,6 +255,7 @@ typedef struct {
     ngx_uint_t             next_session_id; /* monotonic session id allocator */
     ngx_uint_t             nworkers;
     ngx_uint_t             ring_slots;
+    uint32_t               layout;     /* == NGX_RTC_SHM_LAYOUT, checked on reuse */
 } ngx_rtc_shm_ctx_t;
 
 /* Per-cycle configuration (process memory). One rtc_zone per cycle. */
@@ -189,6 +265,15 @@ typedef struct {
     ngx_slab_pool_t     *shpool;     /* slab allocator */
     ngx_uint_t           nworkers;    /* from ccf->worker_processes */
     ngx_uint_t           ring_slots;  /* media-ring capacity per worker */
+
+    /* Runtime tunables. Published to the pure C units as one read-only
+     * snapshot by ngx_rtc_core_init_conf (see ngx_rtc_tunables_t in
+     * ngx_rtc_core.h); NGX_CONF_UNSET* until then. */
+    ngx_msec_t           jitter_timeout;    /* rtc_jitter_timeout */
+    ngx_msec_t           nack_window;       /* rtc_nack_window */
+    ngx_msec_t           nack_window_max;   /* rtc_nack_window_max */
+    ngx_uint_t           eagain_streak_max; /* rtc_eagain_streak */
+    ngx_uint_t           gop_ring_slots;    /* rtc_gop_ring_slots */
 } ngx_rtc_core_conf_t;
 
 ngx_rtc_core_conf_t *ngx_rtc_core_get_conf(ngx_cycle_t *cycle);
@@ -239,20 +324,107 @@ ngx_int_t ngx_rtc_shm_session_request_close(ngx_rtc_shm_ctx_t *ctx,
 ngx_uint_t ngx_rtc_shm_session_is_close_requested(ngx_rtc_shm_ctx_t *ctx,
                                                   u_char *ufrag, size_t len);
 
-/* Mirror a session's running transport-cc counters into its shm skeleton. */
-void ngx_rtc_shm_session_set_twcc(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag,
-                                  size_t len, ngx_uint_t lost,
-                                  ngx_uint_t received);
+/* Mirror a session's running egress counters into its shm skeleton: the
+ * transport-cc tallies, the AIMD pacer target, and the two reasons the pacer
+ * and the IDR gate held media back. Published for /rtc/v1/stats, which Lua
+ * reads out of lua_shared_dict rtc_stats. */
+void ngx_rtc_shm_session_set_stats(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag,
+                                   size_t len, ngx_uint_t lost,
+                                   ngx_uint_t received, ngx_uint_t pacer_bps,
+                                   ngx_uint_t drop_pacer, ngx_uint_t drop_gop);
+
+/* Publish a session's lifecycle state for the stats renderer to read.
+ *
+ * Owner-only by construction, and the slot guard enforces it: `slot` is the
+ * caller's worker slot, and a skeleton already owned by a different worker is
+ * left alone. The guard deliberately accepts owner_slot == -1 as well as an
+ * exact match -- in the single-worker case the OS routes the STUN binding to
+ * the same process that created the session, so ngx_rtc_shm_session_bind()
+ * never runs and owner_slot stays -1 until activate(). A strict comparison
+ * would therefore drop exactly the ICE_BOUND and DTLS_HANDSHAKE writes, which
+ * are the ones worth having.
+ *
+ * Note it only writes the state: owner_slot keeps its existing meaning, set by
+ * bind()/activate() alone, so the cross_worker stat is unaffected. */
+void ngx_rtc_shm_session_set_state(ngx_rtc_shm_ctx_t *ctx, u_char *ufrag,
+                                   size_t len, ngx_uint_t slot, uint8_t state);
+
+/* Verify that a reused zone root was built by a binary with this layout. A zone
+ * outlives both a reload and a master restart, and neither reuse path can know
+ * that the new binary expects different offsets -- a struct that grew would have
+ * the new code read slab metadata as fields, silently. NGX_OK when the tag
+ * matches, NGX_ERROR after logging NGX_LOG_EMERG otherwise, so the caller can
+ * return it directly. */
+ngx_int_t ngx_rtc_shm_layout_check(const ngx_rtc_shm_ctx_t *sh, ngx_log_t *log);
 
 /* Mark every viewer of one source for close by its "app/stream" name (admin
  * disconnect). NGX_OK when the source exists, NGX_ERROR otherwise. */
 ngx_int_t ngx_rtc_shm_source_request_close(ngx_rtc_shm_ctx_t *ctx,
                                            u_char *name, size_t len);
 
-/* Set a source's publishing flag under the pool mutex (the only way the bridge
- * may mutate it; free_locked reads it under the same mutex). */
-void ngx_rtc_shm_source_set_publishing(ngx_rtc_shm_ctx_t *ctx, u_char *name,
-                                       size_t len, ngx_uint_t publishing);
+/* Atomically claim publish ownership of a source under the pool mutex.
+ * NGX_OK when `kind` now owns it (claim, or already owned by the same kind);
+ * NGX_BUSY when a different publisher kind owns it; NGX_ERROR on bad args or a
+ * source that no longer exists. Only a successful claim makes the returned
+ * source safe to cache (publishing == 1 keeps it alive). */
+ngx_int_t ngx_rtc_shm_source_try_publish(ngx_rtc_shm_ctx_t *ctx, u_char *name,
+                                         size_t len, ngx_uint_t kind);
+
+/* Release publish ownership held by `kind`. Clears publishing only when the
+ * source is still owned by that kind, so a stale close cannot steal the flag
+ * from a live publisher of another protocol. */
+void ngx_rtc_shm_source_release_publish(ngx_rtc_shm_ctx_t *ctx, u_char *name,
+                                        size_t len, ngx_uint_t kind);
+
+/* ============================================================================
+ * Publish ownership: the only writers of a local source's ownership pair
+ *
+ * `publisher_kind` / `publishing` exist twice: in the shm source (the
+ * authority, arbitrated above) and on the process-local ngx_rtc_source_t (a
+ * mirror the per-packet media path reads without taking a lock). Two copies is
+ * unavoidable; two *owners* is not.
+ *
+ * Before these three functions, five unrelated call sites wrote the local
+ * mirror by hand while the shm half was claimed separately, and the two drifted.
+ * Both known ownership defects came from exactly that: a WHIP publisher whose
+ * teardown did not release the shm right (name permanently unpublishable), and
+ * an RTMP takeover that claimed in shm and then bailed, leaving publishing=1
+ * with nobody left to clear it.
+ *
+ * Nothing except these functions may write src->publisher_kind or
+ * src->publishing. Reading them anywhere is fine, and a caller may gate on the
+ * tag to decide whether a release is worth attempting.
+ *
+ * src->shm_src is a cache of the shm source pointer, not ownership. All three
+ * functions clear it when the ownership moves, because a release can make the
+ * shm source reapable and a stale cached pointer would then dangle. Populating
+ * it is also allowed from the one place that adopts another worker's claim:
+ * ngx_rtc_stream_attach_from_shm(). Never populate it without holding the
+ * ownership that keeps the source alive.
+ * ============================================================================ */
+
+/* Take the publish right for src->name on behalf of this process.
+ *
+ * NGX_OK   this process now owns the name; the mirror reads `kind`. shm_src may
+ *          still be NULL -- no rtc_zone (single-worker), or the shm source
+ *          vanished before the claim -- which degrades to "no cross-worker
+ *          mirror", never to a dangling pointer.
+ * NGX_BUSY another kind already owns it. The local mirror is cleared, because a
+ *          stale tag is precisely what made an RTMP takeover of a dead WHIP
+ *          name impossible until the process restarted.
+ * NGX_ERROR bad argument. */
+ngx_int_t ngx_rtc_publish_claim(ngx_rtc_source_t *src, ngx_uint_t kind);
+
+/* Give up the publish right this process holds for `src`, if any. Idempotent,
+ * so every teardown path (deleteStream, disconnect, session close, reap) may
+ * call it unconditionally; a worker that does not own the name is a no-op. */
+void ngx_rtc_publish_release(ngx_rtc_source_t *src);
+
+/* Adopt an ownership another worker already holds, without claiming anything in
+ * shm. For the media worker's local source built by attach_from_shm: it answers
+ * DTLS/SRTP for a WHIP published on the signaling worker, so it must report the
+ * same ownership without racing that worker's claim. */
+void ngx_rtc_publish_mirror(ngx_rtc_source_t *src, ngx_uint_t kind);
 
 /* Overwrite a source's broadcast payload types under the pool mutex. A zero
  * pt leaves the current value unchanged. */
@@ -287,7 +459,7 @@ ngx_uint_t ngx_rtc_shm_source_snapshot(ngx_rtc_shm_ctx_t *ctx, u_char *name,
 
 /* Cross-worker retransmit ring. The publisher appends every video packet (in
  * RTP sequence order); any worker reads one packet by RTP sequence or replays
- * the latest GOP. All ring slots are read/written under the per-ring lock. */
+ * the latest GOP. All ring slots are read/written under the slab pool mutex. */
 typedef ngx_int_t (*ngx_rtc_shm_retransmit_cb)(void *opaque,
                                                const uint8_t *rtp,
                                                uint32_t len,
@@ -297,10 +469,14 @@ typedef ngx_int_t (*ngx_rtc_shm_retransmit_cb)(void *opaque,
 void ngx_rtc_shm_retransmit_reset(ngx_rtc_shm_ctx_t *ctx, u_char *name,
                                   size_t len);
 
-/* Append one video packet; lazily allocates the ring on first use. */
-void ngx_rtc_shm_retransmit_append(ngx_rtc_shm_ctx_t *ctx, u_char *name,
-                                   size_t len, const uint8_t *rtp,
-                                   uint32_t rtp_len, uint8_t is_gop_start);
+/* Append one video packet; lazily allocates the ring on first use. The caller
+ * passes the publisher's cached shm source pointer (valid while publishing == 1)
+ * so the no-cross-worker-viewer fast path can skip the slab pool mutex and the
+ * rbtree lookup entirely. */
+void ngx_rtc_shm_retransmit_append(ngx_rtc_shm_ctx_t *ctx,
+                                   ngx_rtc_shm_source_t *src,
+                                   const uint8_t *rtp, uint32_t rtp_len,
+                                   uint8_t is_gop_start);
 
 /* Copy one cached packet by its 16-bit RTP sequence into out (<= out_cap).
  * NGX_OK on hit, NGX_DECLINED on miss. */
