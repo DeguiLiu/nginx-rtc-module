@@ -7,6 +7,10 @@ test/run_tests
 *.log
 *.exe
 
+# Sanitizer builds (regenerate with scripts/sanitize-tests.sh). Kept as a
+# sibling of test/build/ so a `make clean` there does not delete these.
+test/build-asan/
+
 # Windows cross-compile release artifacts (regenerate with
 # scripts/cross-win64-tests.sh).
 dist/

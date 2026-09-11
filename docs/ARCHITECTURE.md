@@ -36,8 +36,15 @@ ngx_rtc_stream_module(owner worker 出队 → SRTP → UDP)
 - **多 worker 数据面**：明文 RTP 通过 `rtc_zone` 的 per-worker 媒体环 + eventfd
   跨进程投递，owner worker 做 SRTP 加密后发送。
 - **重传缓存下沉 shm**：每 source 一个固定窗口视频重传环写入共享内存，任意 worker
-  订阅可立即回放最新 GOP、NACK/PLI 按 seq 命中，跨 worker 首帧免等自然 IDR；同 worker
+  订阅可回放最新 GOP、NACK/PLI 按 seq 命中；环槽统一在 slab pool 锁下读写/释放，append
+  按「有无跨 worker viewer」门控（无跨 worker viewer 时同 worker 单 memcpy）。同 worker
   直接读进程内 GOP 环，无锁。
 - **音频线程隔离**：AAC→Opus 转码在独立 pthread 中执行，避免阻塞 nginx 事件循环。
+- **会话状态机**：`ngx_rtc_session_fsm` 跟踪
+  NEW → ICE_BOUND → DTLS_HANDSHAKE → SRTP_READY → CLOSED，只做状态判定、无副作用；
+  close 类事件挂在根状态上，从任意状态收敛。绑定与 DTLS 起始转移带 guard（校验事件上下文里的
+  连接与 DTLS 记录），未处理事件经 `ngx_rtc_session_fsm_set_reporter` 以 debug 上报，避免静默停滞。
+  跨 worker 时该状态机每进程一份，信令 worker 的副本会停在 NEW 直到被回收，因此**全局就绪应以
+  shm 会话骨架的 `srtp_ready` 为准**，进程内 `ngx_rtc_session_fsm_is_ready()` 只回答本进程。
 
 详细设计见发行仓 `nginx-rtc-example/docs/`。

@@ -26,7 +26,7 @@ mkdir -p "$OUT"
 make -C "$ROOT/test" -j"${JOBS:-4}" \
     CC="$CC" \
     CPPFLAGS="-I../src -I. -Iinclude -I$THIRD/include" \
-    LDLIBS="-L$THIRD/lib -lcrypto -lwinpthread" \
+    LDLIBS="-L$THIRD/lib -lssl -lcrypto -lws2_32 -lwinpthread" \
     BUILD_DIR="$BUILD" \
     BIN="$BUILD/run_tests.exe"
 

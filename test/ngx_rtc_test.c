@@ -83,11 +83,31 @@ int ngx_rtc_test_run_all(void)
         else
         {
             failed++;
+            /*
+             * Name the case on stdout as well, not only on stderr. The detail
+             * lines ("FAIL file:line: expr (a) != expr (b)") go to stderr with
+             * the assertion, and stderr is unbuffered, so a CI that keeps only
+             * stdout used to end up with the summary line and no idea which
+             * case produced it. Flush immediately for the same reason the
+             * summary flushes below: if a later case crashes under a sanitizer,
+             * the record of this failure is already on disk.
+             */
+            (void)printf("FAIL  %s\n", g_entries[i].name);
+            (void)fflush(stdout);
         }
     }
 
     (void)printf("\n==== ngx-rtc host unit tests ====\n");
     (void)printf("TOTAL: %d  PASS: %d  FAIL: %d\n", total, passed, failed);
+
+    /*
+     * Flush before returning. Under a sanitizer, an exit that reports a problem
+     * goes through the runtime's own _exit()-style path rather than normal
+     * stdio cleanup, so a redirected run loses whatever is still sitting in the
+     * stdout buffer -- which is exactly this summary plus the tail of the PASS
+     * lines. The symptom is a run that looks truncated for no visible reason.
+     */
+    (void)fflush(stdout);
 
     return (0 == failed) ? 0 : 1;
 }

@@ -41,6 +41,13 @@ make -C test run_tests       # 87 cases
 
 ## Windows portability
 
+**Windows limitation**: the Windows nginx build has no UDP support (see
+`nginx.org/en/docs/windows.html`, "Known issues"). The WebRTC media plane
+(`ngx_rtc_stream_module`) requires `listen ... udp`, so WebRTC playout cannot
+run on Windows. A Windows build is therefore limited to the TCP-only path:
+RTMP ingest (1935) + HTTP-FLV / HLS / DASH playback (18082). Full RTMP →
+WebRTC low-latency playout requires Linux.
+
 The nginx-free protocol core (`rtp/sdp/stun/rtcp/hsm/session_fsm/core/ring/
 avsync`) compiles under MinGW, and its host tests run on Windows x86-64. The
 four module glues (`shm/http/stream/bridge`) still require a full

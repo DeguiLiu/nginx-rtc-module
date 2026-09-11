@@ -39,6 +39,13 @@ make -C test run_tests       # 87 个用例
 
 ## Windows 可移植性
 
+**Windows 平台限制**：Windows 版 nginx 不支持 UDP（见
+`nginx.org/en/docs/windows.html` 的 Known issues）。WebRTC 媒体面
+（`ngx_rtc_stream_module`）依赖 `listen ... udp`，因此 WebRTC 播放无法在
+Windows 上运行。Windows 构建仅支持纯 TCP 路径：RTMP 推流（1935）+
+HTTP-FLV / HLS / DASH 播放（18082）。完整的 RTMP → WebRTC 低延迟播放必须在
+Linux 上运行。
+
 不依赖 nginx 的协议核心（`rtp/sdp/stun/rtcp/hsm/session_fsm/core/ring/avsync`）
 可在 MinGW 下编译，其 host 单测可在 Windows x86-64 上运行。四个模块胶水代码
 （`shm/http/stream/bridge`）仍需完整的 OpenResty/nginx Windows 构建，该路径

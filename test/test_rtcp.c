@@ -316,9 +316,9 @@ NGX_RTC_TEST(rtcp_twcc_loss_summary)
     rtcp_wr_u16(raw + 12, 100u);
     rtcp_wr_u16(raw + 14, 5u);
 
-    /* chunks: run=2 lost, then run=3 received */
-    rtcp_wr_u16(raw + 20, 0x0002u); /* T=0, S=0, run=2 */
-    rtcp_wr_u16(raw + 22, 0x4003u); /* T=0, S=1, run=3 */
+    /* chunks: T=0 S=0 run=2 (not received), then T=0 S=2 run=3 (received) */
+    rtcp_wr_u16(raw + 20, 0x0002u);
+    rtcp_wr_u16(raw + 22, 0x4003u);
 
     NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt,
                                                   &consumed), NGX_RTC_OK);
@@ -342,15 +342,150 @@ NGX_RTC_TEST(rtcp_twcc_status_vector)
     rtcp_wr_u32(raw + 4, 0x11111111u);
     rtcp_wr_u32(raw + 8, 0x22222222u);
     rtcp_wr_u16(raw + 12, 200u);
-    rtcp_wr_u16(raw + 14, 2u);
+    rtcp_wr_u16(raw + 14, 7u);
 
-    /* status vector chunk: T=1, symbol0=0b10 (received), symbol1=0b00 (lost) */
-    rtcp_wr_u16(raw + 20, 0xA000u);
+    /* Status vector chunk T=1, S=1: seven 2-bit symbols in bits 13..0, here
+     * 00 00 01 10 11 01 10. Two of them are "not received". Nothing else in the
+     * suite exercises this layout, and the 1-bit form below is a separate branch,
+     * so a wrong shift or a wrong symbol count here would otherwise go unseen. */
+    rtcp_wr_u16(raw + 20, 0xC1B6u);
 
     NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt,
                                                   &consumed), NGX_RTC_OK);
-    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_lost, 1);
-    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_received, 1);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_pkt_count, 7);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_lost, 2);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_received, 5);
+}
+
+/* draft-holmer-rmcat-transport-wide-cc-extensions-01 section 3.1.4 gives the
+ * status vector chunk a symbol-size bit: bit 15 is the chunk type, bit 14 is S,
+ * and bits 13..0 hold either fourteen 1-bit symbols (S=0) or seven 2-bit symbols
+ * (S=1). A parser that assumes the 2-bit form unconditionally reads an S=0 chunk
+ * as 7 symbols instead of 14, then walks the rest of the feedback at the wrong
+ * stride, drifts into the recv-delta section, and counts arrival-time bytes as
+ * packet status -- which is how a path with no loss at all comes to be reported
+ * as most of the stream lost. (RFC 8888 does not define this chunk at all.) */
+NGX_RTC_TEST(rtcp_twcc_status_vector_one_bit_symbols)
+{
+    ngx_rtc_rtcp_pkt_t pkt;
+    uint8_t raw[24];
+    uint32_t consumed = 0;
+
+    (void)memset(raw, 0, sizeof(raw));
+
+    raw[0] = 0x8Fu;
+    raw[1] = NGX_RTC_RTCP_RTPFB;
+    rtcp_wr_u16(raw + 2, 5u);
+    rtcp_wr_u32(raw + 4, 0x11111111u);
+    rtcp_wr_u32(raw + 8, 0x22222222u);
+    rtcp_wr_u16(raw + 12, 300u);
+    rtcp_wr_u16(raw + 14, 14u);
+
+    /* T=1, S=0: fourteen 1-bit symbols, twelve received then two lost
+     * (0xBFFC = 10 11111111111100). A zero symbol means "not received" in both
+     * symbol forms, which follows section 3.1.4's own Example 1 (its leading 0
+     * is labelled "packet not received") rather than its prose, where "packet
+     * received" is (0).
+     *
+     * The totals must be ASYMMETRIC to pin that down. An earlier revision of
+     * this case used 0xBF80 (seven and seven) and passed unchanged under a
+     * polarity reversal -- the mutation swapped the two counters, so a test
+     * asserting 7 and 7 could not see it. The count assertion below is what
+     * pins the symbol WIDTH: read as seven 2-bit symbols these same bits
+     * account for only seven of the fourteen declared packets.
+     *
+     * Order is deliberately not asserted here: reversing a bit string preserves
+     * its number of ones and zeros, so no assertion over twcc_lost /
+     * twcc_received -- the only order-free outputs the parser produces -- can
+     * ever catch a reader that walks the symbol list backwards. */
+    rtcp_wr_u16(raw + 20, 0xBFFCu);
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt,
+                                                  &consumed), NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_pkt_count, 14);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_lost, 2);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_received, 12);
+}
+
+/* draft-holmer-rmcat-transport-wide-cc-extensions-01 section 3.1.3 lays the run
+ * length chunk out as T (1 bit) | S (2 bits) | run length (13 bits). Reading a
+ * single status bit and a 14-bit run -- easy to do, because the *status vector*
+ * chunk's size flag really is one bit -- shifts everything by one: a normal
+ * "received, small delta" run (S=1) has bit 14 clear, so it is read as a lost
+ * run, and its length picks up the S bit and becomes 8192 + n, which the
+ * caller's clamp turns into "everything left in this feedback was lost". Almost
+ * every arrival takes that path, so a link with no loss reports near-total loss
+ * and any loss-feedback controller collapses to its floor. */
+NGX_RTC_TEST(rtcp_twcc_run_length_chunk_symbol_bits)
+{
+    ngx_rtc_rtcp_pkt_t pkt;
+    uint8_t raw[24];
+    uint32_t consumed = 0;
+
+    (void)memset(raw, 0, sizeof(raw));
+
+    raw[0] = 0x8Fu;
+    raw[1] = NGX_RTC_RTCP_RTPFB;
+    rtcp_wr_u16(raw + 2, 5u);
+    rtcp_wr_u32(raw + 4, 0x11111111u);
+    rtcp_wr_u32(raw + 8, 0x22222222u);
+    rtcp_wr_u16(raw + 12, 400u);
+    rtcp_wr_u16(raw + 14, 5u);
+
+    /* T=0, S=1 (received, small delta), run length 5: every reported packet
+     * arrived. Read with the draft layout this is five lost packets. */
+    rtcp_wr_u16(raw + 20, 0x2005u);
+
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt,
+                                                  &consumed), NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_lost, 0);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_received, 5);
+
+    /* T=0, S=2 (received, large delta), run length 5. */
+    (void)memset(&pkt, 0, sizeof(pkt));
+    rtcp_wr_u16(raw + 20, 0x4005u);
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt,
+                                                  &consumed), NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_lost, 0);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_received, 5);
+
+    /* T=0, S=0 (not received), run length 5. */
+    (void)memset(&pkt, 0, sizeof(pkt));
+    rtcp_wr_u16(raw + 20, 0x0005u);
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt,
+                                                  &consumed), NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_lost, 5);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_received, 0);
+
+    /* A run longer than the declared packet count is clamped to it, so a bogus
+     * or overlapping feedback cannot inflate the totals past packet_count. */
+    (void)memset(&pkt, 0, sizeof(pkt));
+    rtcp_wr_u16(raw + 20, 0x3FFFu);
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt,
+                                                  &consumed), NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_lost + pkt.twcc_received, 5);
+
+    /* Symbol 3 means received (without a recv delta), not "reserved": reading it
+     * as a loss would invert the status of every run a sender emits that way. */
+    (void)memset(&pkt, 0, sizeof(pkt));
+    rtcp_wr_u16(raw + 20, 0x6005u);
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt,
+                                                  &consumed), NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_lost, 0);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_received, 5);
+
+    /* The symbol field is TWO bits wide, not three. 0x1005 = 0001 0000 0000
+     * 0101 puts the symbol at 00 (not received) with the top bit of the run
+     * length set; read with a 3-bit symbol field those three bits are 001 --
+     * received -- so the entire run flips from lost to received. Every vector
+     * above reads as non-zero under both widths, which is why this misread
+     * survived them all; this is the placement that separates the two. */
+    (void)memset(&pkt, 0, sizeof(pkt));
+    rtcp_wr_u16(raw + 20, 0x1005u);
+    NGX_RTC_TEST_ASSERT_I64_EQ(ngx_rtc_rtcp_parse(raw, sizeof(raw), &pkt,
+                                                  &consumed), NGX_RTC_OK);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_lost, 5);
+    NGX_RTC_TEST_ASSERT_I64_EQ(pkt.twcc_received, 0);
 }
 
 NGX_RTC_TEST(rtcp_remb_single_ssrc)
