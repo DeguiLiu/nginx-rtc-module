@@ -1,5 +1,8 @@
-/*
- * ngx_rtc_sdp.c - Minimal WebRTC SDP offer parser and answer generator
+/**
+ * @file    ngx_rtc_sdp.c
+ * @brief   Minimal WebRTC SDP offer parser and answer generator.
+ * @version 0.5.0
+ * @license MIT, see LICENSE
  *
  * Pure C11 translation of SRS 6.0:
  *   src/app/srs_app_rtc_sdp.cpp  (SrsSessionInfo::parse_attribute/encode,

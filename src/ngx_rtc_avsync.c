@@ -1,5 +1,13 @@
-/*
- * ngx_rtc_avsync.c - SR-anchor RTP<->NTP mapping (see ngx_rtc_avsync.h).
+/**
+ * @file    ngx_rtc_avsync.c
+ * @brief   SR-anchor RTP <-> NTP wall-clock mapping (see ngx_rtc_avsync.h).
+ * @version 0.5.0
+ * @license MIT, see LICENSE
+ *
+ * Holds the two Sender Reports that anchor the mapping and the exact rational
+ * slope dntp/drtp between them. The 64x64-bit multiply that applies the slope
+ * is done in __uint128_t so it cannot overflow, and all RTP arithmetic is
+ * wrap-aware 32-bit distance.
  */
 
 #include "ngx_rtc_avsync.h"
