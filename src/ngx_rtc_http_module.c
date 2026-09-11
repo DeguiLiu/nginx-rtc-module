@@ -44,12 +44,17 @@ extern int ngx_http_lua_ffi_shdict_store(ngx_shm_zone_t *zone, int op,
  * worst-case %ui widths. */
 #define NGX_RTC_STATS_RESERVE   2048u
 
-/* Upper bound on the SDP offer buffered out of a /rtc/v1/play/ body. The SDP
- * parser is length-driven and bounds every field it copies, so this is purely
- * a memory cap -- but it must be enforced, because the body is otherwise only
- * limited by client_max_body_size. 16 KB covers a browser offer with inline
- * ICE candidates; the same constant guards the WHIP body copy. */
-#define NGX_RTC_MAX_SDP_LEN     16384u
+/*
+ * Default for the `rtc_max_sdp_len` directive: the largest signaling body
+ * accepted. It is a directive rather than a constant so the limit lives in
+ * nginx.conf next to client_body_buffer_size, which it is coupled to: nginx
+ * spills a body larger than that buffer to a temp file, and a body read from a
+ * file buffer arrives with pos/last empty, so the length lands as 0 and the
+ * request is answered as an empty offer instead of an oversized one. The
+ * effective cap is clamped to client_body_buffer_size at request time (see
+ * ngx_rtc_http_max_sdp), so raising this alone cannot outrun the buffer.
+ */
+#define NGX_RTC_DEFAULT_MAX_SDP_LEN  (64u * 1024u)
 
 /* ngx_lua wraps each lua_shared_dict: the zone registered in
  * cycle->shared_memory is only a wrapper whose ->data points to a
@@ -63,6 +68,7 @@ typedef struct
 {
     ngx_str_t  candidate_ip;    /* server host candidate IP */
     ngx_int_t  candidate_port;  /* server host candidate UDP port */
+    size_t     max_sdp_len;     /* rtc_max_sdp_len; see the default's comment */
 } ngx_rtc_http_loc_conf_t;
 
 
@@ -98,6 +104,7 @@ static ngx_int_t  ngx_rtc_chain_reader_get(ngx_rtc_chain_reader_t *rd,
                      u_char *out);
 static ngx_int_t  ngx_rtc_http_json_string(ngx_rtc_chain_reader_t *rd,
                      const char *key, char *out, size_t out_cap, size_t *out_len);
+static size_t     ngx_rtc_http_max_sdp(ngx_http_request_t *r);
 static u_char    *ngx_rtc_http_render_stats(u_char *p, u_char *end);
 static void       ngx_rtc_stats_flush_send_failures(void);
 static void       ngx_rtc_stats_mirror_timer(ngx_event_t *ev);
@@ -130,6 +137,13 @@ static ngx_command_t ngx_rtc_http_commands[] = {
       ngx_conf_set_num_slot,
       NGX_HTTP_LOC_CONF_OFFSET,
       offsetof(ngx_rtc_http_loc_conf_t, candidate_port),
+      NULL },
+
+    { ngx_string("rtc_max_sdp_len"),
+      NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1,
+      ngx_conf_set_size_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_rtc_http_loc_conf_t, max_sdp_len),
       NULL },
 
     { ngx_string("rtc_kick"),
@@ -198,6 +212,7 @@ ngx_rtc_http_create_loc_conf(ngx_conf_t *cf)
     conf->candidate_ip.len = 0;
     conf->candidate_ip.data = NULL;
     conf->candidate_port = NGX_CONF_UNSET;
+    conf->max_sdp_len = NGX_CONF_UNSET_SIZE;
 
     return conf;
 }
@@ -321,14 +336,13 @@ ngx_rtc_http_render_stats(u_char *p, u_char *end)
         }
 
         p = ngx_slprintf(p, end,
-                "%s{\"name\":\"%s\",\"publishing\":%ui,\"pub_worker\":%d,"
+                "%s{\"name\":\"%s\",\"publishing\":%ui,\"pub_worker\":%i,"
                 "\"cross_worker\":%ui,\"clients\":%ui,"
                 "\"send_failed\":%ui,\"send_eagain\":%ui,\"sessions\":[",
                 first ? "" : ",",
-                shm_src->name, (ngx_uint_t)shm_src->publishing,
-                (int) shm_src->publisher_slot, cross, nsub,
-                (ngx_uint_t)shm_src->send_failed,
-                (ngx_uint_t)shm_src->send_eagain);
+                shm_src->name, shm_src->publishing,
+                shm_src->publisher_slot, cross, nsub,
+                shm_src->send_failed, shm_src->send_eagain);
 
         /* Every skeleton of this source, not only its subscribers -- see the
          * counting pass above. Every session is created against a source
@@ -357,36 +371,36 @@ ngx_rtc_http_render_stats(u_char *p, u_char *end)
 
             p = ngx_slprintf(p, end,
                     "%s{\"id\":%ui,\"ufrag\":\"%s\",\"state\":\"%s\","
-                    "\"twcc_lost\":%ui,\"twcc_received\":%ui,\"pacer_bps\":%ui,"
-                    "\"drop_pacer\":%ui,\"drop_gop\":%ui}",
-                    first_sess ? "" : ",", (ngx_uint_t) shm_sess->id,
+                    "\"twcc_lost\":%uA,\"twcc_received\":%uA,\"pacer_bps\":%uA,"
+                    "\"drop_pacer\":%uA,\"drop_gop\":%uA}",
+                    first_sess ? "" : ",", shm_sess->id,
                     shm_sess->ice_ufrag,
                     ngx_rtc_session_fsm_state_name(
                             (ngx_rtc_session_state_t) st),
-                    (ngx_uint_t) shm_sess->twcc_lost,
-                    (ngx_uint_t) shm_sess->twcc_received,
-                    (ngx_uint_t) shm_sess->pacer_bps,
-                    (ngx_uint_t) shm_sess->drop_pacer,
-                    (ngx_uint_t) shm_sess->drop_gop);
+                    (ngx_atomic_uint_t) shm_sess->twcc_lost,
+                    (ngx_atomic_uint_t) shm_sess->twcc_received,
+                    (ngx_atomic_uint_t) shm_sess->pacer_bps,
+                    (ngx_atomic_uint_t) shm_sess->drop_pacer,
+                    (ngx_atomic_uint_t) shm_sess->drop_gop);
             first_sess = 0;
         }
 
         p = ngx_slprintf(p, end,
-                "],\"video\":{\"ssrc\":%ui,\"pt\":%ui,\"packets\":%ui,\"octets\":%ui},"
-                "\"audio\":{\"ssrc\":%ui,\"pt\":%ui,\"packets\":%ui,\"octets\":%ui},"
+                "],\"video\":{\"ssrc\":%uD,\"pt\":%ui,\"packets\":%ui,\"octets\":%ui},"
+                "\"audio\":{\"ssrc\":%uD,\"pt\":%ui,\"packets\":%ui,\"octets\":%ui},"
                 "\"retransmit_alloc_failed\":%ui,"
                 "\"retx_lock\":{\"append_locked\":%ui,\"append_us\":%ui,"
                 "\"replay_count\":%ui,\"replay_slots\":%ui,\"replay_us\":%ui}}",
-                (ngx_uint_t)shm_src->video_ssrc, (ngx_uint_t)shm_src->video_pt,
-                (ngx_uint_t)shm_src->video_pkts, (ngx_uint_t)shm_src->video_octets,
-                (ngx_uint_t)shm_src->audio_ssrc, (ngx_uint_t)shm_src->audio_pt,
-                (ngx_uint_t)shm_src->audio_pkts, (ngx_uint_t)shm_src->audio_octets,
-                (ngx_uint_t)shm_src->retransmit_alloc_failed,
-                (ngx_uint_t)shm_src->retx_append_locked,
-                (ngx_uint_t)shm_src->retx_append_us,
-                (ngx_uint_t)shm_src->retx_replay_count,
-                (ngx_uint_t)shm_src->retx_replay_slots,
-                (ngx_uint_t)shm_src->retx_replay_us);
+                shm_src->video_ssrc, (ngx_uint_t) shm_src->video_pt,
+                shm_src->video_pkts, shm_src->video_octets,
+                shm_src->audio_ssrc, (ngx_uint_t) shm_src->audio_pt,
+                shm_src->audio_pkts, shm_src->audio_octets,
+                shm_src->retransmit_alloc_failed,
+                shm_src->retx_append_locked,
+                shm_src->retx_append_us,
+                shm_src->retx_replay_count,
+                shm_src->retx_replay_slots,
+                shm_src->retx_replay_us);
         first = 0;
 
         total_streams++;
@@ -605,6 +619,38 @@ ngx_rtc_http_play_handler(ngx_http_request_t *r)
 }
 
 
+/*
+ * Effective cap for a signaling body: the configured rtc_max_sdp_len, clamped
+ * to nginx's client_body_buffer_size. The clamp is what keeps the two settings
+ * from drifting: a body larger than the buffer is spilled to a temp file, and a
+ * body read from a file buffer has no pos/last, so its measured length is 0 and
+ * the request would be answered as an empty offer rather than an oversized one.
+ * Clamping makes that unreachable no matter how the two are configured.
+ */
+static size_t
+ngx_rtc_http_max_sdp(ngx_http_request_t *r)
+{
+    ngx_rtc_http_loc_conf_t  *rcf;
+    ngx_http_core_loc_conf_t *clcf;
+    size_t                    cap;
+
+    rcf = ngx_http_get_module_loc_conf(r, ngx_rtc_http_module);
+    clcf = ngx_http_get_module_loc_conf(r, ngx_http_core_module);
+
+    /* Same shape as candidate_port above: seeded UNSET so ngx_conf_set_size_slot
+     * accepts the directive at all (it rejects a field that is not UNSET as a
+     * duplicate), and defaulted here. */
+    cap = (NGX_CONF_UNSET_SIZE == rcf->max_sdp_len)
+          ? NGX_RTC_DEFAULT_MAX_SDP_LEN : rcf->max_sdp_len;
+    if (0 != clcf->client_body_buffer_size
+        && cap > clcf->client_body_buffer_size) {
+        cap = clcf->client_body_buffer_size;
+    }
+
+    return cap;
+}
+
+
 static void
 ngx_rtc_http_body_handler(ngx_http_request_t *r)
 {
@@ -635,6 +681,8 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
     ngx_rtc_http_loc_conf_t *rcf;
     char                candidate_ip[NGX_RTC_SDP_STR_LEN];
     char                video_fmtp_buf[128];
+    ngx_uint_t          body_on_disk;
+    size_t              max_sdp_len;
 
     /* Diagnostic only: NGX_LOG_ERR here printed a pointer pair on every play
      * request. Level-gated so a production build pays one branch. */
@@ -644,6 +692,19 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
                    (r->request_body ? r->request_body->bufs : NULL));
 
     if (NULL == r->request_body || NULL == r->request_body->bufs) {
+        /* bufs == NULL with temp_file set is not an empty body: nginx spilled
+         * the whole thing to disk and left nothing in the chain. Reporting
+         * "empty" there points at the client instead of at the size, so say
+         * what happened. A chain can also carry a file-backed buffer, which the
+         * length loop below catches. */
+        if (NULL != r->request_body && NULL != r->request_body->temp_file) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "rtc_play: request body spilled to disk, cap=%uz; "
+                          "raise client_body_buffer_size and rtc_max_sdp_len",
+                          ngx_rtc_http_max_sdp(r));
+            ngx_http_finalize_request(r, NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
+            return;
+        }
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                       "rtc_play: empty request body");
         ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
@@ -653,15 +714,27 @@ ngx_rtc_http_body_handler(ngx_http_request_t *r)
     /* The offer is client-controlled, so it goes on the request pool instead
      * of a fixed stack frame, and the cap is applied before the allocation:
      * the body itself is only bounded by client_max_body_size. */
+    max_sdp_len = ngx_rtc_http_max_sdp(r);
     body_len = 0;
+    body_on_disk = 0;
     for (cl = r->request_body->bufs; NULL != cl; cl = cl->next) {
         if (NULL != cl->buf) {
+            if (cl->buf->in_file) {
+                /* nginx spilled the body to a temp file: pos/last carry no
+                 * length there, so summing them reports 0 and the request would
+                 * fail later as "no usable sdp field". Report the real cause. */
+                body_on_disk = 1;
+                break;
+            }
             body_len += (size_t) (cl->buf->last - cl->buf->pos);
         }
     }
-    if (body_len > NGX_RTC_MAX_SDP_LEN) {
+    if (0 != body_on_disk || body_len > max_sdp_len) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "rtc_play: request body too large, len=%uz", body_len);
+                      "rtc_play: request body too large, len=%uz on_disk=%ui "
+                      "cap=%uz; raise client_body_buffer_size and "
+                      "rtc_max_sdp_len together if this is a real offer",
+                      body_len, body_on_disk, max_sdp_len);
         ngx_http_finalize_request(r, NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
         return;
     }
@@ -1300,8 +1373,20 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
     char                  ans_buf[4096];
     uint32_t              ans_len;
     char                  candidate_ip[NGX_RTC_SDP_STR_LEN];
+    ngx_uint_t            body_on_disk;
+    size_t                max_sdp_len;
 
     if (NULL == r->request_body || NULL == r->request_body->bufs) {
+        /* Same as rtc_play: a spilled body leaves the chain empty, and that is
+         * a size problem, not a missing body. */
+        if (NULL != r->request_body && NULL != r->request_body->temp_file) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "rtc_whip: request body spilled to disk, cap=%uz; "
+                          "raise client_body_buffer_size and rtc_max_sdp_len",
+                          ngx_rtc_http_max_sdp(r));
+            ngx_http_finalize_request(r, NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
+            return;
+        }
         ngx_http_finalize_request(r, NGX_HTTP_BAD_REQUEST);
         return;
     }
@@ -1318,15 +1403,27 @@ ngx_rtc_http_whip_body_handler(ngx_http_request_t *r)
     /* Copy the raw SDP offer out of the request-body chain (it may span
      * several chunk buffers). Body size is client-controlled, so it is capped
      * before the pool allocation. */
+    max_sdp_len = ngx_rtc_http_max_sdp(r);
     sdp_len = 0;
+    body_on_disk = 0;
     for (cl = r->request_body->bufs; NULL != cl; cl = cl->next) {
         if (NULL != cl->buf) {
+            if (cl->buf->in_file) {
+                /* Spilled to a temp file: pos/last carry no length there, so
+                 * summing them reports 0 and the request would be answered as
+                 * an empty offer. Same rule as rtc_play. */
+                body_on_disk = 1;
+                break;
+            }
             sdp_len += (size_t)(cl->buf->last - cl->buf->pos);
         }
     }
-    if (sdp_len > NGX_RTC_MAX_SDP_LEN) {
+    if (0 != body_on_disk || sdp_len > max_sdp_len) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                      "rtc_whip: request body too large, len=%uz", sdp_len);
+                      "rtc_whip: request body too large, len=%uz on_disk=%ui "
+                      "cap=%uz; raise client_body_buffer_size and "
+                      "rtc_max_sdp_len together if this is a real offer",
+                      sdp_len, body_on_disk, max_sdp_len);
         ngx_http_finalize_request(r, NGX_HTTP_REQUEST_ENTITY_TOO_LARGE);
         return;
     }
